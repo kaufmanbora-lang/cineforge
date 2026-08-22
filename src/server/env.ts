@@ -4,7 +4,7 @@ const EnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   APP_URL: z.string().url().default("http://localhost:3000"),
   APP_ENCRYPTION_KEY: z.string().optional(),
-  DEFAULT_WORKSPACE_ID: z.string().uuid().default("00000000-0000-0000-0000-000000000001"),
+  DEFAULT_WORKSPACE_ID: z.string().uuid().default("00000000-0000-4000-8000-000000000001"),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_SCREENWRITER_MODEL: z.string().default("gpt-5.6-sol"),
   OPENAI_PROMPT_MODEL: z.string().default("gpt-5.6-terra"),

@@ -6,7 +6,7 @@ envVarGroups:
       - key: APP_ENCRYPTION_KEY
         generateValue: true
       - key: DEFAULT_WORKSPACE_ID
-        value: 00000000-0000-0000-0000-000000000001
+        value: 00000000-0000-4000-8000-000000000001
       - key: S3_REGION
         value: us-east-1
       - key: S3_BUCKET
