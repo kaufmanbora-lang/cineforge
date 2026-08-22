@@ -5,6 +5,7 @@ import { MoviePlanStructuredOutputSchema, moviePlanFromStructuredOutput, type Mo
 import { env } from "@/server/env";
 import { getProviderKey } from "@/server/provider-secrets";
 import { query } from "@/server/db";
+import { discoverGoogleModels } from "@/server/providers/video/google";
 
 export const OPENAI_TASK_MODELS = {
   screenwriting: { id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", role: "Complex story architecture and direction" },
@@ -41,15 +42,33 @@ export async function testOpenAIConnection(): Promise<{ connected: true; model: 
 }
 
 export async function transcribeMovieDescription(file: File): Promise<string> {
-  const client = await openAIClient();
-  const result = await client.audio.transcriptions.create({
-    file,
-    model: "gpt-4o-transcribe",
-    language: "ru",
-    response_format: "json",
-    prompt: "Точное описание идеи фильма на русском языке. Сохраняй имена, жанры, длительность, реплики и кинематографические термины.",
-  });
-  return result.text.trim();
+  try {
+    const client = await openAIClient();
+    const result = await client.audio.transcriptions.create({
+      file,
+      model: "gpt-4o-transcribe",
+      language: "ru",
+      response_format: "json",
+      prompt: "Точное описание идеи фильма на русском языке. Сохраняй имена, жанры, длительность, реплики и кинематографические термины.",
+    });
+    return result.text.trim();
+  } catch (openAIError) {
+    try {
+      const apiKey = await getProviderKey("google");
+      if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
+      const model = await selectGeminiFallbackModel(apiKey);
+      const data = Buffer.from(await file.arrayBuffer()).toString("base64");
+      const payload = await callGeminiGenerateContent(apiKey, model, {
+        contents: [{ role: "user", parts: [
+          { inlineData: { mimeType: file.type || "audio/webm", data } },
+          { text: "Точно расшифруй речь на русском языке. Верни только произнесённый текст без пояснений, кавычек и markdown." },
+        ] }],
+      });
+      return geminiText(payload).trim();
+    } catch (geminiError) {
+      throw combinedProviderError("распознавание речи", openAIError, geminiError);
+    }
+  }
 }
 
 export interface ProjectContextBundle {
@@ -70,28 +89,92 @@ export async function generateStructuredMoviePlan(input: {
   durationSeconds: number;
   modelId?: string;
 }): Promise<MoviePlan> {
-  const client = await openAIClient();
-  const response = await client.responses.parse({
-    model: input.modelId ?? (await openAIModelRouting()).screenwriting,
-    reasoning: { effort: "high" },
-    instructions: SCREENWRITER_INSTRUCTIONS,
-    input: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: `Create a production-ready MoviePlan for project ${input.projectId}. Exact target runtime: ${input.durationSeconds} seconds. User idea: ${input.idea}`,
-          },
-        ],
-      },
-    ],
-    text: { format: zodTextFormat(MoviePlanStructuredOutputSchema, "movie_plan") },
-    max_output_tokens: 120_000,
+  try {
+    const client = await openAIClient();
+    const response = await client.responses.parse({
+      model: input.modelId ?? (await openAIModelRouting()).screenwriting,
+      reasoning: { effort: "high" },
+      instructions: SCREENWRITER_INSTRUCTIONS,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: moviePlanRequest(input),
+            },
+          ],
+        },
+      ],
+      text: { format: zodTextFormat(MoviePlanStructuredOutputSchema, "movie_plan") },
+      max_output_tokens: 120_000,
+    });
+    const parsed = (response as typeof response & { output_parsed?: unknown }).output_parsed;
+    if (!parsed) throw new Error("OpenAI returned no structured MoviePlan.");
+    return moviePlanFromStructuredOutput(parsed);
+  } catch (openAIError) {
+    try {
+      const apiKey = await getProviderKey("google");
+      if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
+      const model = await selectGeminiFallbackModel(apiKey);
+      const payload = await callGeminiGenerateContent(apiKey, model, {
+        systemInstruction: { parts: [{ text: SCREENWRITER_INSTRUCTIONS }] },
+        contents: [{ role: "user", parts: [{ text: moviePlanRequest(input) }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseJsonSchema: z.toJSONSchema(MoviePlanStructuredOutputSchema),
+        },
+      });
+      const parsed = MoviePlanStructuredOutputSchema.parse(JSON.parse(geminiText(payload)));
+      return moviePlanFromStructuredOutput(parsed);
+    } catch (geminiError) {
+      throw combinedProviderError("создание сценария", openAIError, geminiError);
+    }
+  }
+}
+
+function moviePlanRequest(input: { projectId: string; idea: string; durationSeconds: number }): string {
+  return `Create a production-ready MoviePlan for project ${input.projectId}. Exact target runtime: ${input.durationSeconds} seconds. User idea: ${input.idea}`;
+}
+
+async function selectGeminiFallbackModel(apiKey: string): Promise<string> {
+  const models = await discoverGoogleModels(apiKey);
+  const usable = models.filter((model) => (model.supportedGenerationMethods ?? []).includes("generateContent"));
+  const availableIds = new Set(usable.map((model) => model.name.replace(/^models\//, "")));
+  const preferred = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
+  const exact = preferred.find((id) => availableIds.has(id));
+  if (exact) return exact;
+  const discovered = usable.map((model) => model.name.replace(/^models\//, ""))
+    .find((id) => /^gemini-.*flash/i.test(id) && !/image|tts|live|audio/i.test(id));
+  if (!discovered) throw new Error("Google API не предоставил текстовую Gemini Flash модель для резервного сценариста.");
+  return discovered;
+}
+
+async function callGeminiGenerateContent(apiKey: string, model: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    body: JSON.stringify(body),
   });
-  const parsed = (response as typeof response & { output_parsed?: unknown }).output_parsed;
-  if (!parsed) throw new Error("OpenAI returned no structured MoviePlan.");
-  return moviePlanFromStructuredOutput(parsed);
+  const text = await response.text();
+  if (!response.ok) throw Object.assign(new Error(`Google Gemini ${model}: ${text.slice(0, 1_000)}`), { status: response.status });
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+function geminiText(payload: Record<string, unknown>): string {
+  const candidates = payload.candidates as Array<{ content?: { parts?: Array<{ text?: string }> } }> | undefined;
+  const text = candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
+  if (!text) throw new Error("Google Gemini не вернул текстовый результат.");
+  return text;
+}
+
+function combinedProviderError(task: string, openAIError: unknown, geminiError: unknown): Error {
+  const openAIMessage = openAIError instanceof Error ? openAIError.message : String(openAIError);
+  const geminiMessage = geminiError instanceof Error ? geminiError.message : String(geminiError);
+  const error = new Error(`Не удалось выполнить ${task}. OpenAI: ${openAIMessage}. Резервный Google Gemini: ${geminiMessage}.`);
+  const status = typeof geminiError === "object" && geminiError && "status" in geminiError ? Number((geminiError as { status: unknown }).status) : undefined;
+  if (status) Object.assign(error, { status });
+  return error;
 }
 
 export async function enhanceShotPrompt(input: {
