@@ -202,6 +202,8 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
   let done = false;
   let uri: string | undefined;
   let mimeType: string | undefined;
+  let raiMediaFilteredCount = 0;
+  let raiMediaFilteredReasons: string[] = [];
   let readingInlineVideo = false;
   let inlineFinished = false;
   let base64Carry = "";
@@ -220,8 +222,14 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
     }
     const uriMatch = value.match(/"(?:uri|videoUri|video_uri|downloadUri|download_uri)"\s*:\s*"((?:\\.|[^"\\])*)"/);
     const mimeMatch = value.match(/"(?:mimeType|mime_type|encoding)"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    const filteredCountMatch = value.match(/"raiMediaFilteredCount"\s*:\s*(\d+)/);
+    const filteredReasonsMatch = value.match(/"raiMediaFilteredReasons"\s*:\s*(\[[\s\S]*?\])/);
     if (uriMatch) uri = JSON.parse(`"${uriMatch[1]}"`) as string;
     if (mimeMatch) mimeType = JSON.parse(`"${mimeMatch[1]}"`) as string;
+    if (filteredCountMatch) raiMediaFilteredCount = Number(filteredCountMatch[1]);
+    if (filteredReasonsMatch) {
+      try { raiMediaFilteredReasons = JSON.parse(filteredReasonsMatch[1]) as string[]; } catch { /* incomplete streaming window */ }
+    }
   };
   const writeBase64 = async (value: string, final = false) => {
     const compact = `${base64Carry}${value}`.replace(/\s+/g, "");
@@ -281,6 +289,9 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
     if (readingInlineVideo) throw new Error("Google returned an incomplete inline video payload.");
     if (!done) return { done: false };
     if (uri) return { done: true, response: { generateVideoResponse: { generatedSamples: [{ video: { uri, mimeType } }] } } };
+    if (raiMediaFilteredCount > 0) {
+      return { done: true, response: { generateVideoResponse: { generatedSamples: [], raiMediaFilteredCount, raiMediaFilteredReasons } } };
+    }
     if (!inlineFinished || !output || byteSize <= 0) {
       const prefixes = [...stringPrefixes].slice(0, 16).map(([key, value]) => `${key}=${value.slice(0, 24)}`).join(", ");
       throw new Error(`Google completed the operation without downloadable video media. JSON fields: ${[...responseFields].slice(0, 48).join(", ") || "none"}. String prefixes: ${prefixes || "none"}.`);

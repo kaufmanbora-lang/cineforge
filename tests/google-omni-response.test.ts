@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { durableProviderOperation, generationAccountingCost, providerDurationSeconds, resumableProviderOperation } from "@/server/worker/process-shot";
+import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, providerDurationSeconds, resumableProviderOperation } from "@/server/worker/process-shot";
 import { shot } from "./fixtures";
 
 describe("Google Omni response parsing", () => {
@@ -112,6 +112,29 @@ describe("Google Omni response parsing", () => {
     const filePath = parsed.response.generateVideoResponse.generatedSamples[0].video.localFilePath;
     expect(await readFile(filePath)).toEqual(expected);
     await rm(filePath, { force: true });
+  });
+
+  it("preserves a chunked Veo moderation response for automatic recovery", async () => {
+    const payload = JSON.stringify({ done: true, response: { generateVideoResponse: {
+      raiMediaFilteredCount: 1,
+      raiMediaFilteredReasons: ["Output video was blocked by safety filters"],
+    } } });
+    const parsed = await readVeoOperationResponse(new Response(payload)) as {
+      response: { generateVideoResponse: { raiMediaFilteredCount: number; raiMediaFilteredReasons: string[] } };
+    };
+    expect(parsed.response.generateVideoResponse).toMatchObject({
+      raiMediaFilteredCount: 1,
+      raiMediaFilteredReasons: ["Output video was blocked by safety filters"],
+    });
+  });
+
+  it("rephrases a filtered shot once and changes its content hash", () => {
+    const plannedShot = shot("shot-safety");
+    const payload = { shot: { ...plannedShot, generationPrompt: plannedShot.generationPrompt! }, specHash: "original" };
+    const retried = moderationRetryPayload(payload);
+    expect(retried.specHash).not.toBe(payload.specHash);
+    expect(retried.shot.generationPrompt?.prompt).toContain("CINEFORGE SAFETY RETRY");
+    expect(moderationRetryPayload(retried)).toBe(retried);
   });
 
   it("resumes a persisted SDK polling failure without starting a second paid generation", () => {

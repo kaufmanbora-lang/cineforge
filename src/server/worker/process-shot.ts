@@ -198,10 +198,16 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     return { cached: false, storageKey };
   } catch (error) {
     const failure = classifyFailure(error);
-    const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`Shot provider failure ${job.id}: ${failure}: ${message}\n`);
     await withDurableDatabaseRetry(() => settleFailedReservation(job.id, job.project_id, providerCompleted));
+    if (failure === "moderation" && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE SAFETY RETRY")) {
+      const nextPayload = moderationRetryPayload(job.payload);
+      await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message));
+      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
+      return { cached: false, storageKey: "", retrying: true };
+    }
+    const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
     if (decision.pauseProject) await withDurableDatabaseRetry(() => pauseProjectJobs(job.project_id, { code: failure, message }));
     await withDurableDatabaseRetry(() => query(
       "UPDATE jobs SET state=$2, last_error=$3, available_at=now()+($4::text || ' milliseconds')::interval WHERE id=$1",
@@ -216,6 +222,15 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   } finally {
     clearInterval(heartbeat);
   }
+}
+
+export function moderationRetryPayload(payload: JobRow["payload"]): JobRow["payload"] {
+  const generationPrompt = payload.shot.generationPrompt;
+  if (!generationPrompt) return payload;
+  if (generationPrompt.prompt.includes("CINEFORGE SAFETY RETRY")) return payload;
+  const prompt = `${generationPrompt.prompt}\nCINEFORGE SAFETY RETRY: This is a peaceful fictional cinematic scene with fictional people and organizations. No weapons, injury, violence, dangerous driving, pursuit, real government insignia, public figures, or readable brands. Keep every safe visual, camera, continuity, wardrobe, location, and audio detail unchanged.`;
+  const shot = { ...payload.shot, generationPrompt: { ...generationPrompt, prompt } };
+  return { ...payload, shot, specHash: contentHash({ shot, safetyRetry: 1 }) };
 }
 
 export function providerDurationSeconds(modelId: string, resolution: Resolution, plannedSeconds: number): number {
@@ -400,6 +415,25 @@ async function settleFailedReservation(jobId: string, projectId: string, provide
     await client.query(
       "UPDATE projects SET reserved_usd=GREATEST(0,reserved_usd-$2),spent_usd=spent_usd+CASE WHEN $3 THEN $2 ELSE 0 END WHERE id=$1",
       [projectId, amount, providerCompleted],
+    );
+  });
+}
+
+async function persistModerationRetry(job: JobRow, nextPayload: JobRow["payload"], providerMessage: string): Promise<void> {
+  await transaction(async (client) => {
+    await client.query(
+      "UPDATE jobs SET state='retrying',payload=$2,last_error=$3,available_at=now()+interval '1 second',reserved_cost_usd=0 WHERE id=$1",
+      [job.id, JSON.stringify(nextPayload), JSON.stringify({ code: "GOOGLE_MODERATION_RETRY", message: providerMessage })],
+    );
+    await client.query(
+      "UPDATE shots SET state='retrying',retry_count=$2,last_error=$3,last_operation=NULL WHERE id=$1",
+      [job.shot_id, job.attempt, JSON.stringify({ code: "GOOGLE_MODERATION_RETRY", message: providerMessage })],
+    );
+    await client.query("UPDATE projects SET status='generating',last_error=NULL WHERE id=$1", [job.project_id]);
+    await client.query(
+      `INSERT INTO checkpoints (project_id,event_type,failed_shot_ids,pending_shot_ids,current_job_id,snapshot)
+       VALUES ($1,'shot-moderation-retry','{}'::text[],ARRAY[$2]::text[],$3,$4)`,
+      [job.project_id, job.shot_id, job.id, JSON.stringify({ shotId: job.shot_id, retryAttempt: job.attempt, reason: "provider-output-filtered" })],
     );
   });
 }
