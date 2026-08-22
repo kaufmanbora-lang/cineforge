@@ -43,7 +43,7 @@ function roundMoney(value: number): number {
 export const DURATION_OPTIONS = [10, 30, 60, 180, 300, 600, 900, 1200, 1800, 2700, 3600] as const;
 
 export function formatDuration(totalSeconds: number): string {
-  if (totalSeconds < 60) return `${totalSeconds} sec`;
+  if (totalSeconds < 60) return `${totalSeconds} сек`;
   const minutes = Math.floor(totalSeconds / 60);
-  return `${minutes} min`;
+  return `${minutes} мин`;
 }

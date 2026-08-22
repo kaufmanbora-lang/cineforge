@@ -7,6 +7,14 @@ describe("API failure policy", () => {
     expect(classifyFailure(error)).toBe("quota");
     expect(retryDecision({ failure: "quota", attempt: 1, maxAttempts: 3 })).toEqual({ retry: false, pauseProject: true, delayMs: 0 });
   });
+  it("pauses on billing and key failures so completed checkpoints stay intact", () => {
+    const billing = Object.assign(new Error("Google billing failed_precondition"), { status: 400, code: "GOOGLE_BILLING_NOT_READY" });
+    const authentication = Object.assign(new Error("invalid API key"), { status: 401, code: "GOOGLE_AUTHENTICATION" });
+    expect(classifyFailure(billing)).toBe("billing");
+    expect(classifyFailure(authentication)).toBe("authentication");
+    expect(retryDecision({ failure: "billing", attempt: 1, maxAttempts: 3 })).toEqual({ retry: false, pauseProject: true, delayMs: 0 });
+    expect(retryDecision({ failure: "authentication", attempt: 1, maxAttempts: 3 })).toEqual({ retry: false, pauseProject: true, delayMs: 0 });
+  });
   it("uses bounded exponential backoff for transient errors", () => {
     expect(retryDecision({ failure: "server", attempt: 1, maxAttempts: 3, baseMs: 1000 })).toEqual({ retry: true, pauseProject: false, delayMs: 2300 });
     expect(retryDecision({ failure: "server", attempt: 3, maxAttempts: 3 })).toEqual({ retry: false, pauseProject: false, delayMs: 0 });

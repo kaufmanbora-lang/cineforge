@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { apiError } from "@/server/http";
 import { getProviderKey } from "@/server/provider-secrets";
-import { availableGoogleVideoModels } from "@/server/providers/video/google";
+import { diagnoseGoogleConnection } from "@/server/providers/video/google";
 
 export const runtime = "nodejs";
 
@@ -9,7 +9,7 @@ export async function GET() {
   try {
     const key = await getProviderKey("google");
     if (!key) return NextResponse.json({ models: [], connected: false });
-    return NextResponse.json({ models: await availableGoogleVideoModels(key), connected: true });
+    return NextResponse.json(await diagnoseGoogleConnection(key));
   } catch (error) {
     return apiError(error, 400);
   }

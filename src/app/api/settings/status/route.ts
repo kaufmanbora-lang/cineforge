@@ -14,12 +14,14 @@ export async function GET() {
   const routing = await openAIModelRouting();
   const rows = await query<{ settings: Record<string, unknown> }>("SELECT settings FROM workspace_settings WHERE workspace_id=$1", [env().DEFAULT_WORKSPACE_ID]).catch(() => []);
   const saved = rows[0]?.settings ?? {};
+  const availableGoogleModelIds = new Set(Array.isArray(google.metadata.availableModelIds) ? google.metadata.availableModelIds.map(String) : []);
   return NextResponse.json({
     google: {
       ...google,
-      models: Object.values(GOOGLE_VIDEO_MODELS),
+      models: Object.values(GOOGLE_VIDEO_MODELS).map((model) => ({ ...model, available: availableGoogleModelIds.has(model.id) })),
       quota: null,
-      quotaNote: "The Gemini Models API does not return remaining account quota. Active limits are shown in Google AI Studio.",
+      quotaNote: "Google не возвращает остаток Prepay-баланса или доступной квоты через Gemini Models API. Баланс проверяется в Google AI Studio, а точная ошибка оплаты сохраняется при фактическом запуске кадра.",
+      billing: google.metadata.billing ?? { status: "not_exposed_by_api", balanceUsd: null, billingUrl: "https://aistudio.google.com/billing", usageUrl: "https://aistudio.google.com/usage", spendUrl: "https://aistudio.google.com/spend" },
     },
     openai: { ...openai, taskModels: OPENAI_TASK_MODELS, availableModels: OPENAI_AVAILABLE_MODELS, routing },
     engine: {

@@ -131,7 +131,7 @@ export async function listProjects(workspaceId: string): Promise<ProjectRecord[]
     id: string; title: string; prompt: string; duration_seconds: number; model_id: string; resolution: string;
       aspect_ratio: string; render_tier: "draft" | "final"; status: ProjectRecord["status"]; progress: string; maximum_budget_usd: string;
     estimated_cost_usd: string; spent_usd: string; completed_shots: number; total_shots: number;
-    poster_storage_key: string | null; updated_at: string;
+    last_error: ProjectRecord["lastError"]; poster_storage_key: string | null; updated_at: string;
   }>("SELECT * FROM projects WHERE workspace_id = $1 ORDER BY updated_at DESC", [workspaceId]);
   return rows.map((row) => ({
     id: row.id,
@@ -149,6 +149,7 @@ export async function listProjects(workspaceId: string): Promise<ProjectRecord[]
     spentUsd: Number(row.spent_usd),
     completedShots: row.completed_shots,
     totalShots: row.total_shots,
+    lastError: row.last_error,
     posterUrl: row.poster_storage_key ?? undefined,
     updatedAt: row.updated_at,
   }));

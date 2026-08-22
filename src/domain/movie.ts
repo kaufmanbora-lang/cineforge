@@ -53,26 +53,30 @@ export const AudioContextSchema = z.object({
 
 export type AudioContext = z.infer<typeof AudioContextSchema>;
 
+export const CharacterStateSchema = z.object({
+  locationId: z.string(),
+  wardrobeId: z.string(),
+  heldProps: z.array(z.string()),
+  injuries: z.array(z.string()),
+  appearanceChanges: z.array(z.string()),
+  position: z.string(),
+  emotionalState: z.string(),
+});
+
+export const LocationStateSchema = z.object({
+  timeOfDay: z.string(),
+  weather: z.string(),
+  lighting: z.string(),
+  objectPositions: z.record(z.string(), z.string()),
+});
+
 export const ContinuityStateSchema = z.object({
   characterStates: z.record(
     z.string(),
-    z.object({
-      locationId: z.string(),
-      wardrobeId: z.string(),
-      heldProps: z.array(z.string()),
-      injuries: z.array(z.string()),
-      appearanceChanges: z.array(z.string()),
-      position: z.string(),
-      emotionalState: z.string(),
-    }),
+    CharacterStateSchema,
   ),
   locationId: z.string(),
-  locationState: z.object({
-    timeOfDay: z.string(),
-    weather: z.string(),
-    lighting: z.string(),
-    objectPositions: z.record(z.string(), z.string()),
-  }),
+  locationState: LocationStateSchema,
   previousShotId: z.string().nullable(),
   nextShotId: z.string().nullable(),
   requiredReferences: z.array(z.string()),
@@ -225,6 +229,70 @@ export const MoviePlanSchema = z.object({
 
 export type MoviePlan = z.infer<typeof MoviePlanSchema>;
 
+// OpenAI strict Structured Outputs intentionally forbids arbitrary JSON object
+// keys. The domain model keeps dictionaries because they are convenient for
+// continuity lookups, while this transport schema represents them as explicit
+// key/value rows. Conversion happens immediately after the API response.
+const StructuredCharacterSchema = CharacterSchema.extend({
+  relationships: z.array(z.object({ characterId: z.string(), description: z.string() })),
+});
+
+const StructuredLocationSchema = LocationSchema.extend({
+  objectLayout: z.array(z.object({ objectId: z.string(), position: z.string() })),
+});
+
+const StructuredContinuityStateSchema = ContinuityStateSchema.extend({
+  characterStates: z.array(z.object({ characterId: z.string(), state: CharacterStateSchema })),
+  locationState: LocationStateSchema.extend({
+    objectPositions: z.array(z.object({ objectId: z.string(), position: z.string() })),
+  }),
+  lockedValues: z.array(z.object({ key: z.string(), value: z.string() })),
+});
+
+const StructuredShotSchema = ShotSchema.extend({
+  continuity: StructuredContinuityStateSchema,
+});
+
+const StructuredSceneSchema = SceneSchema.extend({
+  shots: z.array(StructuredShotSchema),
+});
+
+export const MoviePlanStructuredOutputSchema = MoviePlanSchema.extend({
+  characters: z.array(StructuredCharacterSchema),
+  locations: z.array(StructuredLocationSchema),
+  scenes: z.array(StructuredSceneSchema),
+});
+
+export function moviePlanFromStructuredOutput(input: unknown): MoviePlan {
+  const parsed = MoviePlanStructuredOutputSchema.parse(input);
+  return MoviePlanSchema.parse({
+    ...parsed,
+    characters: parsed.characters.map((character) => ({
+      ...character,
+      relationships: Object.fromEntries(character.relationships.map((relationship) => [relationship.characterId, relationship.description])),
+    })),
+    locations: parsed.locations.map((location) => ({
+      ...location,
+      objectLayout: Object.fromEntries(location.objectLayout.map((entry) => [entry.objectId, entry.position])),
+    })),
+    scenes: parsed.scenes.map((scene) => ({
+      ...scene,
+      shots: scene.shots.map((shot) => ({
+        ...shot,
+        continuity: {
+          ...shot.continuity,
+          characterStates: Object.fromEntries(shot.continuity.characterStates.map((entry) => [entry.characterId, entry.state])),
+          locationState: {
+            ...shot.continuity.locationState,
+            objectPositions: Object.fromEntries(shot.continuity.locationState.objectPositions.map((entry) => [entry.objectId, entry.position])),
+          },
+          lockedValues: Object.fromEntries(shot.continuity.lockedValues.map((entry) => [entry.key, entry.value])),
+        },
+      })),
+    })),
+  });
+}
+
 export interface ProjectRecord {
   id: string;
   title: string;
@@ -241,6 +309,7 @@ export interface ProjectRecord {
   spentUsd: number;
   completedShots: number;
   totalShots: number;
+  lastError?: { stage?: string; code?: string; failure?: string; message?: string; [key: string]: unknown } | null;
   posterUrl?: string;
   updatedAt: string;
 }

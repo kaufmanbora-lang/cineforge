@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { zodTextFormat } from "openai/helpers/zod";
 import { buildContinuityState, validateContinuity } from "@/server/movie/continuity";
-import { scopeMoviePlanIds, type MoviePlan } from "@/domain/movie";
+import { MoviePlanStructuredOutputSchema, scopeMoviePlanIds, type MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
 
 describe("Project Memory and continuity", () => {
@@ -37,5 +38,17 @@ describe("Project Memory and continuity", () => {
     expect(scoped.scenes[0].shots[0].continuity.characterStates[scoped.characters[0].id].locationId).toBe(scoped.locations[0].id);
     expect(scoped.scenes[0].shots[0].sceneId).toBe(scoped.scenes[0].id);
     expect(twice).toEqual(scoped);
+  });
+  it("keeps every object closed for OpenAI strict Structured Outputs", () => {
+    const format = zodTextFormat(MoviePlanStructuredOutputSchema, "movie_plan");
+    const openObjects: string[] = [];
+    const visit = (value: unknown, path = "$") => {
+      if (!value || typeof value !== "object") return;
+      const row = value as Record<string, unknown>;
+      if (row.type === "object" && row.additionalProperties !== false) openObjects.push(path);
+      for (const [key, child] of Object.entries(row)) visit(child, `${path}.${key}`);
+    };
+    visit(format.schema);
+    expect(openObjects).toEqual([]);
   });
 });

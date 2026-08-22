@@ -248,7 +248,7 @@ body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial
 h1{font-size:32px;line-height:1.08;margin:30px 0 12px;letter-spacing:-.035em}p{color:#969eaa;font-size:14px;line-height:1.65;margin:0 0 28px;max-width:590px}
 label{display:block;color:#b5bbc4;font-size:12px;margin-bottom:9px}input{width:100%;height:48px;border:1px solid #323740;background:#0b0e12;color:#fff;padding:0 15px;font:14px ui-monospace,SFMono-Regular,Consolas,monospace;outline:none}input:focus{border-color:#d99148;box-shadow:0 0 0 3px rgba(217,145,72,.12)}
 .actions{display:flex;gap:10px;margin-top:18px}button{height:42px;border:1px solid #343941;background:#171b21;color:#e8ebef;padding:0 18px;font:600 13px "Segoe UI",sans-serif;cursor:pointer}button.primary{border-color:#e4a05a;background:#e4a05a;color:#17110b}button:disabled{opacity:.55;cursor:wait}.status{min-height:22px;margin-top:16px;font-size:12px;color:#7cc4b8}.status.error{color:#f08c86}.note{margin-top:30px;border-top:1px solid #252a31;padding-top:18px;color:#6f7782;font-size:11px;line-height:1.6}
-</style></head><body><main class="shell"><div class="brand"><span class="mark">CF</span>CineForge Studio · Windows</div><h1>Подключите облачную киностудию</h1><p>Интерфейс установлен на этом компьютере. Сценарии, очередь, checkpoints, видеофайлы и рендеры хранятся в облаке и продолжают работать, когда приложение закрыто или компьютер выключен.</p><label for="backend">CineForge backend URL</label><input id="backend" spellcheck="false" placeholder="https://your-cineforge-web.onrender.com"><div class="actions"><button class="primary" id="connect">Проверить и подключить</button><button id="help">Как развернуть backend</button></div><div class="status" id="status"></div><div class="note">URL сохраняется только в профиле Windows. Google и OpenAI API keys добавляются после подключения на странице Settings → API и никогда не встраиваются в установщик.</div></main><script>
+</style></head><body><main class="shell"><div class="brand"><span class="mark">CF</span>CineForge Studio · Windows</div><h1>Подключите облачную киностудию</h1><p>Интерфейс установлен на этом компьютере. Сценарии, очередь, контрольные точки, видеофайлы и рендеры хранятся в облаке и продолжают работать, когда приложение закрыто или компьютер выключен.</p><label for="backend">Адрес облачного сервера CineForge</label><input id="backend" spellcheck="false" placeholder="https://ваш-сервис.onrender.com"><div class="actions"><button class="primary" id="connect">Проверить и подключить</button><button id="help">Как развернуть сервер</button></div><div class="status" id="status"></div><div class="note">Адрес сохраняется только в профиле Windows. Ключи Google и OpenAI хранятся в защищённом серверном хранилище и никогда не встраиваются в установщик.</div></main><script>
 const input=document.getElementById('backend'),status=document.getElementById('status'),connect=document.getElementById('connect');
 window.cineforgeDesktop.getAppInfo().then(info=>{if(info.backendUrl)input.value=info.backendUrl});
 document.getElementById('help').addEventListener('click',()=>window.cineforgeDesktop.openRenderHelp());
@@ -269,7 +269,7 @@ function createSetupWindow(initialBackendUrl = "") {
     minHeight: 560,
     show: false,
     backgroundColor: "#080a0d",
-    title: `${APP_NAME} — Cloud Setup`,
+    title: `${APP_NAME} — подключение к облаку`,
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),

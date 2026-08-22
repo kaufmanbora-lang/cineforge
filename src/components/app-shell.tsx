@@ -17,20 +17,20 @@ import { useEffect, useState, type ReactNode } from "react";
 import { clsx } from "clsx";
 
 const navItems = [
-  { href: "/projects", label: "Projects", icon: FolderOpen },
-  { href: "/create", label: "Create Movie", icon: Clapperboard },
-  { href: "/screenwriter", label: "AI Screenwriter", icon: MessageSquareText },
-  { href: "/characters", label: "Characters", icon: Users },
-  { href: "/locations", label: "Locations", icon: MapPin },
-  { href: "/editor", label: "Editor", icon: Sparkles },
-  { href: "/renders", label: "Renders", icon: CloudCog },
-  { href: "/settings", label: "Settings", icon: Settings },
+  { href: "/projects", label: "Проекты", icon: FolderOpen },
+  { href: "/create", label: "Создать фильм", icon: Clapperboard },
+  { href: "/screenwriter", label: "ИИ-сценарист", icon: MessageSquareText },
+  { href: "/characters", label: "Персонажи", icon: Users },
+  { href: "/locations", label: "Локации", icon: MapPin },
+  { href: "/editor", label: "Редактор", icon: Sparkles },
+  { href: "/renders", label: "Рендеры", icon: CloudCog },
+  { href: "/settings", label: "Настройки", icon: Settings },
 ] as const;
 
 export function AppShell({
   children,
   projectTitle = "CineForge Studio",
-  role = "Screenwriter / AI Director",
+  role = "Сценарист / ИИ-режиссёр",
   compactTop = false,
 }: {
   children: ReactNode;
@@ -47,11 +47,11 @@ export function AppShell({
   return (
     <div className={clsx("app-shell", collapsed && "nav-collapsed")}>
       <aside className="side-nav">
-        <Link className="brand" href="/projects" aria-label="CineForge projects">
+        <Link className="brand" href="/projects" aria-label="Проекты CineForge">
           <span className="brand-mark">C</span>
           <span>CINEFORGE</span>
         </Link>
-        <nav aria-label="Primary navigation">
+        <nav aria-label="Основная навигация">
           {navItems.map(({ href, label, icon: Icon }) => {
             const active = pathname === href || pathname.startsWith(`${href}/`);
             return (
@@ -62,9 +62,9 @@ export function AppShell({
             );
           })}
         </nav>
-        <button className="collapse-nav" onClick={() => setCollapsed((value) => !value)} type="button" aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}>
+        <button className="collapse-nav" onClick={() => setCollapsed((value) => !value)} type="button" aria-label={collapsed ? "Развернуть навигацию" : "Свернуть навигацию"}>
           <Menu size={17} strokeWidth={1.5} />
-          <span>{collapsed ? "Expand" : "Collapse"}</span>
+          <span>{collapsed ? "Развернуть" : "Свернуть"}</span>
         </button>
       </aside>
 
@@ -75,9 +75,9 @@ export function AppShell({
             <strong>{projectTitle}</strong>
           </Link>
           <div className="top-spacer" />
-          <div className="autosave"><span className="status-dot green" />Persistent project state</div>
-          <div className="provider-status"><span className={`status-dot ${providers.google === undefined ? "amber" : providers.google ? "green" : "red"}`} />Google {providers.google === undefined ? "checking" : providers.google ? "configured" : "not configured"}</div>
-          <div className="provider-status"><span className={`status-dot ${providers.openai === undefined ? "amber" : providers.openai ? "green" : "red"}`} />OpenAI {providers.openai === undefined ? "checking" : providers.openai ? "configured" : "not configured"}</div>
+          <div className="autosave"><span className="status-dot green" />Проект сохраняется автоматически</div>
+          <div className="provider-status"><span className={`status-dot ${providers.google === undefined ? "amber" : providers.google ? "green" : "red"}`} />Google {providers.google === undefined ? "проверка" : providers.google ? "подключён" : "не подключён"}</div>
+          <div className="provider-status"><span className={`status-dot ${providers.openai === undefined ? "amber" : providers.openai ? "green" : "red"}`} />OpenAI {providers.openai === undefined ? "проверка" : providers.openai ? "подключён" : "не подключён"}</div>
           <span className="role-switcher">{role}</span>
         </header>
         <main className="app-main">{children}</main>

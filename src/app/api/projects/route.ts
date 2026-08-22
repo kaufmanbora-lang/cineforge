@@ -43,7 +43,7 @@ export async function GET(request: Request) {
     const projectId = new URL(request.url).searchParams.get("id");
     if (!projectId) return NextResponse.json({ projects });
     const project = projects.find((item) => item.id === projectId);
-    if (!project) return NextResponse.json({ error: "Project not found." }, { status: 404 });
+    if (!project) return NextResponse.json({ error: "Проект не найден." }, { status: 404 });
     const [plan, jobs, checkpoints, timeline, versions, exports, characters, locations] = await Promise.all([
       latestMoviePlan(projectId),
       query("SELECT id,type,state,scene_id,shot_id,attempt,max_attempts,last_error,created_at,updated_at FROM jobs WHERE project_id=$1 ORDER BY created_at DESC LIMIT 500", [projectId]),
@@ -72,7 +72,7 @@ export async function PATCH(request: Request) {
        RETURNING resource.id`,
       [body.resourceId, body.projectId, env().DEFAULT_WORKSPACE_ID, JSON.stringify(body.locks)],
     );
-    if (!result[0]) return NextResponse.json({ error: "Project memory item not found." }, { status: 404 });
+    if (!result[0]) return NextResponse.json({ error: "Элемент памяти проекта не найден." }, { status: 404 });
     return NextResponse.json({ saved: true, locks: body.locks });
   } catch (error) {
     return apiError(error, 400);
@@ -85,7 +85,7 @@ export async function POST(request: Request) {
     const body = CreateProjectBody.parse(await request.json());
     const model = getVideoModel(body.modelId);
     if (!model.resolutions.includes(body.resolution as Resolution)) {
-      return NextResponse.json({ error: `${body.resolution} is not supported by ${model.displayName}.` }, { status: 400 });
+      return NextResponse.json({ error: `Модель ${model.displayName} не поддерживает разрешение ${body.resolution}.` }, { status: 400 });
     }
     const estimate = estimateGeneration({ durationSeconds: body.durationSeconds, modelId: body.modelId, resolution: body.resolution });
     const rows = await query<{ id: string }>(

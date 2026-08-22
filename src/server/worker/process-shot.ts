@@ -83,7 +83,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     }
     if (operation.state === "failed" || !operation.output) {
       const error = new Error(operation.error?.message ?? "Video generation failed.");
-      Object.assign(error, { status: Number(operation.error?.code) || undefined });
+      Object.assign(error, { status: operation.error?.status, code: operation.error?.code });
       throw error;
     }
     providerCompleted = true;

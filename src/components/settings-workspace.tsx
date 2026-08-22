@@ -3,10 +3,12 @@
 import { useEffect, useState } from "react";
 import { Bot, CheckCircle2, Database, Eye, EyeOff, KeyRound, LockKeyhole, ServerCog, ShieldCheck, Video } from "lucide-react";
 import { Button, StatusDot } from "./ui";
+import { errorMessageRu } from "@/lib/ru";
 
 type ProviderState = { configured: boolean; source: "vault" | "environment" | "none"; hint: string | null; status: string; lastCheckedAt: string | null };
 type EngineConfig = { qcRetryThreshold: number; qcFlagThreshold: number; automaticRetries: number; workerConcurrency: number };
-type StatusPayload = { google: ProviderState & { models?: Array<{ id: string; displayName: string; resolutions: string[]; nativeAudio: boolean; selectable?: boolean }> }; openai: ProviderState & { taskModels?: Record<string,{ id: string; displayName: string }>; availableModels?: Array<{ id: string; displayName: string }>; routing?: Record<string,string> }; engine: EngineConfig; storage: { bucket: string; region: string; endpoint: string } };
+type GoogleBilling = { status: string; balanceUsd: number | null; message?: string; billingUrl: string; usageUrl: string; spendUrl: string };
+type StatusPayload = { google: ProviderState & { models?: Array<{ id: string; displayName: string; resolutions: string[]; nativeAudio: boolean; selectable?: boolean; available?: boolean }>; billing?: GoogleBilling; quotaNote?: string }; openai: ProviderState & { taskModels?: Record<string,{ id: string; displayName: string }>; availableModels?: Array<{ id: string; displayName: string }>; routing?: Record<string,string> }; engine: EngineConfig; storage: { bucket: string; region: string; endpoint: string } };
 
 export function SettingsWorkspace() {
   const [section, setSection] = useState("API");
@@ -31,79 +33,80 @@ export function SettingsWorkspace() {
   async function save(provider: "google" | "openai") {
     const key = provider === "google" ? googleKey : openaiKey;
     if (!key) return;
-    setBusy(provider); setMessage("Testing connection…");
+    setBusy(provider); setMessage("Проверка подключения…");
     try {
       const response = await fetch(`/api/settings/${provider}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: key }) });
       const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error ?? "Connection failed.");
+      if (!response.ok) throw new Error(errorMessageRu(payload.error, "Не удалось проверить подключение."));
       if (provider === "google") setGoogleKey("");
       else setOpenaiKey("");
-      setMessage(`${provider === "google" ? "Google" : "OpenAI"} API key verified and stored server-side.`);
+      setMessage(provider === "google" ? "Ключ Google действителен, каталог видеомоделей доступен. Баланс Google проверяется отдельно в AI Studio." : "Ключ OpenAI проверен и безопасно сохранён на сервере.");
       await loadStatus();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Connection failed."); }
+    } catch (error) { setMessage(errorMessageRu(error, "Не удалось проверить подключение.")); }
     finally { setBusy(undefined); }
   }
 
   async function test(provider: "google" | "openai") {
-    setBusy(`test-${provider}`); setMessage("Testing connection…");
+    setBusy(`test-${provider}`); setMessage("Проверка подключения…");
     try {
       const response = await fetch(`/api/settings/${provider}`, { method: "PUT" });
       const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error ?? "Connection failed.");
-      setMessage(`${provider === "google" ? "Google" : "OpenAI"} connection is healthy.`); await loadStatus();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Connection failed."); }
+      if (!response.ok) throw new Error(errorMessageRu(payload.error, "Не удалось проверить подключение."));
+      setMessage(provider === "google" ? "Ключ Google действителен, доступные модели обновлены. Остаток денег Google не передаёт через API." : "Подключение OpenAI работает."); await loadStatus();
+    } catch (error) { setMessage(errorMessageRu(error, "Не удалось проверить подключение.")); }
     finally { setBusy(undefined); }
   }
 
   async function saveRouting(task: string, modelId: string) {
-    setBusy(`routing-${task}`); setMessage("Saving model routing…");
+    setBusy(`routing-${task}`); setMessage("Сохранение модели для задачи…");
     try {
       const response = await fetch("/api/settings/openai", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task, modelId }) });
       const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error ?? "Unable to save model routing.");
-      setMessage(`${task} now uses ${modelId}.`); await loadStatus();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Unable to save model routing."); }
+      if (!response.ok) throw new Error(errorMessageRu(payload.error, "Не удалось сохранить выбор модели."));
+      setMessage(`Для задачи «${taskLabel(task)}» выбрана модель ${modelId}.`); await loadStatus();
+    } catch (error) { setMessage(errorMessageRu(error, "Не удалось сохранить выбор модели.")); }
     finally { setBusy(undefined); }
   }
 
   async function saveEngine() {
-    setBusy("engine"); setMessage("Saving Movie Engine limits…");
+    setBusy("engine"); setMessage("Сохранение лимитов киносистемы…");
     try {
       const response = await fetch("/api/settings/status", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(engine) });
-      const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Unable to save Movie Engine settings.");
-      setMessage("Movie Engine limits saved. QC and new job retries use them immediately; concurrency applies on the next worker restart."); await loadStatus();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Unable to save Movie Engine settings."); }
+      const payload = await response.json(); if (!response.ok) throw new Error(errorMessageRu(payload.error, "Не удалось сохранить настройки киносистемы."));
+      setMessage("Лимиты киносистемы сохранены. Проверка качества и новые повторы применяют их сразу; параллельность — после перезапуска фонового обработчика."); await loadStatus();
+    } catch (error) { setMessage(errorMessageRu(error, "Не удалось сохранить настройки киносистемы.")); }
     finally { setBusy(undefined); }
   }
 
   return <div className="page-frame">
-    <div className="page-heading"><div><h1>Settings</h1><p>Provider credentials, task models, storage and production limits.</p></div>{message ? <div className="secure-note"><CheckCircle2 size={14} />{message}</div> : null}</div>
+    <div className="page-heading"><div><h1>Настройки</h1><p>API-ключи, ИИ-модели, хранилище и производственные лимиты.</p></div>{message ? <div className="secure-note"><CheckCircle2 size={14} />{message}</div> : null}</div>
     <div className="settings-layout">
-      <nav className="settings-nav">{[{label:"API",icon:KeyRound},{label:"AI Models",icon:Bot},{label:"Movie Engine",icon:ServerCog},{label:"Storage",icon:Database},{label:"Security",icon:ShieldCheck}].map(({label,icon:Icon}) => <button className={section === label ? "active" : ""} key={label} onClick={() => setSection(label)} type="button"><Icon size={14} />{label}</button>)}</nav>
+      <nav className="settings-nav">{[{label:"API",icon:KeyRound},{label:"ИИ-модели",icon:Bot},{label:"Киносистема",icon:ServerCog},{label:"Хранилище",icon:Database},{label:"Безопасность",icon:ShieldCheck}].map(({label,icon:Icon}) => <button className={section === label ? "active" : ""} key={label} onClick={() => setSection(label)} type="button"><Icon size={14} />{label}</button>)}</nav>
       <div className="settings-content">
         {section === "API" ? <>
-          <ProviderCard icon={<Video size={16} />} name="Google Gemini / Video API" description="Veo 3.1, Gemini Omni Flash and discovered Google video models" provider={status?.google}>
-            <div className="form-row"><label htmlFor="google-key">API key</label><div><div className="field-group"><input autoComplete="off" id="google-key" onChange={(event) => setGoogleKey(event.target.value)} placeholder={status?.google.hint || "Enter GEMINI_API_KEY"} type={showGoogle ? "text" : "password"} value={googleKey} /><Button onClick={() => setShowGoogle((value) => !value)}>{showGoogle ? <EyeOff size={14} /> : <Eye size={14} />}</Button><Button disabled={!googleKey.trim()} loading={busy === "google"} onClick={() => save("google")} variant="primary">Save & test</Button></div><p className="field-help">After saving, this field is cleared. The full key is never returned to the browser.</p></div></div>
-            <div className="form-row"><label>Connection</label><div><Button loading={busy === "test-google"} onClick={() => test("google")}>Test Connection</Button><p className="field-help">Remaining account quota is not exposed by Google&apos;s Models API; use Google AI Studio for active project limits.</p></div></div>
+          <ProviderCard icon={<Video size={16} />} name="Google Gemini / Video API" description="Veo 3.1, Gemini Omni Flash и другие официально доступные видеомодели Google" provider={status?.google}>
+            <div className="form-row"><label htmlFor="google-key">API-ключ</label><div><div className="field-group"><input autoComplete="off" id="google-key" onChange={(event) => setGoogleKey(event.target.value)} placeholder={status?.google.hint || "Введите GEMINI_API_KEY"} type={showGoogle ? "text" : "password"} value={googleKey} /><Button aria-label={showGoogle ? "Скрыть ключ" : "Показать ключ"} onClick={() => setShowGoogle((value) => !value)}>{showGoogle ? <EyeOff size={14} /> : <Eye size={14} />}</Button><Button disabled={!googleKey.trim()} loading={busy === "google"} onClick={() => save("google")} variant="primary">Сохранить и проверить</Button></div><p className="field-help">После сохранения поле очищается. Полный ключ никогда не возвращается в браузер.</p></div></div>
+            <div className="form-row"><label>Подключение</label><div><Button loading={busy === "test-google"} onClick={() => test("google")}>Проверить ключ и модели</Button><p className="field-help">{status?.google.quotaNote ?? "Google не предоставляет остаток баланса через API."}</p><div className="page-actions" style={{ justifyContent: "flex-start", marginTop: 8 }}><a className="button button-teal" href={status?.google.billing?.billingUrl ?? "https://aistudio.google.com/billing"} rel="noreferrer" target="_blank">Баланс и Prepay</a><a className="button" href={status?.google.billing?.usageUrl ?? "https://aistudio.google.com/usage"} rel="noreferrer" target="_blank">Использование</a><a className="button" href={status?.google.billing?.spendUrl ?? "https://aistudio.google.com/spend"} rel="noreferrer" target="_blank">Лимит расходов</a></div></div></div>
             <ModelTable models={status?.google.models ?? []} />
           </ProviderCard>
-          <ProviderCard icon={<Bot size={16} />} name="OpenAI Responses API" description="ChatGPT screenwriter, prompt engineer and AI Director" provider={status?.openai}>
-            <div className="form-row"><label htmlFor="openai-key">API key</label><div><div className="field-group"><input autoComplete="off" id="openai-key" onChange={(event) => setOpenaiKey(event.target.value)} placeholder={status?.openai.hint || "Enter OPENAI_API_KEY"} type={showOpenAI ? "text" : "password"} value={openaiKey} /><Button onClick={() => setShowOpenAI((value) => !value)}>{showOpenAI ? <EyeOff size={14} /> : <Eye size={14} />}</Button><Button disabled={!openaiKey.trim()} loading={busy === "openai"} onClick={() => save("openai")} variant="primary">Save & test</Button></div><p className="field-help">Environment keys remain server-only. Stored keys are encrypted with AES-256-GCM.</p></div></div>
-            <div className="form-row"><label>Connection</label><div><Button loading={busy === "test-openai"} onClick={() => test("openai")}>Test Connection</Button></div></div>
+          <ProviderCard icon={<Bot size={16} />} name="OpenAI Responses API" description="ChatGPT-сценарист, инженер промптов и ИИ-режиссёр" provider={status?.openai}>
+            <div className="form-row"><label htmlFor="openai-key">API-ключ</label><div><div className="field-group"><input autoComplete="off" id="openai-key" onChange={(event) => setOpenaiKey(event.target.value)} placeholder={status?.openai.hint || "Введите OPENAI_API_KEY"} type={showOpenAI ? "text" : "password"} value={openaiKey} /><Button aria-label={showOpenAI ? "Скрыть ключ" : "Показать ключ"} onClick={() => setShowOpenAI((value) => !value)}>{showOpenAI ? <EyeOff size={14} /> : <Eye size={14} />}</Button><Button disabled={!openaiKey.trim()} loading={busy === "openai"} onClick={() => save("openai")} variant="primary">Сохранить и проверить</Button></div><p className="field-help">Ключ хранится только на сервере и шифруется с помощью AES-256-GCM.</p></div></div>
+            <div className="form-row"><label>Подключение</label><div><Button loading={busy === "test-openai"} onClick={() => test("openai")}>Проверить подключение</Button></div></div>
           </ProviderCard>
-          <div className="secure-note"><LockKeyhole size={15} />Secrets are resolved only inside server routes and workers. No provider key is serialized into React props, API responses or the client bundle.</div>
+          <div className="secure-note"><LockKeyhole size={15} />Секреты используются только серверными маршрутами и фоновым обработчиком. Ключи не попадают в React, ответы API или клиентский JavaScript.</div>
         </> : null}
-        {section === "AI Models" ? <ModelRouting available={status?.openai.availableModels ?? []} busy={busy} onChange={saveRouting} routing={status?.openai.routing ?? {}} /> : null}
-        {section === "Movie Engine" ? <EngineSettings busy={busy === "engine"} config={engine} onChange={setEngine} onSave={saveEngine} /> : null}
-        {section === "Storage" ? <InfoCard title="Object storage"><p>Generated video, audio, reference frames and exports use S3-compatible object storage. PostgreSQL contains only metadata and object keys.</p><div className="readout-list"><p><strong>Bucket</strong><span>{status?.storage.bucket ?? "Loading…"}</span></p><p><strong>Region</strong><span>{status?.storage.region ?? "Loading…"}</span></p><p><strong>Endpoint</strong><span>{status?.storage.endpoint ?? "Loading…"}</span></p></div><p className="field-help">Storage credentials and endpoint changes are deployment secrets; they are intentionally not editable in browser JavaScript.</p></InfoCard> : null}
-        {section === "Security" ? <InfoCard title="Security policy"><div className="memory-facts"><p><CheckCircle2 size={13} />Encrypted provider secrets</p><p><CheckCircle2 size={13} />Signed, expiring object URLs</p><p><CheckCircle2 size={13} />Validated request bodies</p><p><CheckCircle2 size={13} />Budget gates before paid generation</p></div></InfoCard> : null}
+        {section === "ИИ-модели" ? <ModelRouting available={status?.openai.availableModels ?? []} busy={busy} onChange={saveRouting} routing={status?.openai.routing ?? {}} /> : null}
+        {section === "Киносистема" ? <EngineSettings busy={busy === "engine"} config={engine} onChange={setEngine} onSave={saveEngine} /> : null}
+        {section === "Хранилище" ? <InfoCard title="Объектное хранилище"><p>Видео, звук, референсные кадры и экспорты хранятся в S3-совместимом объектном хранилище. В PostgreSQL находятся только метаданные и ключи объектов.</p><div className="readout-list"><p><strong>Контейнер</strong><span>{status?.storage.bucket ?? "Загрузка…"}</span></p><p><strong>Регион</strong><span>{status?.storage.region ?? "Загрузка…"}</span></p><p><strong>Адрес</strong><span>{status?.storage.endpoint ?? "Загрузка…"}</span></p></div><p className="field-help">Данные доступа к хранилищу являются секретами развёртывания и не редактируются в браузере.</p></InfoCard> : null}
+        {section === "Безопасность" ? <InfoCard title="Политика безопасности"><div className="memory-facts"><p><CheckCircle2 size={13} />Зашифрованные ключи провайдеров</p><p><CheckCircle2 size={13} />Подписанные временные ссылки на файлы</p><p><CheckCircle2 size={13} />Проверка входных данных</p><p><CheckCircle2 size={13} />Подтверждение бюджета до платной генерации</p></div></InfoCard> : null}
       </div>
     </div>
   </div>;
 }
 
-function ProviderCard({ icon, name, description, provider, children }: { icon: React.ReactNode; name: string; description: string; provider?: ProviderState; children: React.ReactNode }) { const connected = provider?.configured; return <section className="settings-card"><header className="settings-card-head"><span className="provider-mark">{icon}</span><div><h2>{name}</h2><p>{description}</p></div><span className="connection"><StatusDot tone={connected ? "green" : "red"} />{connected ? `Configured via ${provider?.source}` : "Not configured"}</span></header><div className="settings-card-body">{children}</div></section>; }
-function ModelTable({ models }: { models: Array<{ id: string; displayName: string; resolutions: string[]; nativeAudio: boolean; selectable?: boolean }> }) { return <table className="model-table"><thead><tr><th>Available model</th><th>Resolution</th><th>Audio</th><th>Status</th></tr></thead><tbody>{models.map((model) => <tr key={model.id}><td><strong>{model.displayName}</strong><br/><span style={{ color: "var(--muted)", fontFamily: "var(--mono)", fontSize: 8 }}>{model.id}</span></td><td>{model.resolutions.length ? model.resolutions.join(" · ") : "Unverified"}</td><td>{model.nativeAudio ? "Native" : model.selectable === false ? "Unverified" : "Separate"}</td><td><StatusDot tone={model.selectable === false ? "amber" : "green"} /> {model.selectable === false ? "Discovered" : "Adapter ready"}</td></tr>)}</tbody></table>; }
-function ModelRouting({ available, routing, busy, onChange }: { available: Array<{ id: string; displayName: string }>; routing: Record<string,string>; busy?: string; onChange: (task: string, modelId: string) => Promise<void> }) { return <InfoCard title="OpenAI task routing"><p>Strong reasoning is reserved for story architecture; faster models handle prompts and high-volume quality checks. Selections are stored per workspace and resolved only on the server.</p>{["screenwriting","prompts","qc"].map((task) => <div className="form-row" key={task}><label>{task[0].toUpperCase()+task.slice(1)}</label><div className="field-group"><select className="settings-select" disabled={!available.length || busy === `routing-${task}`} onChange={(event) => void onChange(task,event.target.value)} value={routing[task] ?? available[0]?.id ?? ""}>{!available.length ? <option value="">Connect OpenAI to load models</option> : null}{available.map((model) => <option key={model.id} value={model.id}>{model.displayName} · {model.id}</option>)}</select></div></div>)}</InfoCard>; }
-function EngineSettings({ config, busy, onChange, onSave }: { config: EngineConfig; busy: boolean; onChange: (value: EngineConfig) => void; onSave: () => Promise<void> }) { const numberField = (key: keyof EngineConfig, min: number, max: number) => ({ min, max, onChange: (event: React.ChangeEvent<HTMLInputElement>) => onChange({ ...config, [key]: Math.max(min, Math.min(max, Number(event.target.value) || min)) }), value: config[key] }); return <InfoCard title="Movie Engine"><p>These persisted limits control automatic retries and quality decisions. A failed shot never invalidates completed checkpoints.</p><div className="form-row"><label>QC retry below</label><input className="settings-select" type="number" {...numberField("qcRetryThreshold",0,100)}/></div><div className="form-row"><label>Flag below</label><input className="settings-select" type="number" {...numberField("qcFlagThreshold",0,100)}/></div><div className="form-row"><label>Automatic retries</label><input className="settings-select" type="number" {...numberField("automaticRetries",0,5)}/></div><div className="form-row"><label>Worker concurrency</label><div><input className="settings-select" type="number" {...numberField("workerConcurrency",1,16)}/><p className="field-help">Applied when the background worker next starts.</p></div></div><Button loading={busy} onClick={() => void onSave()} variant="primary">Save Movie Engine settings</Button></InfoCard>; }
+function ProviderCard({ icon, name, description, provider, children }: { icon: React.ReactNode; name: string; description: string; provider?: ProviderState; children: React.ReactNode }) { const connected = provider?.configured && provider.status !== "failed"; const source = provider?.source === "vault" ? "зашифрованное хранилище" : "серверная переменная"; return <section className="settings-card"><header className="settings-card-head"><span className="provider-mark">{icon}</span><div><h2>{name}</h2><p>{description}</p></div><span className="connection"><StatusDot tone={connected ? "green" : "red"} />{connected ? `Ключ сохранён: ${source}` : "Не подключён"}</span></header><div className="settings-card-body">{children}</div></section>; }
+function ModelTable({ models }: { models: Array<{ id: string; displayName: string; resolutions: string[]; nativeAudio: boolean; selectable?: boolean; available?: boolean }> }) { return <table className="model-table"><thead><tr><th>Видеомодель</th><th>Разрешение</th><th>Звук</th><th>Доступ ключа</th></tr></thead><tbody>{models.map((model) => <tr key={model.id}><td><strong>{model.displayName}</strong><br/><span style={{ color: "var(--muted)", fontFamily: "var(--mono)", fontSize: 8 }}>{model.id}</span></td><td>{model.resolutions.length ? model.resolutions.join(" · ") : "Не проверено"}</td><td>{model.nativeAudio ? "Встроенный" : model.selectable === false ? "Не проверено" : "Отдельный"}</td><td><StatusDot tone={model.available ? "green" : model.selectable === false ? "amber" : "red"} /> {model.available ? "Видна проекту" : model.selectable === false ? "Найдена без адаптера" : "Недоступна"}</td></tr>)}</tbody></table>; }
+function ModelRouting({ available, routing, busy, onChange }: { available: Array<{ id: string; displayName: string }>; routing: Record<string,string>; busy?: string; onChange: (task: string, modelId: string) => Promise<void> }) { return <InfoCard title="Распределение задач OpenAI"><p>Сильная модель используется для архитектуры истории; более быстрые модели — для промптов и массовой проверки качества. Выбор хранится отдельно для этой студии и применяется только на сервере.</p>{["screenwriting","prompts","qc"].map((task) => <div className="form-row" key={task}><label>{taskLabel(task)}</label><div className="field-group"><select className="settings-select" disabled={!available.length || busy === `routing-${task}`} onChange={(event) => void onChange(task,event.target.value)} value={routing[task] ?? available[0]?.id ?? ""}>{!available.length ? <option value="">Подключите OpenAI для загрузки моделей</option> : null}{available.map((model) => <option key={model.id} value={model.id}>{model.displayName} · {model.id}</option>)}</select></div></div>)}</InfoCard>; }
+function EngineSettings({ config, busy, onChange, onSave }: { config: EngineConfig; busy: boolean; onChange: (value: EngineConfig) => void; onSave: () => Promise<void> }) { const numberField = (key: keyof EngineConfig, min: number, max: number) => ({ min, max, onChange: (event: React.ChangeEvent<HTMLInputElement>) => onChange({ ...config, [key]: Math.max(min, Math.min(max, Number(event.target.value) || min)) }), value: config[key] }); return <InfoCard title="Киносистема"><p>Эти лимиты управляют автоматическими повторами и решениями контроля качества. Ошибка одного кадра никогда не отменяет готовые контрольные точки.</p><div className="form-row"><label>Повторять при оценке ниже</label><input className="settings-select" type="number" {...numberField("qcRetryThreshold",0,100)}/></div><div className="form-row"><label>Помечать при оценке ниже</label><input className="settings-select" type="number" {...numberField("qcFlagThreshold",0,100)}/></div><div className="form-row"><label>Автоматические повторы</label><input className="settings-select" type="number" {...numberField("automaticRetries",0,5)}/></div><div className="form-row"><label>Параллельных заданий</label><div><input className="settings-select" type="number" {...numberField("workerConcurrency",1,16)}/><p className="field-help">Применится после следующего запуска фонового обработчика.</p></div></div><Button loading={busy} onClick={() => void onSave()} variant="primary">Сохранить настройки киносистемы</Button></InfoCard>; }
 function InfoCard({ title, children }: { title: string; children: React.ReactNode }) { return <section className="settings-card"><header className="settings-card-head"><h2>{title}</h2></header><div className="settings-card-body" style={{ color: "var(--muted)", fontSize: 10, lineHeight: 1.6 }}>{children}</div></section>; }
+function taskLabel(task: string) { return ({ screenwriting: "Сценарий", prompts: "Промпты", qc: "Контроль качества" } as Record<string,string>)[task] ?? task; }

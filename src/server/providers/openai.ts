@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
-import { MoviePlanSchema, type MoviePlan } from "@/domain/movie";
+import { MoviePlanStructuredOutputSchema, moviePlanFromStructuredOutput, type MoviePlan } from "@/domain/movie";
 import { env } from "@/server/env";
 import { getProviderKey } from "@/server/provider-secrets";
 import { query } from "@/server/db";
@@ -74,12 +74,12 @@ export async function generateStructuredMoviePlan(input: {
         ],
       },
     ],
-    text: { format: zodTextFormat(MoviePlanSchema, "movie_plan") },
+    text: { format: zodTextFormat(MoviePlanStructuredOutputSchema, "movie_plan") },
     max_output_tokens: 120_000,
   });
-  const parsed = (response as typeof response & { output_parsed?: MoviePlan }).output_parsed;
+  const parsed = (response as typeof response & { output_parsed?: unknown }).output_parsed;
   if (!parsed) throw new Error("OpenAI returned no structured MoviePlan.");
-  return MoviePlanSchema.parse(parsed);
+  return moviePlanFromStructuredOutput(parsed);
 }
 
 export async function enhanceShotPrompt(input: {
@@ -205,15 +205,18 @@ export async function createScreenwriterStream(input: {
 }
 
 const SCREENWRITER_INSTRUCTIONS = `You are CineForge's production screenwriter. Return a strict MoviePlan only.
+Write every user-visible field in the language of the user's idea. If the language is Russian, all titles, descriptions, actions, dialogue, camera notes, sound notes and continuity descriptions must be in Russian. Keep only stable IDs and provider model IDs in ASCII.
 The screenplay must have meaningful dramatic content for the full target runtime without repeated shots, artificial slow motion, filler, reused dialogue or padding.
 Every scene and shot requires stable IDs. Every shot must be short enough for the chosen Google video model (maximum 10 seconds).
 Build character, location, wardrobe, voice, audio and continuity state explicitly. Dialogue text is exact. Audio contexts start clean unless carry-over is intentional.
 Locked values must never change without a direct user request. The total of shot durations should closely match the requested runtime.`;
 
 const SCREENWRITER_CHAT_INSTRUCTIONS = `You are CineForge AI Screenwriter. Help develop titles, concepts, characters, acts, scenes, dialogue and production-ready screenplays.
+Always answer in the user's language; default to Russian when the project language is unclear.
 Use the supplied project context and never mix facts between projects. Make targeted changes: when the user asks to change one scene or ending, preserve unaffected content and explain the affected range.
 When the user asks to start generation, call create_movie_from_current_screenplay. That tool only prepares a plan; paid video generation always needs explicit UI confirmation.`;
 
 const DIRECTOR_INSTRUCTIONS = `You are CineForge AI Director. Reason from the supplied screenplay, Project Memory, locked values, shot states and continuity evidence.
+Always answer in the user's language; default to Russian when the project language is unclear.
 Prefer minimal impact. Never regenerate unaffected content. For every proposed edit identify scene_id, shot_id, affected tracks/frames and unaffected range.
 Do not start paid video generation directly. Use create_movie_from_current_screenplay only to prepare a cost confirmation plan.`;

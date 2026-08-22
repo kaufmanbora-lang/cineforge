@@ -6,6 +6,7 @@ import { Clapperboard, KeyRound, Plus, RefreshCw } from "lucide-react";
 import { formatDuration } from "@/domain/estimation";
 import type { ProjectRecord } from "@/domain/movie";
 import { Button, StatusDot } from "./ui";
+import { errorMessageRu, projectStatusRu } from "@/lib/ru";
 
 type LibraryFilter = "All" | "Drafts" | "Rendering" | "Completed" | "Paused" | "Failed";
 
@@ -49,25 +50,25 @@ export function ProjectLibrary() {
 
   return <div className="page-frame">
     <div className="page-heading">
-      <div><h1>Project Library</h1><p>Every film, checkpoint and active render in one recoverable workspace.</p></div>
-      <div className="page-actions"><Button loading={loading} onClick={load}><RefreshCw size={14} />Refresh</Button><Link className="button button-primary" href="/create"><Plus size={14} />New Project</Link></div>
+      <div><h1>Библиотека проектов</h1><p>Все фильмы, контрольные точки и активные рендеры в едином восстанавливаемом пространстве.</p></div>
+      <div className="page-actions"><Button loading={loading} onClick={load}><RefreshCw size={14} />Обновить</Button><Link className="button button-primary" href="/create"><Plus size={14} />Новый проект</Link></div>
     </div>
-    {googleConfigured === false ? <div className="secure-note" style={{ margin: "4px 0 14px" }}><KeyRound size={15} />First-run setup: connect a Google Gemini API key before generating video.<Link className="button button-teal" style={{ marginLeft: "auto" }} href="/settings">Open Settings → API</Link></div> : null}
+    {googleConfigured === false ? <div className="secure-note" style={{ margin: "4px 0 14px" }}><KeyRound size={15} />Подключите ключ Google Gemini перед генерацией видео.<Link className="button button-teal" style={{ marginLeft: "auto" }} href="/settings">Открыть «Настройки → API»</Link></div> : null}
     <div className="filter-tabs">
-      {(["All","Drafts","Rendering","Completed","Paused","Failed"] as LibraryFilter[]).map((item) => <button className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)} type="button">{item}</button>)}
-      {offline ? <span style={{ marginLeft: "auto", paddingBottom: 11, color: "var(--muted)", fontSize: 9 }}>Infrastructure offline · project library unavailable</span> : null}
+      {(["All","Drafts","Rendering","Completed","Paused","Failed"] as LibraryFilter[]).map((item) => <button className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)} type="button">{{ All: "Все", Drafts: "Черновики", Rendering: "В работе", Completed: "Готовые", Paused: "Приостановленные", Failed: "С ошибкой" }[item]}</button>)}
+      {offline ? <span style={{ marginLeft: "auto", paddingBottom: 11, color: "var(--muted)", fontSize: 9 }}>Облачная инфраструктура недоступна</span> : null}
     </div>
     <div className="project-grid">
-      <Link className="new-project-card" href="/create"><div><span><Plus size={18} /></span><strong>Create a new film</strong></div></Link>
+      <Link className="new-project-card" href="/create"><div><span><Plus size={18} /></span><strong>Создать новый фильм</strong></div></Link>
       {visible.map((project) => <article className="project-card" key={project.id}>
-        <Link className="project-poster project-placeholder" href={`/editor?project=${project.id}`} onClick={() => localStorage.setItem("cineforge.projectId", project.id)}>
-          <Clapperboard size={30}/><span className="placeholder-label">{project.completedShots ? `${project.completedShots} shots checkpointed` : "No generated poster yet"}</span>
-          <span className="project-status"><StatusDot tone={project.status === "completed" ? "green" : project.status === "paused" ? "amber" : project.status === "failed" ? "red" : "teal"} />{project.status}</span>
+        <Link className="project-poster project-placeholder" href={`${project.status === "completed" ? "/editor" : "/create"}?project=${project.id}`} onClick={() => localStorage.setItem("cineforge.projectId", project.id)}>
+          <Clapperboard size={30}/><span className="placeholder-label">{project.completedShots ? `Сохранено кадров: ${project.completedShots}` : "Постер появится после генерации"}</span>
+          <span className="project-status"><StatusDot tone={project.status === "completed" ? "green" : project.status === "paused" ? "amber" : project.status === "failed" ? "red" : "teal"} />{projectStatusRu(project.status)}</span>
           <span className="project-duration">{formatDuration(project.durationSeconds)}</span>
         </Link>
-        <div className="project-card-body"><h2>{project.title}</h2><p>{project.modelId} · {project.resolution}</p><div className="project-progress"><i style={{ width: `${project.progress}%` }} /></div><div className="project-meta"><span>{project.completedShots}/{project.totalShots} shots</span><span>${Number(project.spentUsd).toFixed(2)}</span><span>{project.progress}%</span></div></div>
+        <div className="project-card-body"><h2>{project.title}</h2><p>{project.modelId} · {project.resolution}</p>{project.lastError?.message ? <p style={{ color: "var(--red)" }}>{errorMessageRu(project.lastError.message, "Проект остановлен с ошибкой.")}</p> : null}<div className="project-progress"><i style={{ width: `${project.progress}%` }} /></div><div className="project-meta"><span>{project.completedShots}/{project.totalShots} кадров</span><span>${Number(project.spentUsd).toFixed(2)}</span><span>{project.progress}%</span></div></div>
       </article>)}
     </div>
-    {!visible.length ? <div className="empty-state"><div><Clapperboard size={27} /><h2>No projects in this view</h2><p>Start a new movie or switch the library filter.</p><Link className="button button-primary" href="/create">Create Movie</Link></div></div> : null}
+    {!visible.length ? <div className="empty-state"><div><Clapperboard size={27} /><h2>Здесь пока нет проектов</h2><p>Создайте новый фильм или выберите другой фильтр.</p><Link className="button button-primary" href="/create">Создать фильм</Link></div></div> : null}
   </div>;
 }

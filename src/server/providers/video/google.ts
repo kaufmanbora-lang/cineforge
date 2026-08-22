@@ -60,6 +60,26 @@ export async function availableGoogleVideoModels(apiKey: string) {
   return [...known, ...discoveredVideoModels];
 }
 
+export async function diagnoseGoogleConnection(apiKey: string) {
+  const models = await availableGoogleVideoModels(apiKey);
+  const availableModelIds = models.filter((model) => model.available && model.selectable !== false).map((model) => model.id);
+  return {
+    connected: true as const,
+    keyValid: true as const,
+    modelCatalogAccessible: true as const,
+    availableModelIds,
+    billing: {
+      status: "not_exposed_by_api" as const,
+      balanceUsd: null,
+      message: "Ключ действителен и каталог моделей доступен. Google не передаёт остаток предоплаченного баланса через Gemini Models API; готовность оплаты окончательно проверяется при первом запросе генерации.",
+      billingUrl: "https://aistudio.google.com/billing",
+      usageUrl: "https://aistudio.google.com/usage",
+      spendUrl: "https://aistudio.google.com/spend",
+    },
+    models,
+  };
+}
+
 export class GoogleVeoAdapter implements VideoModelAdapter {
   readonly capabilities;
   constructor(modelId: string) {
@@ -115,10 +135,11 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
         response?: { generatedVideos?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }> };
       };
       if (raw.error) {
+        const normalized = normalizeGoogleProviderError({ status: raw.error.code, message: raw.error.message });
         return {
           ...operation,
           state: "failed",
-          error: { code: String(raw.error.code ?? "GOOGLE_ERROR"), message: raw.error.message ?? "Video generation failed", retryable: isRetryableCode(raw.error.code) },
+          error: normalized,
         };
       }
       if (!raw.done) return operation;
@@ -212,24 +233,58 @@ async function downloadGoogleFile(uri: string | undefined, apiKey: string): Prom
 
 async function googleHttpError(response: Response): Promise<Error> {
   const text = await response.text();
-  const error = new Error(`Google API ${response.status}: ${text.slice(0, 500)}`);
-  Object.assign(error, { status: response.status });
+  const normalized = normalizeGoogleProviderError({ status: response.status, message: text.slice(0, 1_500) });
+  const error = new Error(normalized.message);
+  Object.assign(error, { status: response.status, code: normalized.code, providerMessage: text.slice(0, 1_500) });
   return error;
 }
 
 function failedOperation(modelId: string, error: unknown, operationId = `failed-${Date.now()}`): ProviderOperation {
-  const status = typeof error === "object" && error && "status" in error ? Number((error as { status: number }).status) : undefined;
+  const normalized = normalizeGoogleProviderError(error);
   return {
     provider: "google",
     modelId,
     operationId,
     state: "failed",
-    error: {
-      code: status ? String(status) : "GOOGLE_SDK_ERROR",
-      message: error instanceof Error ? error.message : "Unknown Google API error",
-      retryable: status ? isRetryableCode(status) : true,
-    },
+    error: normalized,
   };
+}
+
+export function normalizeGoogleProviderError(error: unknown): { code: string; message: string; retryable: boolean; status?: number } {
+  const record = typeof error === "object" && error ? error as Record<string, unknown> : {};
+  const rawStatus = record.status ?? record.statusCode ?? record.httpStatus ?? (typeof record.code === "number" ? record.code : undefined);
+  const status = rawStatus === undefined ? undefined : Number(rawStatus);
+  const rawMessage = error instanceof Error ? error.message : typeof record.message === "string" ? record.message : String(error ?? "");
+  const probe = `${String(record.code ?? "")} ${rawMessage}`.toLowerCase();
+
+  if (status === 401 || /api[_ -]?key.*(invalid|expired)|unauthenticated|authentication/.test(probe)) {
+    return { code: "GOOGLE_AUTHENTICATION", status, retryable: false, message: "Google отклонил API-ключ. Создайте новый ключ Gemini API и замените его в разделе «Настройки → API»." };
+  }
+  if (/billing|prepay|prepaid|payment|credit balance|no credits|failed_precondition/.test(probe)) {
+    return { code: "GOOGLE_BILLING_NOT_READY", status, retryable: false, message: "Оплата Gemini API ещё не активна для проекта этого ключа. Проверьте положительный баланс Prepay и привязку billing именно к проекту ключа в Google AI Studio." };
+  }
+  if (status === 403 || /permission_denied|access restricted|permission/.test(probe)) {
+    return { code: "GOOGLE_PERMISSION_DENIED", status, retryable: false, message: "У проекта Google нет доступа к выбранной видеомодели. Проверьте платный уровень, регион, права проекта и ограничения ключа." };
+  }
+  if (status === 404 || /model_not_found|not found/.test(probe)) {
+    return { code: "GOOGLE_MODEL_UNAVAILABLE", status, retryable: false, message: "Выбранная видеомодель недоступна этому Google-проекту. Выберите другую доступную модель и продолжите с checkpoint." };
+  }
+  if (status === 429 && /quota|resource_exhausted|daily|balance|квот/.test(probe)) {
+    return { code: "GOOGLE_QUOTA_EXHAUSTED", status, retryable: false, message: "Квота или доступный лимит Gemini API исчерпаны. Проект поставлен на паузу и продолжится с незавершённого кадра после восстановления лимита." };
+  }
+  if (status === 429) {
+    return { code: "GOOGLE_RATE_LIMIT", status, retryable: true, message: "Google временно ограничил частоту запросов. CineForge повторит только незавершённый кадр с увеличивающейся задержкой." };
+  }
+  if (status === 408 || /timeout|deadline_exceeded/.test(probe)) {
+    return { code: "GOOGLE_TIMEOUT", status, retryable: true, message: "Google не завершил запрос вовремя. CineForge безопасно повторит только этот кадр." };
+  }
+  if ((status && status >= 500) || /service_unavailable|api_error|server error/.test(probe)) {
+    return { code: "GOOGLE_SERVER_ERROR", status, retryable: true, message: "Видеосервис Google временно недоступен. CineForge повторит запрос с ограниченной автоматической задержкой." };
+  }
+  if (/safety|moderation|blocked|policy/.test(probe)) {
+    return { code: "GOOGLE_MODERATION", status, retryable: false, message: "Google отклонил этот кадр по правилам безопасности. Исправьте только проблемную сцену или её prompt." };
+  }
+  return { code: "GOOGLE_REQUEST_FAILED", status, retryable: isRetryableCode(status), message: rawMessage ? `Google не выполнил запрос: ${rawMessage.slice(0, 500)}` : "Google не выполнил запрос по неизвестной причине." };
 }
 
 function isRetryableCode(code: number | undefined): boolean {
