@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { extractOmniVideo, googleVeoConfig, normalizeGoogleProviderError } from "@/server/providers/video/google";
-import { generationAccountingCost, providerDurationSeconds } from "@/server/worker/process-shot";
+import { extractOmniVideo, extractVeoVideo, googleVeoConfig, normalizeGoogleProviderError } from "@/server/providers/video/google";
+import { generationAccountingCost, providerDurationSeconds, resumableProviderOperation } from "@/server/worker/process-shot";
 import { shot } from "./fixtures";
 
 describe("Google Omni response parsing", () => {
@@ -56,6 +56,23 @@ describe("Google Omni response parsing", () => {
         { content: [{ type: "video", data: "AAAA", mime_type: "video/mp4" }] },
       ],
     })).toEqual({ type: "video", data: "AAAA", mime_type: "video/mp4" });
+  });
+
+  it("extracts the raw Gemini Developer API long-running Veo response", () => {
+    expect(extractVeoVideo({ response: { generateVideoResponse: { generatedSamples: [
+      { video: { uri: "https://generativelanguage.googleapis.com/v1beta/files/movie" } },
+    ] } } })).toEqual({ uri: "https://generativelanguage.googleapis.com/v1beta/files/movie" });
+  });
+
+  it("resumes a persisted SDK polling failure without starting a second paid generation", () => {
+    const saved = {
+      provider: "google" as const,
+      modelId: "veo-3.1-fast-generate-preview",
+      operationId: "models/veo-3.1-fast-generate-preview/operations/abc",
+      state: "failed" as const,
+      error: { code: "GOOGLE_REQUEST_FAILED", message: "operation._fromAPIResponse is not a function", retryable: false },
+    };
+    expect(resumableProviderOperation(saved, "same-shot-spec")).toMatchObject({ operationId: saved.operationId, state: "pending" });
   });
 
   it("does not label every failed precondition as a billing failure", () => {

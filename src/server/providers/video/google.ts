@@ -115,15 +115,24 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
 
   async poll(operation: ProviderOperation, apiKey: string): Promise<ProviderOperation> {
     if (operation.state !== "pending") return operation;
-    const ai = new GoogleGenAI({ apiKey });
     try {
-      const polled = await ai.operations.getVideosOperation({
-        operation: { name: operation.operationId } as never,
+      const operationName = operation.operationId.replace(/^\/?v1beta\//, "");
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/${operationName}`, {
+        headers: { "x-goog-api-key": apiKey },
+        cache: "no-store",
       });
-      const raw = polled as unknown as {
+      if (!response.ok) throw await googleHttpError(response);
+      const raw = await response.json() as {
         done?: boolean;
         error?: { code?: number; message?: string };
-        response?: { generatedVideos?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }> };
+        response?: {
+          generatedVideos?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }>;
+          generateVideoResponse?: {
+            generatedSamples?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }>;
+            raiMediaFilteredCount?: number;
+            raiMediaFilteredReasons?: string[];
+          };
+        };
       };
       if (raw.error) {
         const normalized = normalizeGoogleProviderError({ status: raw.error.code, message: raw.error.message });
@@ -134,8 +143,14 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
         };
       }
       if (!raw.done) return operation;
-      const video = raw.response?.generatedVideos?.[0]?.video;
-      if (!video) throw new Error("Google completed the operation without a video output.");
+      const video = extractVeoVideo(raw);
+      if (!video) {
+        const reasons = raw.response?.generateVideoResponse?.raiMediaFilteredReasons?.join("; ");
+        if (raw.response?.generateVideoResponse?.raiMediaFilteredCount) {
+          throw Object.assign(new Error(reasons || "Google blocked the generated video for safety reasons."), { code: "GOOGLE_MODERATION" });
+        }
+        throw new Error("Google completed the operation without a video output.");
+      }
       const bytes = video.videoBytes
         ? Buffer.from(video.videoBytes, "base64")
         : await downloadGoogleFile(video.uri, apiKey);
@@ -149,6 +164,15 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
       return failedOperation(operation.modelId, error, operation.operationId);
     }
   }
+}
+
+export function extractVeoVideo(raw: {
+  response?: {
+    generatedVideos?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }>;
+    generateVideoResponse?: { generatedSamples?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }> };
+  };
+}) {
+  return raw.response?.generatedVideos?.[0]?.video ?? raw.response?.generateVideoResponse?.generatedSamples?.[0]?.video;
 }
 
 export function googleVeoConfig(

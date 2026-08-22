@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { isRetryableDatabaseConnectionError, query, transaction } from "@/server/db";
 import { getProviderKey } from "@/server/provider-secrets";
 import { googleVideoAdapter } from "@/server/providers/video/google";
-import type { VideoGenerationRequest } from "@/server/providers/video/types";
+import type { ProviderOperation, VideoGenerationRequest } from "@/server/providers/video/types";
 import { getObjectIfExists, putObject, signedObjectUrl } from "@/server/storage";
 import { findCachedShot } from "@/server/movie/repository";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
@@ -30,6 +30,7 @@ interface JobRow {
   spent_usd: string;
   reserved_usd: string;
   reserved_cost_usd: string;
+  shot_last_operation: (ProviderOperation & { specHash?: string }) | null;
 }
 
 export async function processShot(databaseJobId: string): Promise<{ cached: boolean; storageKey: string; retrying?: boolean }> {
@@ -39,8 +40,9 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
        WHERE id=$1 AND state IN ('queued','retrying') AND available_at<=now()
        RETURNING *
      )
-     SELECT claimed.*,p.model_id,p.resolution,p.aspect_ratio,p.render_tier,p.maximum_budget_usd,p.spent_usd,p.reserved_usd
-     FROM claimed JOIN projects p ON p.id=claimed.project_id`,
+     SELECT claimed.*,p.model_id,p.resolution,p.aspect_ratio,p.render_tier,p.maximum_budget_usd,p.spent_usd,p.reserved_usd,
+       s.last_operation AS shot_last_operation
+     FROM claimed JOIN projects p ON p.id=claimed.project_id JOIN shots s ON s.id=claimed.shot_id`,
     [databaseJobId],
   );
   const job = rows[0];
@@ -71,7 +73,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   try {
     const prompt = job.payload.shot.generationPrompt;
     if (!prompt) throw new Error("Shot has no generation prompt.");
-    let operation;
+    let operation: ProviderOperation;
     if (staged) {
       operation = {
         provider: "google" as const,
@@ -99,12 +101,13 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         fastMode: job.render_tier === "draft",
       };
       const adapter = googleVideoAdapter(job.model_id);
-      operation = await adapter.start(request, apiKey);
-      await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify(operation)]);
+      const resumable = resumableProviderOperation(job.shot_last_operation, job.payload.specHash);
+      operation = resumable ?? await adapter.start(request, apiKey);
+      await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify({ ...operation, specHash: job.payload.specHash })]);
       while (operation.state === "pending") {
         await new Promise((resolve) => setTimeout(resolve, 10_000));
         operation = await adapter.poll(operation, apiKey);
-        await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify(operation)]);
+        await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify({ ...operation, specHash: job.payload.specHash })]);
       }
     }
     if (operation.state === "failed" || !operation.output) {
@@ -184,6 +187,17 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
 export function providerDurationSeconds(modelId: string, resolution: Resolution, plannedSeconds: number): number {
   const allowed = getAllowedDurations(modelId, resolution).sort((left, right) => left - right);
   return allowed.find((seconds) => seconds >= plannedSeconds) ?? allowed.at(-1) ?? plannedSeconds;
+}
+
+export function resumableProviderOperation(
+  saved: (ProviderOperation & { specHash?: string }) | null,
+  specHash: string,
+): ProviderOperation | null {
+  if (!saved || !/^(?:models\/[^/]+\/)?operations\//.test(saved.operationId)) return null;
+  const sdkPollingFailure = saved.error?.message.includes("_fromAPIResponse") ?? false;
+  if (saved.specHash !== specHash && !(!saved.specHash && sdkPollingFailure)) return null;
+  if (saved.state !== "pending" && !sdkPollingFailure) return null;
+  return { ...saved, state: "pending", error: undefined };
 }
 
 export function generationAccountingCost(projectedCost: number, outstandingReservation: number, staged: boolean): number {
