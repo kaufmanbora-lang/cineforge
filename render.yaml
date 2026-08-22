@@ -19,6 +19,8 @@ envVarGroups:
         value: ffprobe
       - key: WORKER_CONCURRENCY
         value: "4"
+      - key: WORKER_MEMORY_MB
+        value: "512"
       - key: MAX_AUTO_RETRIES
         value: "2"
       - key: QC_RETRY_THRESHOLD

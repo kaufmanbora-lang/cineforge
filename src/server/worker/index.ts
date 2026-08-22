@@ -18,7 +18,9 @@ await recoverInterruptedJobs();
 await recoverActiveProjects();
 await reconcileQueuedJobs();
 const settingRows = await query<{ settings: { workerConcurrency?: number } }>("SELECT settings FROM workspace_settings WHERE workspace_id=$1", [env().DEFAULT_WORKSPACE_ID]).catch(() => []);
-const workerConcurrency = Math.max(1, Math.min(16, Number(settingRows[0]?.settings.workerConcurrency ?? env().WORKER_CONCURRENCY)));
+const memoryConcurrency = Math.max(1, Math.floor(env().WORKER_MEMORY_MB / 512));
+const workerConcurrency = Math.max(1, Math.min(16, memoryConcurrency, Number(settingRows[0]?.settings.workerConcurrency ?? env().WORKER_CONCURRENCY)));
+process.stdout.write(`Worker concurrency ${workerConcurrency} for ${env().WORKER_MEMORY_MB} MB memory budget.\n`);
 
 const worker = new Worker(
   MOVIE_QUEUE,
