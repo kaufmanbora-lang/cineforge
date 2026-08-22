@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, providerDurationSeconds, resumableProviderOperation } from "@/server/worker/process-shot";
+import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, providerDurationSeconds, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
 import { shot } from "./fixtures";
 
 describe("Google Omni response parsing", () => {
@@ -145,6 +145,16 @@ describe("Google Omni response parsing", () => {
     expect(fallback.specHash).not.toBe(safeRetry.specHash);
     expect(fallback.shot.generationPrompt?.prompt).toContain("CINEFORGE OMNI FALLBACK");
     expect(omniFallbackPayload(fallback)).toBe(fallback);
+  });
+
+  it("returns an Omni billing failure to Veo with a neutral bounded prompt", () => {
+    const plannedShot = shot("shot-veo-rescue");
+    const omni = omniFallbackPayload({ shot: { ...plannedShot, generationPrompt: plannedShot.generationPrompt! }, specHash: "original" });
+    const rescued = veoNeutralRescuePayload(omni);
+    expect(rescued.providerModelId).toBe("veo-3.1-fast-generate-preview");
+    expect(rescued.specHash).not.toBe(omni.specHash);
+    expect(rescued.shot.generationPrompt?.prompt).toContain("CINEFORGE VEO NEUTRAL RESCUE");
+    expect(veoNeutralRescuePayload(rescued)).toBe(rescued);
   });
 
   it("resumes a persisted SDK polling failure without starting a second paid generation", () => {

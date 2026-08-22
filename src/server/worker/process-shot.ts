@@ -220,6 +220,12 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
+    if (failure === "billing" && job.payload.providerModelId === "gemini-omni-flash-preview" && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE")) {
+      const nextPayload = veoNeutralRescuePayload(job.payload);
+      await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_VEO_BILLING_FALLBACK"));
+      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
+      return { cached: false, storageKey: "", retrying: true };
+    }
     const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
     if (decision.pauseProject) await withDurableDatabaseRetry(() => pauseProjectJobs(job.project_id, { code: failure, message }));
     await withDurableDatabaseRetry(() => query(
@@ -253,6 +259,20 @@ export function omniFallbackPayload(payload: JobRow["payload"]): JobRow["payload
   const prompt = `${generationPrompt.prompt}\nCINEFORGE OMNI FALLBACK: Generate the same safe fictional shot. Preserve timing, camera, identity, wardrobe, location, lighting, continuity and clean audio context. No readable logos or real public figures.`;
   const shot = { ...payload.shot, generationPrompt: { ...generationPrompt, prompt } };
   return { ...payload, providerModelId: "gemini-omni-flash-preview", shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview" }) };
+}
+
+export function veoNeutralRescuePayload(payload: JobRow["payload"]): JobRow["payload"] {
+  if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE")) return payload;
+  const generationPrompt = payload.shot.generationPrompt;
+  if (!generationPrompt) return { ...payload, providerModelId: "veo-3.1-fast-generate-preview" };
+  const seconds = payload.shot.durationSeconds;
+  const prompt = `Create one ${seconds}-second photorealistic cinematic shot. Three unmarked black civilian vehicles drive peacefully and legally in a precise convoy on a broad New York avenue during blue hour. Normal speed, dry weather after rain, realistic reflections, coherent vehicle positions, smooth professional camera movement, no people in close-up, no dialogue, no pursuit, no collision, no weapons, no emergency lights, no government insignia, no readable logos, no public figures. Clean audio start with only restrained city ambience, tires and engines. CINEFORGE VEO NEUTRAL RESCUE.`;
+  const shot = { ...payload.shot, generationPrompt: {
+    ...generationPrompt,
+    prompt,
+    negativeDirectives: [...generationPrompt.negativeDirectives, "violence", "dangerous driving", "logos", "public figures"],
+  } };
+  return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", shot, specHash: contentHash({ shot, providerModelId: "veo-3.1-fast-generate-preview", neutralRescue: 1 }) };
 }
 
 function shouldSwitchFilteredVeoToOmni(job: JobRow): boolean {
