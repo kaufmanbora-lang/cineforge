@@ -119,7 +119,9 @@ export async function enqueueReadyProjectJobs(projectId: string): Promise<number
 export async function recoverInterruptedJobs(): Promise<number> {
   const rows = await query<{ id: string; type: string; idempotency_key: string }>(
     `UPDATE jobs SET state='queued', available_at=now(), last_error=jsonb_build_object('code','WORKER_RESTART','message','Recovered after worker restart')
-     WHERE state IN ('generating','validating','retrying') RETURNING id, type, idempotency_key`,
+     WHERE state IN ('generating','validating','retrying')
+       AND updated_at < now() - CASE WHEN type IN ('generate-shot','plan-project') THEN interval '2 minutes' ELSE interval '12 minutes' END
+     RETURNING id, type, idempotency_key`,
   );
   for (const row of rows) {
     const bullId = createHash("sha256").update(`${row.idempotency_key}:recovery`).digest("hex");
@@ -144,16 +146,15 @@ export async function reconcileQueuedJobs(): Promise<number> {
 }
 
 export async function recoverStaleJobs(): Promise<number> {
-  // Google documents an upper bound of minutes for ordinary video requests.
-  // A job left in an active state for twelve minutes without an update is an
-  // orphan (for example, the database restarted while BullMQ was handling it).
-  // The atomic claim in processShot prevents duplicate paid calls.
+  // Video and planning jobs publish frequent heartbeats, so two minutes of
+  // silence proves their worker lease is gone. FFmpeg/audio jobs get a longer
+  // window because their native subprocesses can legitimately stay quiet.
   const rows = await query<{ id: string; type: string; idempotency_key: string; priority: number }>(
     `UPDATE jobs j SET state='queued',available_at=now(),started_at=NULL,
        last_error=jsonb_build_object('code','STALE_JOB_RECOVERY','message','Recovered an orphaned generation job'),updated_at=now()
      FROM projects p
      WHERE j.project_id=p.id AND j.state IN ('generating','validating','retrying')
-       AND j.updated_at < now() - interval '12 minutes'
+       AND j.updated_at < now() - CASE WHEN j.type IN ('generate-shot','plan-project') THEN interval '2 minutes' ELSE interval '12 minutes' END
        AND p.status IN ('planning','queued','generating','validating','assembling')
      RETURNING j.id,j.type,j.idempotency_key,j.priority`,
   );
