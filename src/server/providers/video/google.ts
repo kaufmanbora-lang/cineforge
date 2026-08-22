@@ -208,7 +208,7 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
   const inspectJson = (value: string) => {
     done ||= /"done"\s*:\s*true/.test(value);
     const uriMatch = value.match(/"uri"\s*:\s*"((?:\\.|[^"\\])*)"/);
-    const mimeMatch = value.match(/"(?:mimeType|mime_type)"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    const mimeMatch = value.match(/"(?:mimeType|mime_type|encoding)"\s*:\s*"((?:\\.|[^"\\])*)"/);
     if (uriMatch) uri = JSON.parse(`"${uriMatch[1]}"`) as string;
     if (mimeMatch) mimeType = JSON.parse(`"${mimeMatch[1]}"`) as string;
   };
@@ -249,7 +249,9 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
           await reader.cancel();
           return { done: true, response: { generateVideoResponse: { generatedSamples: [{ video: { uri, mimeType } }] } } };
         }
-        const inlineMatch = /"(?:videoBytes|bytesBase64Encoded)"\s*:\s*"/.exec(window);
+        // Gemini Developer API uses `encodedVideo`; the SDK maps that field to
+        // `videoBytes`. Vertex responses use `bytesBase64Encoded`.
+        const inlineMatch = /"(?:encodedVideo|videoBytes|bytesBase64Encoded)"\s*:\s*"/.exec(window);
         if (inlineMatch) {
           inspectJson(window.slice(0, inlineMatch.index));
           window = window.slice(inlineMatch.index + inlineMatch[0].length);
@@ -335,8 +337,8 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
           // the worker heap and is supported for every Omni video response.
           delivery: "uri",
         },
-        generationConfig: {
-          videoConfig: {
+        generation_config: {
+          video_config: {
             task: request.editInstruction ? "edit" : request.references.length ? "reference_to_video" : "text_to_video",
           },
         },

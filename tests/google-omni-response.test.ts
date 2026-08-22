@@ -69,7 +69,7 @@ describe("Google Omni response parsing", () => {
     const expected = Buffer.from("test-video-payload");
     const payload = JSON.stringify({
       done: true,
-      response: { generateVideoResponse: { generatedSamples: [{ video: { mimeType: "video/mp4", videoBytes: expected.toString("base64") } }] } },
+      response: { generateVideoResponse: { generatedSamples: [{ video: { encoding: "video/mp4", encodedVideo: expected.toString("base64") } }] } },
     });
     const response = new Response(new ReadableStream({
       start(controller) {
