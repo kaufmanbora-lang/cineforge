@@ -56,15 +56,20 @@ export async function transcribeMovieDescription(file: File): Promise<string> {
     try {
       const apiKey = await getProviderKey("google");
       if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
-      const model = await selectGeminiFallbackModel(apiKey);
       const data = Buffer.from(await file.arrayBuffer()).toString("base64");
-      const payload = await callGeminiGenerateContent(apiKey, model, {
-        contents: [{ role: "user", parts: [
-          { inlineData: { mimeType: file.type || "audio/webm", data } },
-          { text: "Точно расшифруй речь на русском языке. Верни только произнесённый текст без пояснений, кавычек и markdown." },
-        ] }],
-      });
-      return geminiText(payload).trim();
+      let lastError: unknown;
+      for (const model of await selectGeminiFallbackModels(apiKey)) {
+        try {
+          const payload = await callGeminiGenerateContent(apiKey, model, {
+            contents: [{ role: "user", parts: [
+              { inlineData: { mimeType: file.type || "audio/webm", data } },
+              { text: "Точно расшифруй речь на русском языке. Верни только произнесённый текст без пояснений, кавычек и markdown." },
+            ] }],
+          });
+          return geminiText(payload).trim();
+        } catch (error) { lastError = error; }
+      }
+      throw lastError ?? new Error("Google API не предоставил резервную Gemini Flash модель.");
     } catch (geminiError) {
       throw combinedProviderError("распознавание речи", openAIError, geminiError);
     }
@@ -116,17 +121,22 @@ export async function generateStructuredMoviePlan(input: {
     try {
       const apiKey = await getProviderKey("google");
       if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
-      const model = await selectGeminiFallbackModel(apiKey);
-      const payload = await callGeminiGenerateContent(apiKey, model, {
-        systemInstruction: { parts: [{ text: SCREENWRITER_INSTRUCTIONS }] },
-        contents: [{ role: "user", parts: [{ text: moviePlanRequest(input) }] }],
-        generationConfig: {
-          responseMimeType: "application/json",
-          responseJsonSchema: z.toJSONSchema(MoviePlanStructuredOutputSchema),
-        },
-      });
-      const parsed = MoviePlanStructuredOutputSchema.parse(JSON.parse(geminiText(payload)));
-      return moviePlanFromStructuredOutput(parsed);
+      let lastError: unknown;
+      for (const model of await selectGeminiFallbackModels(apiKey)) {
+        try {
+          const payload = await callGeminiGenerateContent(apiKey, model, {
+            systemInstruction: { parts: [{ text: SCREENWRITER_INSTRUCTIONS }] },
+            contents: [{ role: "user", parts: [{ text: moviePlanRequest(input) }] }],
+            generationConfig: {
+              responseMimeType: "application/json",
+              responseJsonSchema: z.toJSONSchema(MoviePlanStructuredOutputSchema),
+            },
+          });
+          const parsed = MoviePlanStructuredOutputSchema.parse(JSON.parse(geminiText(payload)));
+          return moviePlanFromStructuredOutput(parsed);
+        } catch (error) { lastError = error; }
+      }
+      throw lastError ?? new Error("Google API не предоставил резервную Gemini Flash модель.");
     } catch (geminiError) {
       throw combinedProviderError("создание сценария", openAIError, geminiError);
     }
@@ -137,17 +147,16 @@ function moviePlanRequest(input: { projectId: string; idea: string; durationSeco
   return `Create a production-ready MoviePlan for project ${input.projectId}. Exact target runtime: ${input.durationSeconds} seconds. User idea: ${input.idea}`;
 }
 
-async function selectGeminiFallbackModel(apiKey: string): Promise<string> {
+async function selectGeminiFallbackModels(apiKey: string): Promise<string[]> {
   const models = await discoverGoogleModels(apiKey);
   const usable = models.filter((model) => (model.supportedGenerationMethods ?? []).includes("generateContent"));
-  const availableIds = new Set(usable.map((model) => model.name.replace(/^models\//, "")));
-  const preferred = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
-  const exact = preferred.find((id) => availableIds.has(id));
-  if (exact) return exact;
   const discovered = usable.map((model) => model.name.replace(/^models\//, ""))
-    .find((id) => /^gemini-.*flash/i.test(id) && !/image|tts|live|audio/i.test(id));
-  if (!discovered) throw new Error("Google API не предоставил текстовую Gemini Flash модель для резервного сценариста.");
-  return discovered;
+    .filter((id) => /^gemini-.*flash/i.test(id) && !/image|tts|live|audio/i.test(id));
+  const availableIds = new Set(discovered);
+  const preferred = ["gemini-2.5-flash", "gemini-3.7-flash", "gemini-2.5-flash-lite", "gemini-3.6-flash", "gemini-3.5-flash"];
+  const ordered = [...preferred.filter((id) => availableIds.has(id)), ...discovered.filter((id) => !preferred.includes(id))];
+  if (!ordered.length) throw new Error("Google API не предоставил текстовую Gemini Flash модель для резервного сценариста.");
+  return ordered.slice(0, 4);
 }
 
 async function callGeminiGenerateContent(apiKey: string, model: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {

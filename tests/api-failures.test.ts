@@ -20,6 +20,11 @@ describe("API failure policy", () => {
     expect(retryDecision({ failure: "server", attempt: 1, maxAttempts: 3, baseMs: 1000 })).toEqual({ retry: true, pauseProject: false, delayMs: 2300 });
     expect(retryDecision({ failure: "server", attempt: 3, maxAttempts: 3 })).toEqual({ retry: false, pauseProject: false, delayMs: 0 });
   });
+  it("retries a fallback provider 503 even when an earlier provider reported no credits", () => {
+    const error = Object.assign(new Error("OpenAI: no credits. Gemini: temporarily unavailable"), { status: 503 });
+    expect(classifyFailure(error)).toBe("server");
+    expect(retryDecision({ failure: "server", attempt: 1, maxAttempts: 3 })).toEqual({ retry: true, pauseProject: false, delayMs: 2300 });
+  });
   it("classifies a refused PostgreSQL connection as a recoverable network failure", () => {
     expect(classifyFailure(Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:5432"), { code: "ECONNREFUSED" }))).toBe("network");
   });

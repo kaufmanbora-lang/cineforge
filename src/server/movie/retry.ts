@@ -5,6 +5,9 @@ export function classifyFailure(error: unknown): FailureClass {
   const status = typeof error === "object" && error && "status" in error ? Number((error as { status: number }).status) : undefined;
   const code = typeof error === "object" && error && "code" in error ? String((error as { code: unknown }).code).toLowerCase() : "";
   const probe = `${code} ${message}`;
+  // The fallback provider's explicit server status is authoritative. If an
+  // earlier provider mentioned billing but Gemini returned 503, retry Gemini.
+  if (status && status >= 500) return "server";
   if (/billing|prepay|payment|credit balance|no credits|оплат/.test(probe)) return "billing";
   if (status === 401 || /authentication|unauthenticated|api[_ -]?key.*invalid/.test(probe)) return "authentication";
   if (status === 403 || /permission|access restricted/.test(probe)) return "permission";
@@ -12,7 +15,6 @@ export function classifyFailure(error: unknown): FailureClass {
   if (status === 429 && /quota|resource_exhausted|квот/.test(probe)) return "quota";
   if (status === 429) return "rate-limit";
   if (status === 408 || /timeout/.test(message)) return "timeout";
-  if (status && status >= 500) return "server";
   if (/moderation|safety|blocked/.test(message)) return "moderation";
   if (/corrupt|invalid media|ffprobe/.test(message)) return "corrupt";
   if (/upload|s3/.test(message)) return "upload";
