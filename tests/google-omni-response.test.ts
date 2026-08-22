@@ -71,6 +71,13 @@ describe("Google Omni response parsing", () => {
     ] } } })).toMatchObject({ videoBytes: "AAAA", mimeType: "video/mp4" });
   });
 
+  it("accepts a renamed base64 video field from a forward-compatible REST response", () => {
+    const encoded = Buffer.alloc(256, 7).toString("base64");
+    expect(extractVeoVideo({ response: { generateVideoResponse: { generatedSamples: [
+      { video: { futureVideoPayload: encoded, encoding: "video/mp4" } as never },
+    ] } } })?.videoBytes).toBe(encoded);
+  });
+
   it("streams a large inline Veo response to a temporary video file", async () => {
     const expected = Buffer.from("test-video-payload");
     const payload = JSON.stringify({

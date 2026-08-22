@@ -257,9 +257,10 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
         // Gemini Developer API uses `encodedVideo`; the SDK maps that field to
         // `videoBytes`. Vertex responses use `bytesBase64Encoded`.
         const inlineMatch = /"(?:encodedVideo|videoBytes|bytesBase64Encoded)"\s*:\s*"/.exec(window);
-        if (inlineMatch) {
-          inspectJson(window.slice(0, inlineMatch.index));
-          window = window.slice(inlineMatch.index + inlineMatch[0].length);
+        const genericInlineMatch = inlineMatch ?? /"[A-Za-z][A-Za-z0-9_]{0,79}"\s*:\s*"(?=[A-Za-z0-9+/]{128})/.exec(window);
+        if (genericInlineMatch) {
+          inspectJson(window.slice(0, genericInlineMatch.index));
+          window = window.slice(genericInlineMatch.index + genericInlineMatch[0].length);
           readingInlineVideo = true;
           output ??= createWriteStream(localFilePath, { flags: "wx" });
           continue;
@@ -301,9 +302,12 @@ export function extractVeoVideo(raw: {
   if (!video) return undefined;
   // Small REST responses are parsed as raw JSON before the SDK mapping layer,
   // where MLDev names the fields `encodedVideo` and `encoding`.
+  const unknownInlineVideo = Object.entries(video).find(([, value]) =>
+    typeof value === "string" && value.length >= 128 && /^[A-Za-z0-9+/]+={0,2}$/.test(value),
+  )?.[1] as string | undefined;
   return {
     ...video,
-    videoBytes: video.videoBytes ?? video.encodedVideo ?? video.bytesBase64Encoded,
+    videoBytes: video.videoBytes ?? video.encodedVideo ?? video.bytesBase64Encoded ?? unknownInlineVideo,
     mimeType: video.mimeType ?? video.encoding,
   };
 }
