@@ -1,8 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { extractOmniVideo, normalizeGoogleProviderError } from "@/server/providers/video/google";
+import { extractOmniVideo, googleVeoConfig, normalizeGoogleProviderError } from "@/server/providers/video/google";
 import { generationAccountingCost } from "@/server/worker/process-shot";
+import { shot } from "./fixtures";
 
 describe("Google Omni response parsing", () => {
+  it("does not send the Enterprise-only seed parameter to Gemini Developer API", () => {
+    const plannedShot = shot("shot-1");
+    expect(googleVeoConfig({
+      projectId: "project-1",
+      sceneId: plannedShot.sceneId,
+      shotId: plannedShot.id,
+      modelId: "veo-3.1-fast-generate-preview",
+      prompt: plannedShot.generationPrompt!.prompt,
+      negativeDirectives: [],
+      durationSeconds: 8,
+      resolution: "720p",
+      aspectRatio: "16:9",
+      seed: 42,
+      references: [],
+      fastMode: true,
+    })).not.toHaveProperty("seed");
+  });
+
   it("extracts the production Interactions API video content part", () => {
     expect(extractOmniVideo({
       steps: [

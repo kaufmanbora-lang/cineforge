@@ -97,16 +97,7 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
         model: request.modelId,
         prompt: request.prompt,
         image: primaryImage ? imageValue(primaryImage) : undefined,
-        config: {
-          aspectRatio: request.aspectRatio,
-          resolution: request.resolution === "preview" ? "720p" : request.resolution,
-          durationSeconds: request.durationSeconds,
-          seed: request.seed ?? undefined,
-          negativePrompt: request.negativeDirectives.join(", "),
-          numberOfVideos: 1,
-          lastFrame: lastFrame ? imageValue(lastFrame) : undefined,
-          referenceImages: subjectReferences.map((reference) => ({ image: imageValue(reference), referenceType: "asset" })),
-        },
+        config: googleVeoConfig(request, lastFrame, subjectReferences),
       } as never);
       const raw = operation as unknown as { name?: string; done?: boolean };
       return {
@@ -158,6 +149,22 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
       return failedOperation(operation.modelId, error, operation.operationId);
     }
   }
+}
+
+export function googleVeoConfig(
+  request: VideoGenerationRequest,
+  lastFrame?: VideoGenerationRequest["references"][number],
+  subjectReferences: VideoGenerationRequest["references"] = [],
+) {
+  return {
+    aspectRatio: request.aspectRatio,
+    resolution: request.resolution === "preview" ? "720p" : request.resolution,
+    durationSeconds: request.durationSeconds,
+    negativePrompt: request.negativeDirectives.join(", "),
+    numberOfVideos: 1,
+    lastFrame: lastFrame ? imageValue(lastFrame) : undefined,
+    referenceImages: subjectReferences.map((reference) => ({ image: imageValue(reference), referenceType: "asset" })),
+  };
 }
 
 export class GoogleOmniAdapter implements VideoModelAdapter {
