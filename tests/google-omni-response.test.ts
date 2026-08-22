@@ -104,6 +104,18 @@ describe("Google Omni response parsing", () => {
       .toMatchObject({ state: "pending" });
   });
 
+  it("re-polls a completed Veo operation after a parser upgrade without paying twice", () => {
+    const saved = {
+      provider: "google" as const,
+      modelId: "veo-3.1-fast-generate-preview",
+      operationId: "models/veo-3.1-fast-generate-preview/operations/already-paid",
+      state: "failed" as const,
+      error: { code: "GOOGLE_REQUEST_FAILED", message: "Google completed the operation without downloadable video media.", retryable: false },
+      specHash: "same-shot-spec",
+    };
+    expect(resumableProviderOperation(saved, "same-shot-spec")).toMatchObject({ state: "pending", operationId: saved.operationId });
+  });
+
   it("resumes a completed URI result without making a second paid request", () => {
     const saved = {
       provider: "google" as const,

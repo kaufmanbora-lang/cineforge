@@ -235,7 +235,8 @@ export function resumableProviderOperation(
     if (saved.output.providerUri || localFileExists) return saved;
   }
   if (!saved.operationId.startsWith("operations/") && !saved.operationId.includes("/operations/")) return null;
-  if (saved.state !== "pending" && !sdkPollingFailure) return null;
+  const parserRecovery = saved.state === "failed" && /without downloadable|without (?:a )?video output|inline video/i.test(saved.error?.message ?? "");
+  if (saved.state !== "pending" && !sdkPollingFailure && !parserRecovery) return null;
   return { ...saved, state: "pending", error: undefined };
 }
 

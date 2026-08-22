@@ -158,7 +158,9 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
         throw new Error("Google completed the operation without a video output.");
       }
       const bytes = video.videoBytes ? Buffer.from(video.videoBytes, "base64") : undefined;
-      if (!bytes && !video.uri && !video.localFilePath) throw new Error("Google completed the operation without downloadable video media.");
+      if (!bytes && !video.uri && !video.localFilePath) {
+        throw new Error(`Google completed the operation without downloadable video media. Video fields: ${Object.keys(video).sort().join(", ") || "none"}.`);
+      }
       return {
         ...operation,
         state: "completed",
