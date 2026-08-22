@@ -25,7 +25,7 @@ interface JobRow {
   shot_id: string;
   attempt: number;
   max_attempts: number;
-  payload: { shot: { durationSeconds: number; generationPrompt?: { prompt: string; negativeDirectives: string[]; seed: number | null }; continuity: { requiredReferences: string[] }; audioContext?: { dialogue: Array<{ id: string; characterId: string; text: string; delivery: string; startSeconds: number; durationSeconds: number }> } }; specHash: string };
+  payload: { providerModelId?: string; shot: { durationSeconds: number; generationPrompt?: { prompt: string; negativeDirectives: string[]; seed: number | null }; continuity: { requiredReferences: string[] }; audioContext?: { dialogue: Array<{ id: string; characterId: string; text: string; delivery: string; startSeconds: number; durationSeconds: number }> } }; specHash: string };
   model_id: string;
   resolution: Resolution;
   aspect_ratio: "16:9" | "9:16";
@@ -53,6 +53,12 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   // Another worker/reconciler may already own this database job. Treat that as
   // an idempotent no-op; only the atomic claimant may call the paid provider.
   if (!job) return { cached: false, storageKey: "", retrying: true };
+  if (shouldSwitchFilteredVeoToOmni(job)) {
+    job.payload = omniFallbackPayload(job.payload);
+    job.shot_last_operation = null;
+    await query("UPDATE jobs SET payload=$2 WHERE id=$1", [job.id, JSON.stringify(job.payload)]);
+    await query("UPDATE shots SET last_operation=NULL WHERE id=$1", [job.shot_id]);
+  }
   const heartbeat = setInterval(() => {
     void query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state IN ('generating','validating')", [job.id]).catch(() => undefined);
   }, 10_000);
@@ -66,9 +72,10 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     await enqueueAutomaticAssemblyIfReady(job.project_id);
     return { cached: true, storageKey: cached.storageKey };
   }
-  const capabilities = getVideoModel(job.model_id);
+  const effectiveModelId = job.payload.providerModelId ?? job.model_id;
+  const capabilities = getVideoModel(effectiveModelId);
   const price = capabilities.pricePerSecondUsd[job.resolution] ?? capabilities.pricePerSecondUsd["720p"] ?? 0;
-  const providerDuration = providerDurationSeconds(job.model_id, job.resolution, job.payload.shot.durationSeconds);
+  const providerDuration = providerDurationSeconds(effectiveModelId, job.resolution, job.payload.shot.durationSeconds);
   const projectedCost = providerDuration * price;
   const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/${job.payload.specHash}.mp4`;
   // Check the durable provider checkpoint before reserving more budget. A
@@ -87,7 +94,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     if (staged) {
       operation = {
         provider: "google" as const,
-        modelId: job.model_id,
+        modelId: effectiveModelId,
         operationId: `staged-${job.payload.specHash}`,
         state: "completed" as const,
         progress: 100,
@@ -101,17 +108,17 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         projectId: job.project_id,
         sceneId: job.scene_id,
         shotId: job.shot_id,
-        modelId: job.model_id,
+        modelId: effectiveModelId,
         prompt: prompt.prompt,
         negativeDirectives: prompt.negativeDirectives,
         durationSeconds: providerDuration,
         resolution: job.resolution,
         aspectRatio: job.aspect_ratio,
         seed: prompt.seed,
-        references: await loadShotReferences(job),
+        references: await loadShotReferences(job, effectiveModelId),
         fastMode: job.render_tier === "draft",
       };
-      const adapter = googleVideoAdapter(job.model_id);
+      const adapter = googleVideoAdapter(effectiveModelId);
       const resumable = resumableProviderOperation(job.shot_last_operation, job.payload.specHash);
       operation = resumable ?? await adapter.start(request, apiKey);
       const providerStartedAt = resumable?.startedAt ?? new Date().toISOString();
@@ -207,6 +214,12 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
+    if (failure === "moderation" && !job.payload.providerModelId && !job.model_id.startsWith("gemini-omni")) {
+      const nextPayload = omniFallbackPayload(job.payload);
+      await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_OMNI_FALLBACK"));
+      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
+      return { cached: false, storageKey: "", retrying: true };
+    }
     const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
     if (decision.pauseProject) await withDurableDatabaseRetry(() => pauseProjectJobs(job.project_id, { code: failure, message }));
     await withDurableDatabaseRetry(() => query(
@@ -231,6 +244,23 @@ export function moderationRetryPayload(payload: JobRow["payload"]): JobRow["payl
   const prompt = `${generationPrompt.prompt}\nCINEFORGE SAFETY RETRY: This is a peaceful fictional cinematic scene with fictional people and organizations. No weapons, injury, violence, dangerous driving, pursuit, real government insignia, public figures, or readable brands. Keep every safe visual, camera, continuity, wardrobe, location, and audio detail unchanged.`;
   const shot = { ...payload.shot, generationPrompt: { ...generationPrompt, prompt } };
   return { ...payload, shot, specHash: contentHash({ shot, safetyRetry: 1 }) };
+}
+
+export function omniFallbackPayload(payload: JobRow["payload"]): JobRow["payload"] {
+  if (payload.providerModelId === "gemini-omni-flash-preview") return payload;
+  const generationPrompt = payload.shot.generationPrompt;
+  if (!generationPrompt) return { ...payload, providerModelId: "gemini-omni-flash-preview" };
+  const prompt = `${generationPrompt.prompt}\nCINEFORGE OMNI FALLBACK: Generate the same safe fictional shot. Preserve timing, camera, identity, wardrobe, location, lighting, continuity and clean audio context. No readable logos or real public figures.`;
+  const shot = { ...payload.shot, generationPrompt: { ...generationPrompt, prompt } };
+  return { ...payload, providerModelId: "gemini-omni-flash-preview", shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview" }) };
+}
+
+function shouldSwitchFilteredVeoToOmni(job: JobRow): boolean {
+  return !job.model_id.startsWith("gemini-omni")
+    && !job.payload.providerModelId
+    && Boolean(job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE SAFETY RETRY"))
+    && job.shot_last_operation?.state === "failed"
+    && job.shot_last_operation.error?.code === "GOOGLE_MODERATION";
 }
 
 export function providerDurationSeconds(modelId: string, resolution: Resolution, plannedSeconds: number): number {
@@ -285,8 +315,8 @@ async function withDurableDatabaseRetry<T>(operation: () => Promise<T>): Promise
   }
 }
 
-async function loadShotReferences(job: JobRow): Promise<ReferenceImage[]> {
-  const capabilities = getVideoModel(job.model_id);
+async function loadShotReferences(job: JobRow, modelId: string): Promise<ReferenceImage[]> {
+  const capabilities = getVideoModel(modelId);
   const references: ReferenceImage[] = [];
   const dependencyId = job.payload.shot.continuity && "previousShotId" in job.payload.shot.continuity
     ? String((job.payload.shot.continuity as { previousShotId?: string | null }).previousShotId ?? "")
@@ -419,15 +449,15 @@ async function settleFailedReservation(jobId: string, projectId: string, provide
   });
 }
 
-async function persistModerationRetry(job: JobRow, nextPayload: JobRow["payload"], providerMessage: string): Promise<void> {
+async function persistModerationRetry(job: JobRow, nextPayload: JobRow["payload"], providerMessage: string, code = "GOOGLE_MODERATION_RETRY"): Promise<void> {
   await transaction(async (client) => {
     await client.query(
       "UPDATE jobs SET state='retrying',payload=$2,last_error=$3,available_at=now()+interval '1 second',reserved_cost_usd=0 WHERE id=$1",
-      [job.id, JSON.stringify(nextPayload), JSON.stringify({ code: "GOOGLE_MODERATION_RETRY", message: providerMessage })],
+      [job.id, JSON.stringify(nextPayload), JSON.stringify({ code, message: providerMessage })],
     );
     await client.query(
       "UPDATE shots SET state='retrying',retry_count=$2,last_error=$3,last_operation=NULL WHERE id=$1",
-      [job.shot_id, job.attempt, JSON.stringify({ code: "GOOGLE_MODERATION_RETRY", message: providerMessage })],
+      [job.shot_id, job.attempt, JSON.stringify({ code, message: providerMessage })],
     );
     await client.query("UPDATE projects SET status='generating',last_error=NULL WHERE id=$1", [job.project_id]);
     await client.query(

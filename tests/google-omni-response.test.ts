@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, providerDurationSeconds, resumableProviderOperation } from "@/server/worker/process-shot";
+import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, providerDurationSeconds, resumableProviderOperation } from "@/server/worker/process-shot";
 import { shot } from "./fixtures";
 
 describe("Google Omni response parsing", () => {
@@ -135,6 +135,16 @@ describe("Google Omni response parsing", () => {
     expect(retried.specHash).not.toBe(payload.specHash);
     expect(retried.shot.generationPrompt?.prompt).toContain("CINEFORGE SAFETY RETRY");
     expect(moderationRetryPayload(retried)).toBe(retried);
+  });
+
+  it("switches only the repeatedly filtered shot to OmniFlash", () => {
+    const plannedShot = shot("shot-omni-fallback");
+    const safeRetry = moderationRetryPayload({ shot: { ...plannedShot, generationPrompt: plannedShot.generationPrompt! }, specHash: "original" });
+    const fallback = omniFallbackPayload(safeRetry);
+    expect(fallback.providerModelId).toBe("gemini-omni-flash-preview");
+    expect(fallback.specHash).not.toBe(safeRetry.specHash);
+    expect(fallback.shot.generationPrompt?.prompt).toContain("CINEFORGE OMNI FALLBACK");
+    expect(omniFallbackPayload(fallback)).toBe(fallback);
   });
 
   it("resumes a persisted SDK polling failure without starting a second paid generation", () => {
