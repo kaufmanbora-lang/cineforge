@@ -51,6 +51,11 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   // Another worker/reconciler may already own this database job. Treat that as
   // an idempotent no-op; only the atomic claimant may call the paid provider.
   if (!job) return { cached: false, storageKey: "", retrying: true };
+  const heartbeat = setInterval(() => {
+    void query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state IN ('generating','validating')", [job.id]).catch(() => undefined);
+  }, 10_000);
+  heartbeat.unref();
+  try {
   await query("UPDATE projects SET status='generating',updated_at=now() WHERE id=$1 AND status NOT IN ('completed','cancelled')", [job.project_id]);
   const cached = await findCachedShot(job.project_id, job.shot_id, job.payload.specHash);
   if (cached) {
@@ -189,6 +194,9 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     }
     throw error;
   }
+  } finally {
+    clearInterval(heartbeat);
+  }
 }
 
 export function providerDurationSeconds(modelId: string, resolution: Resolution, plannedSeconds: number): number {
@@ -200,7 +208,7 @@ export function resumableProviderOperation(
   saved: PersistedProviderOperation | null,
   specHash: string,
 ): PersistedProviderOperation | null {
-  if (!saved || !/^(?:models\/[^/]+\/)?operations\//.test(saved.operationId)) return null;
+  if (!saved || (!saved.operationId.startsWith("operations/") && !saved.operationId.includes("/operations/"))) return null;
   const sdkPollingFailure = saved.error?.message.includes("_fromAPIResponse") ?? false;
   if (saved.specHash !== specHash && !(!saved.specHash && sdkPollingFailure)) return null;
   if (saved.state !== "pending" && !sdkPollingFailure) return null;

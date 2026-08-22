@@ -73,6 +73,8 @@ describe("Google Omni response parsing", () => {
       error: { code: "GOOGLE_REQUEST_FAILED", message: "operation._fromAPIResponse is not a function", retryable: false },
     };
     expect(resumableProviderOperation(saved, "same-shot-spec")).toMatchObject({ operationId: saved.operationId, state: "pending" });
+    expect(resumableProviderOperation({ ...saved, operationId: "projects/p/locations/us/models/veo/operations/abc" }, "same-shot-spec"))
+      .toMatchObject({ state: "pending" });
   });
 
   it("does not label every failed precondition as a billing failure", () => {
