@@ -49,6 +49,7 @@
     "@vitest/coverage-v8": "4.1.11",
     "electron": "43.4.0",
     "electron-builder": "26.15.3",
+    "esbuild": "0.25.12",
     "eslint": "9.39.1",
     "eslint-config-next": "16.3.2",
     "tsx": "4.20.6",

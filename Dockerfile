@@ -20,6 +20,7 @@ RUN apt-get update \
 COPY --from=builder --chown=node:node /app/package.json /app/pnpm-lock.yaml /app/pnpm-workspace.yaml ./
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/.next/standalone ./standalone
+COPY --from=builder --chown=node:node /app/dist/worker.mjs ./dist/worker.mjs
 COPY --from=builder --chown=node:node /app/tsconfig.json ./tsconfig.json
 COPY --from=builder --chown=node:node /app/src ./src
 COPY --from=builder --chown=node:node /app/scripts ./scripts
