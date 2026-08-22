@@ -1,5 +1,3 @@
-import "server-only";
-
 type Bucket = { count: number; resetsAt: number };
 const buckets = new Map<string, Bucket>();
 

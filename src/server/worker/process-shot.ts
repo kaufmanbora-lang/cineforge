@@ -1,4 +1,3 @@
-import "server-only";
 import { createHash } from "node:crypto";
 import { query, transaction } from "@/server/db";
 import { getProviderKey } from "@/server/provider-secrets";

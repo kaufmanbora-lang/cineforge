@@ -1,4 +1,3 @@
-import "server-only";
 import type { PoolClient } from "pg";
 import { scopeMoviePlanIds, type MoviePlan, type ProjectRecord, type Scene, type ShotArtifact } from "@/domain/movie";
 import { contentHash } from "./content-hash";

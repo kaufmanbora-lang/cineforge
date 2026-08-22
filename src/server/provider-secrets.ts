@@ -1,4 +1,3 @@
-import "server-only";
 import type { EncryptedSecret } from "./key-vault";
 import { decryptSecret, encryptSecret, keyHint } from "./key-vault";
 import { env } from "./env";

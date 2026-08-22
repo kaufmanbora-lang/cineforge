@@ -1,4 +1,3 @@
-import "server-only";
 import { GoogleGenAI } from "@google/genai";
 import { getVideoModel, GOOGLE_VIDEO_MODELS } from "@/domain/video-models";
 import type { ProviderOperation, VideoGenerationRequest, VideoModelAdapter } from "./types";

@@ -1,4 +1,3 @@
-import "server-only";
 import { createHash } from "node:crypto";
 import { openAIClient } from "@/server/providers/openai";
 import { query, transaction } from "@/server/db";

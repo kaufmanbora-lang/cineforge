@@ -1,4 +1,3 @@
-import "server-only";
 import type { ProjectContextBundle } from "@/server/providers/openai";
 import { query } from "@/server/db";
 
