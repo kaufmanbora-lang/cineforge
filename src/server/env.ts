@@ -21,7 +21,7 @@ const EnvSchema = z.object({
   S3_FORCE_PATH_STYLE: z.string().default("true"),
   FFMPEG_PATH: z.string().default("ffmpeg"),
   FFPROBE_PATH: z.string().default("ffprobe"),
-  WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(2),
+  WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
   MAX_AUTO_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
   QC_RETRY_THRESHOLD: z.coerce.number().min(0).max(100).default(75),
   QC_FLAG_THRESHOLD: z.coerce.number().min(0).max(100).default(90),

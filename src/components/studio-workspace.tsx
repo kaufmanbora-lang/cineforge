@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Aperture, Check, CircleDollarSign, Clapperboard, Expand, Eye, Film, Gauge,
+  Aperture, Check, Clapperboard, Expand, Eye, Film, Gauge,
   ImageIcon, Lightbulb, ListVideo, Lock, MessageSquareText, Music2, Play,
   Sparkles, Square, Subtitles, Volume2, Waves, X, Zap, ZoomIn, ZoomOut,
 } from "lucide-react";
@@ -22,9 +22,9 @@ type Track = { label: string; icon: typeof Film; tone: string; clips: Array<{ id
 export function StudioWorkspace() {
   const [mode, setMode] = useState<"quick" | "advanced">("quick");
   const [prompt, setPrompt] = useState("");
-  const [duration, setDuration] = useState(60);
+  const [duration, setDuration] = useState(10);
   const [customDuration, setCustomDuration] = useState(false);
-  const [modelId, setModelId] = useState("veo-3.1-fast-generate-preview");
+  const [modelId, setModelId] = useState("gemini-omni-flash-preview");
   const [resolution, setResolution] = useState<Resolution>("720p");
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>("16:9");
   const [draft, setDraft] = useState(true);
@@ -98,7 +98,7 @@ export function StudioWorkspace() {
 
   useEffect(() => {
     if (!projectId || !detail || ["draft","planned","completed","paused","failed","cancelled"].includes(detail.project.status)) return;
-    const interval = window.setInterval(() => void loadProject(projectId, true), 5_000);
+    const interval = window.setInterval(() => void loadProject(projectId, true), 2_500);
     return () => window.clearInterval(interval);
   }, [detail, loadProject, projectId]);
 
@@ -108,32 +108,33 @@ export function StudioWorkspace() {
     localStorage.removeItem("cineforge.projectId"); sessionStorage.removeItem("cineforge.preparedProject"); setNotice("Опишите идею нового фильма.");
   }
 
-  async function createPlan() {
+  function openProductionConfirmation() {
     if (prompt.trim().length < 10) { setNotice("Описание фильма должно содержать не менее 10 символов."); return; }
     if (accountModelIds && !accountModelIds.has(modelId)) { setNotice("Выбранная видеомодель Google недоступна этому API-ключу."); return; }
-    setBusy("planning"); setNotice("Создание кинопроекта…");
-    let activeProjectId = projectId && detail && !detail.plan ? projectId : "";
+    setBudgetOpen(true);
+  }
+
+  async function startFullProduction() {
+    if (prompt.trim().length < 10) { setNotice("Описание фильма должно содержать не менее 10 символов."); return; }
+    if (accountModelIds && !accountModelIds.has(modelId)) { setNotice("Выбранная видеомодель Google недоступна этому API-ключу."); return; }
+    setBusy("generating"); setNotice("Создание сценария, памяти проекта и очереди генерации…");
+    let activeProjectId = projectId && detail ? projectId : "";
     try {
       if (!activeProjectId) {
         const created = await fetch("/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: "Фильм без названия", prompt, durationSeconds: duration, modelId, resolution, aspectRatio, mode, renderTier: draft ? "draft" : "final", maximumBudgetUsd: budget }) });
         const createdPayload = await created.json(); if (!created.ok) throw new Error(errorMessageRu(createdPayload.error, "Не удалось создать проект."));
         activeProjectId = createdPayload.projectId as string; setProjectId(activeProjectId); localStorage.setItem("cineforge.projectId", activeProjectId);
       }
-      setNotice("Создание сценария и графа кадров…");
-      const planned = await fetch(`/api/projects/${activeProjectId}/plan`, { method: "POST" }); const planPayload = await planned.json(); if (!planned.ok) throw new Error(errorMessageRu(planPayload.error, "Не удалось создать сценарий фильма."));
-      await loadProject(activeProjectId, true); setBudgetOpen(true); setNotice(`Запланировано сцен: ${planPayload.scenes}, кадров: ${planPayload.shots}.`);
-    } catch (error) { if (activeProjectId) await loadProject(activeProjectId, true); setNotice(errorMessageRu(error, "Планирование завершилось ошибкой. Проект сохранён, повторная попытка не создаст копию.")); }
-    finally { setBusy(null); }
-  }
-
-  async function confirmGeneration() {
-    if (!projectId || !plan) { setNotice("Сначала создайте сценарий и план фильма."); return; }
-    setBusy("generating"); setNotice("Добавление заданий генерации в очередь…");
-    try {
-      const response = await fetch(`/api/projects/${projectId}/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, maximumBudgetUsd: budget }) });
-      const payload = await response.json(); if (!response.ok) throw new Error(errorMessageRu(payload.error, "Не удалось запустить генерацию."));
-      setBudgetOpen(false); setNotice(`Новых заданий в очереди: ${payload.queued}. Готовые кадры не дублируются.`); await loadProject(projectId, true);
-    } catch (error) { setNotice(errorMessageRu(error, "Генерация завершилась ошибкой.")); }
+      const response = await fetch(`/api/projects/${activeProjectId}/plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ startGeneration: true, confirmed: true, maximumBudgetUsd: budget }),
+      });
+      const payload = await response.json(); if (!response.ok) throw new Error(errorMessageRu(payload.error, "Не удалось запустить полный цикл создания фильма."));
+      setBudgetOpen(false);
+      setNotice(`Производство запущено: ${payload.shots} кадров. Быстрый черновик появится в предпросмотре автоматически.`);
+      await loadProject(activeProjectId, true);
+    } catch (error) { if (activeProjectId) await loadProject(activeProjectId, true); setNotice(errorMessageRu(error, "Запуск завершился ошибкой. Проект сохранён; повторная попытка продолжит его без копии.")); }
     finally { setBusy(null); }
   }
 
@@ -142,8 +143,9 @@ export function StudioWorkspace() {
   async function openFullscreen() { const node = videoRef.current?.parentElement; if (node?.requestFullscreen) await node.requestFullscreen(); }
 
   const tracks = buildTracks(scenes);
-  const planReady = Boolean(plan);
   const costOverBudget = estimate.estimatedTotalUsd > budget;
+  const productionActive = Boolean(detail && ["queued","generating","validating","assembling"].includes(detail.project.status));
+  const productionComplete = detail?.project.status === "completed";
 
   return <div className="studio-grid">
     <section className="brief-panel" aria-label="Описание фильма">
@@ -158,8 +160,8 @@ export function StudioWorkspace() {
         <label className="toggle-row"><span><Zap size={15}/>Быстрый черновик</span><button aria-pressed={draft} className={draft ? "toggle on" : "toggle"} disabled={Boolean(plan)} onClick={() => setDraft((value) => !value)} type="button"><i/></button></label>
       </div>
       <div className="estimate-lines"><div><span>Примерно кадров</span><strong>{estimate.shots}</strong></div><div><span>Генерация видео</span><strong>${estimate.videoUsd.toFixed(2)}</strong></div><div><span>Звук</span><strong>${estimate.audioUsd.toFixed(2)}</strong></div><div><span>Резерв на повторы</span><strong>${estimate.retriesReserveUsd.toFixed(2)}</strong></div><div className="budget-line"><span>Максимальный бюджет</span><label>$<input aria-label="Максимальный бюджет генерации" min="0" onChange={(event) => setBudget(Math.max(0, Number(event.target.value) || 0))} type="number" value={budget}/></label></div></div>
-      <Button className="plan-button" disabled={Boolean(plan) || prompt.trim().length < 10 || busy !== null} loading={busy === "planning"} onClick={() => void createPlan()} variant="primary">{plan ? "План фильма сохранён" : detail && !plan ? "Повторить создание сценария" : "Создать план фильма"}<Clapperboard size={16}/></Button>
-      <p className="approx-note">Стоимость приблизительная. Платные задания запускаются только после отдельного подтверждения.</p>
+      <Button className="plan-button" disabled={prompt.trim().length < 10 || busy !== null || productionActive || productionComplete} loading={busy !== null} onClick={openProductionConfirmation} variant="primary">{productionComplete ? "Фильм готов" : productionActive ? "Производство запущено" : plan ? "Продолжить и создать фильм" : "Создать фильм"}<Clapperboard size={16}/></Button>
+      <p className="approx-note">Одно подтверждение запускает весь цикл. Быстрый черновик использует ускоренную модель и публикует кадры сразу после ответа Google.</p>
     </section>
 
     <section className="preview-panel" aria-label="Предпросмотр фильма">
@@ -172,7 +174,7 @@ export function StudioWorkspace() {
 
     <section className="timeline-panel" aria-label="Монтажная шкала фильма"><div className="timeline-toolbar"><div><strong>ГЛАВНАЯ МОНТАЖНАЯ ШКАЛА</strong></div><strong className="timeline-time">{selectedScene ? formatTimecode(sceneStart(scenes, selectedScene.id)) : "00:00:00"} / {formatTimecode(duration)}</strong><div><button aria-label="Уменьшить масштаб" onClick={() => setTimelineZoom((value) => Math.max(50,value-25))} type="button"><ZoomOut size={15}/></button><input aria-label="Масштаб монтажной шкалы" max="250" min="50" onChange={(event) => setTimelineZoom(Number(event.target.value))} type="range" value={timelineZoom}/><button aria-label="Увеличить масштаб" onClick={() => setTimelineZoom((value) => Math.min(250,value+25))} type="button"><ZoomIn size={15}/></button></div></div><div className="time-ruler">{[0,.2,.4,.6,.8,1].map((ratio) => <span key={ratio}>{formatTimecode(duration*ratio)}</span>)}</div><div className="tracks" style={{ minWidth: `${timelineZoom}%` }}><div className="playhead" style={{ left: `${selectedScene && duration ? sceneStart(scenes,selectedScene.id)/duration*100 : 0}%` }}><i/></div>{tracks.map((track) => <TimelineTrack key={track.label} track={track} selectedSceneId={selectedScene?.id ?? ""} setSelectedSceneId={setSelectedSceneId}/>)}</div></section>
 
-    {budgetOpen && plan ? <BudgetConfirmation budget={budget} estimate={estimate} modelName={model.displayName} onClose={() => setBudgetOpen(false)} onConfirm={() => void confirmGeneration()} busy={busy === "generating"} duration={duration} resolution={resolution} overBudget={costOverBudget}/> : planReady ? <div className="budget-collapsed"><Button onClick={() => setBudgetOpen(true)} variant="primary"><CircleDollarSign size={15}/>Проверить стоимость</Button></div> : null}
+    {budgetOpen ? <BudgetConfirmation budget={budget} estimate={estimate} modelName={model.displayName} onClose={() => setBudgetOpen(false)} onConfirm={() => void startFullProduction()} busy={busy === "generating"} duration={duration} resolution={resolution} overBudget={costOverBudget}/> : null}
 
     <footer className="studio-statusbar"><div><Gauge size={15}/><span>Активная очередь</span><b>{activeJobs.length}</b></div><div className="status-progress"><span>{detail ? `${projectStatusRu(detail.project.status)} · ${detail.project.completedShots}/${detail.project.totalShots} кадров` : "Нет активного производства"}</span><i><b style={{ width: `${progress}%` }}/></i><strong>{progress}%</strong></div><div className="status-progress spend"><span>Расход API проекта</span><i><b style={{ width: `${detail?.project.maximumBudgetUsd ? Math.min(100,detail.project.spentUsd/detail.project.maximumBudgetUsd*100) : 0}%` }}/></i><strong>${Number(detail?.project.spentUsd ?? 0).toFixed(2)} / ${Number(detail?.project.maximumBudgetUsd ?? budget).toFixed(2)}</strong></div><div><StatusDot tone={detail?.project.status === "failed" ? "red" : detail?.project.status === "paused" ? "amber" : "teal"}/><span>{notice}</span></div><div><span>{resolution} · {aspectRatio}{latestCheckpoint ? ` · CP ${latestCheckpoint.sequence}` : ""}</span></div></footer>
   </div>;

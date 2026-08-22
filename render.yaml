@@ -18,7 +18,7 @@ envVarGroups:
       - key: FFPROBE_PATH
         value: ffprobe
       - key: WORKER_CONCURRENCY
-        value: "2"
+        value: "4"
       - key: MAX_AUTO_RETRIES
         value: "2"
       - key: QC_RETRY_THRESHOLD

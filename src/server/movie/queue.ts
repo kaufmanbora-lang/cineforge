@@ -20,7 +20,15 @@ export function redisConnection() {
 let queue: Queue | undefined;
 
 export function movieQueue(): Queue {
-  queue ??= new Queue(MOVIE_QUEUE, { connection: redisConnection(), defaultJobOptions: { removeOnComplete: 500, removeOnFail: 1_000 } });
+  queue ??= new Queue(MOVIE_QUEUE, {
+    connection: redisConnection(),
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { type: "exponential", delay: 2_000 },
+      removeOnComplete: 500,
+      removeOnFail: 1_000,
+    },
+  });
   return queue;
 }
 
@@ -40,11 +48,23 @@ export async function enqueueJobs(jobs: PlannedJob[]): Promise<number> {
          ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`,
         [job.projectId, job.sceneId, job.shotId, job.type, job.idempotencyKey, job.priority, JSON.stringify(job.payload), ready ? "queued" : "planned", maxAttempts],
       );
-      return inserted.rows[0]?.id ?? null;
+      if (inserted.rows[0]) return { id: inserted.rows[0].id, enqueue: ready };
+
+      const existing = await client.query<{ id: string; state: string }>(
+        "SELECT id,state FROM jobs WHERE idempotency_key=$1 FOR UPDATE",
+        [job.idempotencyKey],
+      );
+      const row = existing.rows[0];
+      if (!row || row.state !== "planned") return { id: null, enqueue: false };
+      await client.query(
+        "UPDATE jobs SET payload=$2,priority=$3,max_attempts=$4,state=$5,available_at=now() WHERE id=$1",
+        [row.id, JSON.stringify(job.payload), job.priority, maxAttempts, ready ? "queued" : "planned"],
+      );
+      return { id: row.id, enqueue: ready };
     });
-    if (!result || !ready) continue;
+    if (!result.id || !result.enqueue) continue;
     const bullId = createHash("sha256").update(job.idempotencyKey).digest("hex");
-    await movieQueue().add(job.type, { databaseJobId: result }, { jobId: bullId, priority: Math.max(1, 20_000 - job.priority) });
+    await movieQueue().add(job.type, { databaseJobId: result.id }, { jobId: bullId, priority: Math.max(1, 20_000 - job.priority) });
     added += 1;
   }
   return added;

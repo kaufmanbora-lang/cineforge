@@ -16,8 +16,8 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   try {
     const { id } = await context.params;
     const body = Body.parse(await request.json());
-    const rows = await query<{ duration_seconds: number; model_id: string; resolution: Resolution; maximum_budget_usd: string }>(
-      "SELECT duration_seconds,model_id,resolution,maximum_budget_usd FROM projects WHERE id=$1",
+    const rows = await query<{ duration_seconds: number; model_id: string; resolution: Resolution; render_tier: "draft" | "final"; maximum_budget_usd: string }>(
+      "SELECT duration_seconds,model_id,resolution,render_tier,maximum_budget_usd FROM projects WHERE id=$1",
       [id],
     );
     if (!rows[0]) return NextResponse.json({ error: "Проект не найден." }, { status: 404 });
@@ -28,8 +28,8 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
     const plan = await latestMoviePlan(id);
     if (!plan) return NextResponse.json({ error: "Создайте сценарий и план фильма перед запуском генерации." }, { status: 409 });
-    const added = await enqueueJobs(planGenerationJobs(id, plan.scenes));
-    await query("UPDATE projects SET status='queued',maximum_budget_usd=$2,estimated_cost_usd=$3 WHERE id=$1", [id, maximumBudget, estimate.estimatedTotalUsd]);
+    const added = await enqueueJobs(planGenerationJobs(id, plan.scenes, { fastDraft: rows[0].render_tier === "draft" }));
+    await query("UPDATE projects SET status=CASE WHEN status IN ('completed','cancelled') THEN status ELSE 'queued'::project_status END,maximum_budget_usd=$2,estimated_cost_usd=$3,last_error=NULL WHERE id=$1", [id, maximumBudget, estimate.estimatedTotalUsd]);
     return NextResponse.json({ queued: added, estimate, projectId: id });
   } catch (error) {
     return apiError(error, 400);

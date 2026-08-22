@@ -19,7 +19,7 @@ export function SettingsWorkspace() {
   const [showOpenAI, setShowOpenAI] = useState(false);
   const [busy, setBusy] = useState<string>();
   const [message, setMessage] = useState("");
-  const [engine, setEngine] = useState<EngineConfig>({ qcRetryThreshold: 75, qcFlagThreshold: 90, automaticRetries: 2, workerConcurrency: 2 });
+  const [engine, setEngine] = useState<EngineConfig>({ qcRetryThreshold: 75, qcFlagThreshold: 90, automaticRetries: 2, workerConcurrency: 4 });
 
   async function loadStatus() {
     const response = await fetch("/api/settings/status", { cache: "no-store" });

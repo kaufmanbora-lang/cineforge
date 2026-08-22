@@ -12,10 +12,18 @@ export interface PlannedJob {
   payload: Record<string, unknown>;
 }
 
-export function planGenerationJobs(projectId: string, scenes: Scene[]): PlannedJob[] {
+export function planGenerationJobs(projectId: string, scenes: Scene[], options: { fastDraft?: boolean } = {}): PlannedJob[] {
   const jobs = scenes.flatMap((scene) => scene.shots.map((shot) => ({ scene, shot })));
   const sceneOrder = new Map(scenes.map((scene, index) => [scene.id, index]));
+  const sceneByShot = new Map(jobs.map(({ scene, shot }) => [shot.id, scene.id]));
+  const shotIds = new Set(sceneByShot.keys());
   return jobs.map(({ scene, shot }) => {
+    // Structured screenplay models occasionally put character, wardrobe or location
+    // IDs in this field. Only shot IDs are scheduling dependencies; accepting any
+    // other graph node leaves the first generation permanently in `planned`.
+    const dependencies = [...new Set(shot.dependencies)]
+      .filter((id) => id !== shot.id && shotIds.has(id))
+      .filter((id) => !options.fastDraft || sceneByShot.get(id) === scene.id);
     const specHash = contentHash({
       prompt: shot.generationPrompt,
       references: shot.continuity.requiredReferences,
@@ -28,9 +36,9 @@ export function planGenerationJobs(projectId: string, scenes: Scene[]): PlannedJ
       shotId: shot.id,
       type: "generate-shot" as const,
       idempotencyKey: `generate-shot:${shot.id}:${specHash}`,
-      dependencies: shot.dependencies,
+      dependencies,
       priority: 10_000 - (sceneOrder.get(scene.id) ?? 0) * 100 - shot.sequence,
-      payload: { shot, specHash },
+      payload: { shot: { ...shot, dependencies }, specHash },
     };
   });
 }

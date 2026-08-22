@@ -176,6 +176,9 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
         model: request.modelId,
         input: request.references.length || request.editInstruction ? input : request.prompt,
         previous_interaction_id: request.previousInteractionId,
+        background: false,
+        stream: false,
+        store: request.fastMode ? false : true,
         response_format: {
           type: "video",
           aspect_ratio: request.aspectRatio,
@@ -226,9 +229,28 @@ function imageValue(reference: { data: string; mimeType: string }) {
 
 async function downloadGoogleFile(uri: string | undefined, apiKey: string): Promise<Uint8Array> {
   if (!uri) throw new Error("Google did not provide inline video bytes or a download URI.");
-  const response = await fetch(uri, { headers: { "x-goog-api-key": apiKey }, redirect: "follow" });
-  if (!response.ok) throw await googleHttpError(response);
-  return new Uint8Array(await response.arrayBuffer());
+  for (let attempt = 0; attempt < 72; attempt += 1) {
+    const response = await fetch(uri, { headers: { "x-goog-api-key": apiKey }, redirect: "follow" });
+    if (response.ok) return new Uint8Array(await response.arrayBuffer());
+    if (![400, 404, 409, 425].includes(response.status)) throw await googleHttpError(response);
+    const fileName = googleFileName(uri);
+    if (!fileName) throw await googleHttpError(response);
+    const metadata = await fetch(`https://generativelanguage.googleapis.com/v1beta/${fileName}`, {
+      headers: { "x-goog-api-key": apiKey },
+      cache: "no-store",
+    });
+    if (!metadata.ok) throw await googleHttpError(metadata);
+    const payload = await metadata.json() as { state?: string | { name?: string }; error?: { message?: string } };
+    const state = typeof payload.state === "string" ? payload.state : payload.state?.name;
+    if (state === "FAILED") throw new Error(payload.error?.message ?? "Google could not process the generated video file.");
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+  throw Object.assign(new Error("Google video file processing timed out."), { status: 408, code: "GOOGLE_TIMEOUT" });
+}
+
+function googleFileName(uri: string): string | null {
+  const match = uri.match(/(?:\/v1beta\/)?(files\/[a-zA-Z0-9_-]+)/);
+  return match?.[1] ?? null;
 }
 
 async function googleHttpError(response: Response): Promise<Error> {

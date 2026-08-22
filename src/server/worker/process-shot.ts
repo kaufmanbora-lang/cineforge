@@ -21,10 +21,13 @@ interface JobRow {
   shot_id: string;
   attempt: number;
   max_attempts: number;
+  state: string;
+  available_at: string;
   payload: { shot: { durationSeconds: number; generationPrompt?: { prompt: string; negativeDirectives: string[]; seed: number | null }; continuity: { requiredReferences: string[] }; audioContext?: { dialogue: Array<{ id: string; characterId: string; text: string; delivery: string; startSeconds: number; durationSeconds: number }> } }; specHash: string };
   model_id: string;
   resolution: Resolution;
   aspect_ratio: "16:9" | "9:16";
+  render_tier: "draft" | "final";
   maximum_budget_usd: string;
   spent_usd: string;
   reserved_usd: string;
@@ -33,12 +36,18 @@ interface JobRow {
 
 export async function processShot(databaseJobId: string): Promise<{ cached: boolean; storageKey: string; retrying?: boolean }> {
   const rows = await query<JobRow>(
-    `SELECT j.*, p.model_id, p.resolution, p.aspect_ratio, p.maximum_budget_usd, p.spent_usd, p.reserved_usd
+    `SELECT j.*, p.model_id, p.resolution, p.aspect_ratio, p.render_tier, p.maximum_budget_usd, p.spent_usd, p.reserved_usd
      FROM jobs j JOIN projects p ON p.id=j.project_id WHERE j.id=$1`,
     [databaseJobId],
   );
   const job = rows[0];
   if (!job) throw new Error("Generation job not found.");
+  if (["completed", "paused", "failed", "cancelled", "planned", "generating", "validating"].includes(job.state)) {
+    return { cached: false, storageKey: "", retrying: ["planned", "generating", "validating"].includes(job.state) };
+  }
+  if (job.state === "retrying" && new Date(job.available_at).getTime() > Date.now()) {
+    return { cached: false, storageKey: "", retrying: true };
+  }
   const cached = await findCachedShot(job.project_id, job.shot_id, job.payload.specHash);
   if (cached) {
     await markCompleted(job, cached.storageKey, 0, true);
@@ -72,6 +81,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       aspectRatio: job.aspect_ratio,
       seed: prompt.seed,
       references: await loadShotReferences(job),
+      fastMode: job.render_tier === "draft",
     };
     const adapter = googleVideoAdapter(job.model_id);
     let operation = await adapter.start(request, apiKey);
@@ -90,7 +100,11 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     const cost = projectedCost;
     const checksum = createHash("sha256").update(operation.output.bytes).digest("hex");
     await query("UPDATE jobs SET state='validating' WHERE id=$1", [job.id]);
-    const qc = await runShotQc(job, operation.output.bytes, operation.output.mimeType, operation.operationId);
+    // Fast Draft is the interactive path: publish the provider result immediately.
+    // Expensive vision QC and consistent-voice replacement remain enabled for Final.
+    const qc = job.render_tier === "draft"
+      ? null
+      : await runShotQc(job, operation.output.bytes, operation.output.mimeType, operation.operationId);
     const engineSettings = await movieEngineSettings(job.project_id);
     if (qc && qc.overall < engineSettings.qcRetryThreshold && job.attempt + 1 < job.max_attempts) {
       const retryPrompt = `${prompt.prompt}\nQC CORRECTION FOR THIS SHOT ONLY: ${qc.retryInstruction ?? qc.issues.join("; ")}. Preserve all unaffected details and locked values.`;
@@ -113,7 +127,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       : null;
     const assetId = await persistCompletedAsset(job, storageKey, checksum, operation.output.bytes.byteLength, operation.operationId, cost, classifiedQc);
     const dialogueSegments = job.payload.shot.audioContext?.dialogue ?? [];
-    if (dialogueSegments.length) {
+    if (dialogueSegments.length && job.render_tier === "final") {
       const dialoguePayload = { dialogueSegments, originalAssetId: assetId, originalStorageKey: storageKey };
       await enqueueDialoguePatch({
         projectId: job.project_id,

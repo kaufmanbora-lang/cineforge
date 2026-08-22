@@ -19,6 +19,7 @@ export interface VideoGenerationRequest {
   aspectRatio: AspectRatio;
   seed: number | null;
   references: ReferenceImage[];
+  fastMode?: boolean;
   previousInteractionId?: string;
   editInstruction?: string;
 }
