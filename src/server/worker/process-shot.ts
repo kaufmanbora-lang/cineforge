@@ -157,15 +157,17 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     });
     return { cached: false, storageKey };
   } catch (error) {
-    await settleFailedReservation(job.id, job.project_id, providerCompleted);
     const failure = classifyFailure(error);
     const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
-    if (decision.pauseProject) await pauseProjectJobs(job.project_id, { code: failure, message: error instanceof Error ? error.message : String(error) });
-    await query(
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`Shot provider failure ${job.id}: ${failure}: ${message}\n`);
+    await withDurableDatabaseRetry(() => settleFailedReservation(job.id, job.project_id, providerCompleted));
+    if (decision.pauseProject) await withDurableDatabaseRetry(() => pauseProjectJobs(job.project_id, { code: failure, message }));
+    await withDurableDatabaseRetry(() => query(
       "UPDATE jobs SET state=$2, last_error=$3, available_at=now()+($4::text || ' milliseconds')::interval WHERE id=$1",
-      [job.id, decision.pauseProject ? "paused" : decision.retry ? "retrying" : "failed", JSON.stringify({ failure, message: error instanceof Error ? error.message : String(error) }), decision.delayMs],
-    );
-    if (!decision.pauseProject && !decision.retry) await query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify({ failure, message: error instanceof Error ? error.message : String(error), shotId: job.shot_id })]);
+      [job.id, decision.pauseProject ? "paused" : decision.retry ? "retrying" : "failed", JSON.stringify({ failure, message }), decision.delayMs],
+    ));
+    if (!decision.pauseProject && !decision.retry) await withDurableDatabaseRetry(() => query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify({ failure, message, shotId: job.shot_id })]));
     if (decision.retry) {
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: decision.delayMs });
     }
