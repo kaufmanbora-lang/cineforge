@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { query, transaction } from "@/server/db";
+import { isRetryableDatabaseConnectionError, query, transaction } from "@/server/db";
 import { getProviderKey } from "@/server/provider-secrets";
 import { googleVideoAdapter } from "@/server/providers/video/google";
 import type { VideoGenerationRequest } from "@/server/providers/video/types";
-import { putObject, signedObjectUrl } from "@/server/storage";
+import { getObjectIfExists, putObject, signedObjectUrl } from "@/server/storage";
 import { findCachedShot } from "@/server/movie/repository";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
 import { enqueueAutomaticAssemblyIfReady, enqueueDialoguePatch, enqueueReadyProjectJobs, pauseProjectJobs, requeueDatabaseJob } from "@/server/movie/queue";
@@ -64,31 +64,45 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   }
   let providerCompleted = false;
   try {
-    const apiKey = await getProviderKey("google");
-    if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
     const prompt = job.payload.shot.generationPrompt;
     if (!prompt) throw new Error("Shot has no generation prompt.");
-    const request: VideoGenerationRequest = {
-      projectId: job.project_id,
-      sceneId: job.scene_id,
-      shotId: job.shot_id,
-      modelId: job.model_id,
-      prompt: prompt.prompt,
-      negativeDirectives: prompt.negativeDirectives,
-      durationSeconds: job.payload.shot.durationSeconds,
-      resolution: job.resolution,
-      aspectRatio: job.aspect_ratio,
-      seed: prompt.seed,
-      references: await loadShotReferences(job),
-      fastMode: job.render_tier === "draft",
-    };
-    const adapter = googleVideoAdapter(job.model_id);
-    let operation = await adapter.start(request, apiKey);
-    await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify(operation)]);
-    while (operation.state === "pending") {
-      await new Promise((resolve) => setTimeout(resolve, 10_000));
-      operation = await adapter.poll(operation, apiKey);
+    const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/${job.payload.specHash}.mp4`;
+    const staged = await getObjectIfExists(storageKey);
+    let operation;
+    if (staged) {
+      operation = {
+        provider: "google" as const,
+        modelId: job.model_id,
+        operationId: `staged-${job.payload.specHash}`,
+        state: "completed" as const,
+        progress: 100,
+        output: { bytes: staged.bytes, mimeType: staged.contentType },
+      };
+    } else {
+      const apiKey = await getProviderKey("google");
+      if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
+      const request: VideoGenerationRequest = {
+        projectId: job.project_id,
+        sceneId: job.scene_id,
+        shotId: job.shot_id,
+        modelId: job.model_id,
+        prompt: prompt.prompt,
+        negativeDirectives: prompt.negativeDirectives,
+        durationSeconds: job.payload.shot.durationSeconds,
+        resolution: job.resolution,
+        aspectRatio: job.aspect_ratio,
+        seed: prompt.seed,
+        references: await loadShotReferences(job),
+        fastMode: job.render_tier === "draft",
+      };
+      const adapter = googleVideoAdapter(job.model_id);
+      operation = await adapter.start(request, apiKey);
       await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify(operation)]);
+      while (operation.state === "pending") {
+        await new Promise((resolve) => setTimeout(resolve, 10_000));
+        operation = await adapter.poll(operation, apiKey);
+        await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify(operation)]);
+      }
     }
     if (operation.state === "failed" || !operation.output) {
       const error = new Error(operation.error?.message ?? "Video generation failed.");
@@ -98,7 +112,10 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     providerCompleted = true;
     const cost = projectedCost;
     const checksum = createHash("sha256").update(operation.output.bytes).digest("hex");
-    await query("UPDATE jobs SET state='validating' WHERE id=$1", [job.id]);
+    // Object storage is independent of PostgreSQL. Stage the paid provider
+    // result first so a database restart can never force another video call.
+    await putObject(storageKey, operation.output.bytes, operation.output.mimeType);
+    await query("UPDATE jobs SET state='validating' WHERE id=$1", [job.id]).catch(() => undefined);
     // Fast Draft is the interactive path: publish the provider result immediately.
     // Expensive vision QC and consistent-voice replacement remain enabled for Final.
     const qc = job.render_tier === "draft"
@@ -119,12 +136,10 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs });
       return { cached: false, storageKey: rejectedKey, retrying: true };
     }
-    const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/${job.payload.specHash}.mp4`;
-    await putObject(storageKey, operation.output.bytes, operation.output.mimeType);
     const classifiedQc: (ShotQcReport & { decision: "accept" | "flag" }) | null = qc
       ? { ...qc, decision: qc.overall < engineSettings.qcFlagThreshold ? "flag" : "accept" }
       : null;
-    const assetId = await persistCompletedAsset(job, storageKey, checksum, operation.output.bytes.byteLength, operation.operationId, cost, classifiedQc);
+    const assetId = await withDurableDatabaseRetry(() => persistCompletedAsset(job, storageKey, checksum, operation.output!.bytes.byteLength, operation.operationId, cost, classifiedQc));
     const dialogueSegments = job.payload.shot.audioContext?.dialogue ?? [];
     if (dialogueSegments.length && job.render_tier === "final") {
       const dialoguePayload = { dialogueSegments, originalAssetId: assetId, originalStorageKey: storageKey };
@@ -136,8 +151,10 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         idempotencyKey: `dialogue-master:${job.shot_id}:${contentHash(dialoguePayload)}`,
       });
     }
-    await enqueueReadyProjectJobs(job.project_id);
-    await enqueueAutomaticAssemblyIfReady(job.project_id);
+    await withDurableDatabaseRetry(async () => {
+      await enqueueReadyProjectJobs(job.project_id);
+      await enqueueAutomaticAssemblyIfReady(job.project_id);
+    });
     return { cached: false, storageKey };
   } catch (error) {
     await settleFailedReservation(job.id, job.project_id, providerCompleted);
@@ -153,6 +170,20 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: decision.delayMs });
     }
     throw error;
+  }
+}
+
+async function withDurableDatabaseRetry<T>(operation: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + 10 * 60_000;
+  let delayMs = 1_000;
+  for (;;) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isRetryableDatabaseConnectionError(error) || Date.now() + delayMs >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs = Math.min(15_000, delayMs * 2);
+    }
   }
 }
 

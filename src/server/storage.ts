@@ -57,6 +57,22 @@ export async function putObject(key: string, body: Uint8Array, contentType: stri
   }));
 }
 
+export async function getObjectIfExists(key: string): Promise<{ bytes: Uint8Array; contentType: string } | null> {
+  await ensureBucket();
+  try {
+    const result = await s3().send(new GetObjectCommand({ Bucket: env().S3_BUCKET, Key: key }));
+    if (!result.Body) return null;
+    return {
+      bytes: await result.Body.transformToByteArray(),
+      contentType: result.ContentType ?? "video/mp4",
+    };
+  } catch (error) {
+    const record = typeof error === "object" && error ? error as { name?: string; $metadata?: { httpStatusCode?: number } } : {};
+    if (record.name === "NoSuchKey" || record.name === "NotFound" || record.$metadata?.httpStatusCode === 404) return null;
+    throw error;
+  }
+}
+
 export async function signedObjectUrl(key: string, expiresIn = 900): Promise<string> {
   await ensureBucket();
   return getSignedUrl(
