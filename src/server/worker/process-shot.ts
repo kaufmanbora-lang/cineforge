@@ -67,6 +67,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     const apiKey = await getProviderKey("google");
     if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
     await query("UPDATE jobs SET state='generating', started_at=COALESCE(started_at,now()), attempt=attempt+1 WHERE id=$1", [job.id]);
+    await query("UPDATE projects SET status='generating',updated_at=now() WHERE id=$1 AND status NOT IN ('completed','cancelled')", [job.project_id]);
     const prompt = job.payload.shot.generationPrompt;
     if (!prompt) throw new Error("Shot has no generation prompt.");
     const request: VideoGenerationRequest = {

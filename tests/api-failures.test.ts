@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
+import { isRetryableDatabaseConnectionError } from "@/server/db";
 
 describe("API failure policy", () => {
   it("pauses on exhausted quota without a retry loop", () => {
@@ -21,5 +22,9 @@ describe("API failure policy", () => {
   });
   it("does not automatically retry moderation rejection", () => {
     expect(retryDecision({ failure: "moderation", attempt: 1, maxAttempts: 3 }).retry).toBe(false);
+  });
+  it("recognizes temporary PostgreSQL connection refusal without retrying arbitrary database errors", () => {
+    expect(isRetryableDatabaseConnectionError(Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:5432"), { code: "ECONNREFUSED" }))).toBe(true);
+    expect(isRetryableDatabaseConnectionError(Object.assign(new Error("duplicate key"), { code: "23505" }))).toBe(false);
   });
 });

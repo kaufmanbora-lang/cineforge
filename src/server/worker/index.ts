@@ -1,5 +1,5 @@
 import { Worker } from "bullmq";
-import { MOVIE_QUEUE, enqueueJobs, pauseProjectJobs, recoverInterruptedJobs, redisConnection, requeueDatabaseJob } from "@/server/movie/queue";
+import { MOVIE_QUEUE, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverInterruptedJobs, redisConnection, requeueDatabaseJob } from "@/server/movie/queue";
 import { processShot } from "./process-shot";
 import { processDialoguePatch } from "./process-dialogue";
 import { processAssembly } from "./process-assembly";
@@ -11,6 +11,7 @@ import { planGenerationJobs } from "@/server/movie/job-planner";
 
 await recoverInterruptedJobs();
 await recoverActiveProjects();
+await reconcileQueuedJobs();
 const settingRows = await query<{ settings: { workerConcurrency?: number } }>("SELECT settings FROM workspace_settings WHERE workspace_id=$1", [env().DEFAULT_WORKSPACE_ID]).catch(() => []);
 const workerConcurrency = Math.max(1, Math.min(16, Number(settingRows[0]?.settings.workerConcurrency ?? env().WORKER_CONCURRENCY)));
 
@@ -35,6 +36,10 @@ const worker = new Worker(
   },
   { connection: redisConnection(), concurrency: workerConcurrency },
 );
+const reconciliationTimer = setInterval(() => {
+  void reconcileQueuedJobs().catch((error) => process.stderr.write(`Queue reconciliation failed: ${error instanceof Error ? error.message : String(error)}\n`));
+}, 30_000);
+reconciliationTimer.unref();
 
 async function recoverActiveProjects() {
   const projects = await query<{ id: string; render_tier: "draft" | "final" }>(
@@ -67,6 +72,7 @@ worker.on("completed", (job) => process.stdout.write(`Completed ${job.id}\n`));
 worker.on("failed", (job, error) => process.stderr.write(`Failed ${job?.id}: ${error.message}\n`));
 
 async function shutdown() {
+  clearInterval(reconciliationTimer);
   await worker.close();
   process.exit(0);
 }

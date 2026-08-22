@@ -23,8 +23,8 @@ export function movieQueue(): Queue {
   queue ??= new Queue(MOVIE_QUEUE, {
     connection: redisConnection(),
     defaultJobOptions: {
-      attempts: 3,
-      backoff: { type: "exponential", delay: 2_000 },
+      attempts: 5,
+      backoff: { type: "exponential", delay: 5_000 },
       removeOnComplete: 500,
       removeOnFail: 1_000,
     },
@@ -99,6 +99,21 @@ export async function recoverInterruptedJobs(): Promise<number> {
   for (const row of rows) {
     const bullId = createHash("sha256").update(`${row.idempotency_key}:recovery`).digest("hex");
     await movieQueue().add(row.type, { databaseJobId: row.id }, { jobId: bullId });
+  }
+  return rows.length;
+}
+
+export async function reconcileQueuedJobs(): Promise<number> {
+  const rows = await query<{ id: string; type: string; idempotency_key: string; priority: number }>(
+    `SELECT j.id,j.type,j.idempotency_key,j.priority FROM jobs j
+     JOIN projects p ON p.id=j.project_id
+     WHERE j.state='queued' AND j.available_at<=now()
+       AND p.status IN ('queued','generating','validating','assembling')`,
+  );
+  const bucket = Math.floor(Date.now() / 30_000);
+  for (const row of rows) {
+    const bullId = createHash("sha256").update(`${row.idempotency_key}:reconcile:${bucket}`).digest("hex");
+    await movieQueue().add(row.type, { databaseJobId: row.id }, { jobId: bullId, priority: Math.max(1, 20_000 - row.priority) });
   }
   return rows.length;
 }
