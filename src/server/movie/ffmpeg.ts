@@ -50,7 +50,7 @@ export async function probeMedia(filePath: string): Promise<MediaProbe> {
 }
 
 export async function assembleMovie(input: {
-  clips: Array<{ bytes: Uint8Array; extension?: string }>;
+  clips: Array<{ bytes: Uint8Array; extension?: string; durationSeconds?: number }>;
   resolution: "720p" | "1080p" | "4k";
   outputFormat?: "mp4" | "mov";
 }): Promise<{ bytes: Uint8Array; qc: FinalMediaQc }> {
@@ -66,6 +66,7 @@ export async function assembleMovie(input: {
       await writeFile(source, input.clips[index].bytes);
       await execFileAsync(env().FFMPEG_PATH, [
         "-y", "-nostdin", "-threads", "1", "-filter_threads", "1", "-i", source,
+        ...(input.clips[index].durationSeconds ? ["-t", input.clips[index].durationSeconds!.toFixed(3)] : []),
         "-vf", `scale=${dimensions}:force_original_aspect_ratio=decrease,pad=${dimensions}:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p`,
         "-af", "aresample=48000:async=1:first_pts=0,loudnorm=I=-16:TP=-1.5:LRA=11",
         "-c:v", "libx264", "-threads:v", "1", "-preset", "veryfast", "-crf", "18",

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { extractOmniVideo, googleVeoConfig, normalizeGoogleProviderError } from "@/server/providers/video/google";
-import { generationAccountingCost } from "@/server/worker/process-shot";
+import { generationAccountingCost, providerDurationSeconds } from "@/server/worker/process-shot";
 import { shot } from "./fixtures";
 
 describe("Google Omni response parsing", () => {
@@ -41,6 +41,12 @@ describe("Google Omni response parsing", () => {
     const oneReference = [{ id: "portrait", data: "AAAA", mimeType: "image/png", role: "subject" as const }];
     expect(googleVeoConfig(request, undefined, oneReference).referenceImages).toBeUndefined();
     expect(googleVeoConfig(request, undefined, [...oneReference, { ...oneReference[0], id: "wardrobe" }]).referenceImages).toHaveLength(2);
+  });
+
+  it("maps screenplay timing to durations accepted by each video model", () => {
+    expect(providerDurationSeconds("veo-3.1-fast-generate-preview", "720p", 5)).toBe(6);
+    expect(providerDurationSeconds("veo-3.1-fast-generate-preview", "720p", 7)).toBe(8);
+    expect(providerDurationSeconds("gemini-omni-flash-preview", "720p", 5)).toBe(5);
   });
 
   it("extracts the production Interactions API video content part", () => {

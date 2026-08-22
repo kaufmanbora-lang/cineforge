@@ -7,7 +7,7 @@ import { getObjectIfExists, putObject, signedObjectUrl } from "@/server/storage"
 import { findCachedShot } from "@/server/movie/repository";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
 import { enqueueAutomaticAssemblyIfReady, enqueueDialoguePatch, enqueueReadyProjectJobs, pauseProjectJobs, requeueDatabaseJob } from "@/server/movie/queue";
-import { getVideoModel, type Resolution } from "@/domain/video-models";
+import { getAllowedDurations, getVideoModel, type Resolution } from "@/domain/video-models";
 import { env } from "@/server/env";
 import { contentHash } from "@/server/movie/content-hash";
 import { extractFinalFrame, extractRepresentativeFrame } from "@/server/movie/ffmpeg";
@@ -57,7 +57,8 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   }
   const capabilities = getVideoModel(job.model_id);
   const price = capabilities.pricePerSecondUsd[job.resolution] ?? capabilities.pricePerSecondUsd["720p"] ?? 0;
-  const projectedCost = job.payload.shot.durationSeconds * price;
+  const providerDuration = providerDurationSeconds(job.model_id, job.resolution, job.payload.shot.durationSeconds);
+  const projectedCost = providerDuration * price;
   const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/${job.payload.specHash}.mp4`;
   // Check the durable provider checkpoint before reserving more budget. A
   // worker/database restart must never charge or reserve the same video twice.
@@ -90,7 +91,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         modelId: job.model_id,
         prompt: prompt.prompt,
         negativeDirectives: prompt.negativeDirectives,
-        durationSeconds: job.payload.shot.durationSeconds,
+        durationSeconds: providerDuration,
         resolution: job.resolution,
         aspectRatio: job.aspect_ratio,
         seed: prompt.seed,
@@ -178,6 +179,11 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     }
     throw error;
   }
+}
+
+export function providerDurationSeconds(modelId: string, resolution: Resolution, plannedSeconds: number): number {
+  const allowed = getAllowedDurations(modelId, resolution).sort((left, right) => left - right);
+  return allowed.find((seconds) => seconds >= plannedSeconds) ?? allowed.at(-1) ?? plannedSeconds;
 }
 
 export function generationAccountingCost(projectedCost: number, outstandingReservation: number, staged: boolean): number {

@@ -14,19 +14,19 @@ export async function processAssembly(databaseJobId: string) {
   const job = jobs[0];
   if (!job) throw new Error("Assembly job not found.");
   await query("UPDATE jobs SET state='generating',started_at=COALESCE(started_at,now()),attempt=attempt+1 WHERE id=$1", [job.id]);
-  const assets = await query<{ storage_key: string; shot_id: string; checksum: string }>(
-    `SELECT a.storage_key,a.shot_id,a.checksum FROM generation_assets a
+  const assets = await query<{ storage_key: string; shot_id: string; checksum: string; duration_seconds: number }>(
+    `SELECT a.storage_key,a.shot_id,a.checksum,sh.duration_seconds FROM generation_assets a
      JOIN shot_versions sv ON sv.id=a.shot_version_id AND sv.active=true
      JOIN shots sh ON sh.id=a.shot_id JOIN scenes s ON s.id=sh.scene_id
      WHERE a.project_id=$1 AND a.kind='video' ORDER BY s.number,sh.sequence`,
     [job.project_id],
   );
   if (!assets.length) throw new Error("No completed shot assets are available for export.");
-  const clips = [] as Array<{ bytes: Uint8Array; extension: string }>;
+  const clips = [] as Array<{ bytes: Uint8Array; extension: string; durationSeconds: number }>;
   for (const asset of assets) {
     const response = await fetch(await signedObjectUrl(asset.storage_key));
     if (!response.ok) throw new Error(`Failed to download ${asset.shot_id} for assembly.`);
-    clips.push({ bytes: new Uint8Array(await response.arrayBuffer()), extension: "mp4" });
+    clips.push({ bytes: new Uint8Array(await response.arrayBuffer()), extension: "mp4", durationSeconds: Number(asset.duration_seconds) });
   }
   const assembled = await assembleMovie({ clips, resolution: job.payload.resolution, outputFormat: job.payload.format });
   const bytes = assembled.bytes;
