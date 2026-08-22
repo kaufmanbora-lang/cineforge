@@ -65,10 +65,10 @@ export async function assembleMovie(input: {
       const target = path.join(tempRoot, `clip-${index}.mp4`);
       await writeFile(source, input.clips[index].bytes);
       await execFileAsync(env().FFMPEG_PATH, [
-        "-y", "-i", source,
+        "-y", "-nostdin", "-threads", "1", "-filter_threads", "1", "-i", source,
         "-vf", `scale=${dimensions}:force_original_aspect_ratio=decrease,pad=${dimensions}:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p`,
         "-af", "aresample=48000:async=1:first_pts=0,loudnorm=I=-16:TP=-1.5:LRA=11",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:v", "libx264", "-threads:v", "1", "-preset", "veryfast", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart", target,
       ], { maxBuffer: 16 * 1024 * 1024 });
@@ -78,7 +78,7 @@ export async function assembleMovie(input: {
     await writeFile(concatFile, normalized.map((file) => `file '${file.replaceAll("'", "'\\''")}'`).join("\n"));
     const output = path.join(tempRoot, `movie.${input.outputFormat ?? "mp4"}`);
     await execFileAsync(env().FFMPEG_PATH, [
-      "-y", "-f", "concat", "-safe", "0", "-i", concatFile,
+      "-y", "-nostdin", "-threads", "1", "-f", "concat", "-safe", "0", "-i", concatFile,
       "-c", "copy", "-movflags", "+faststart", output,
     ], { maxBuffer: 16 * 1024 * 1024 });
     const qc = await finalMediaQc(output, dimensions);
@@ -98,14 +98,14 @@ async function finalMediaQc(filePath: string, expectedDimensions: string): Promi
   if (Math.abs(probe.frameRate - 24) > 0.01) issues.push("Frame-rate mismatch");
   if (probe.hasAudio && probe.sampleRate !== 48_000) issues.push("Audio sample-rate mismatch");
   const blackScan = await execFileAsync(env().FFMPEG_PATH, [
-    "-hide_banner", "-i", filePath, "-vf", "blackdetect=d=0.4:pic_th=0.98:pix_th=0.02", "-an", "-f", "null", "-",
+    "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1", "-i", filePath, "-vf", "blackdetect=d=0.4:pic_th=0.98:pix_th=0.02", "-an", "-f", "null", "-",
   ], { maxBuffer: 16 * 1024 * 1024 });
   const blackFrameSegments = (blackScan.stderr.match(/black_start:/g) ?? []).length;
   if (blackFrameSegments) issues.push(`${blackFrameSegments} unexpected black-frame segment(s)`);
   let audioMaxVolumeDb: number | null = null;
   if (probe.hasAudio) {
     const audioScan = await execFileAsync(env().FFMPEG_PATH, [
-      "-hide_banner", "-i", filePath, "-af", "volumedetect", "-vn", "-f", "null", "-",
+      "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1", "-i", filePath, "-af", "volumedetect", "-vn", "-f", "null", "-",
     ], { maxBuffer: 16 * 1024 * 1024 });
     const match = audioScan.stderr.match(/max_volume:\s*(-?[\d.]+)\s*dB/i);
     audioMaxVolumeDb = match ? Number(match[1]) : null;
@@ -140,10 +140,10 @@ export async function patchDialogueAudio(input: {
     const start = input.startSeconds.toFixed(3);
     const end = input.endSeconds.toFixed(3);
     await execFileAsync(env().FFMPEG_PATH, [
-      "-y", "-i", source, "-i", speech,
+      "-y", "-nostdin", "-threads", "1", "-filter_complex_threads", "1", "-i", source, "-i", speech,
       "-filter_complex",
       `[0:a]volume=enable='between(t,${start},${end})':volume=0[base];[1:a]adelay=${delayMs}|${delayMs},volume=1.0[voice];[base][voice]amix=inputs=2:duration=first:dropout_transition=0,loudnorm=I=-16:TP=-1.5:LRA=11[mix]`,
-      "-map", "0:v:0", "-map", "[mix]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+      "-map", "0:v:0", "-map", "[mix]", "-c:v", "copy", "-c:a", "aac", "-threads:a", "1", "-b:a", "192k",
       "-ar", "48000", "-movflags", "+faststart", output,
     ], { maxBuffer: 16 * 1024 * 1024 });
     return new Uint8Array(await readFile(output));
@@ -160,7 +160,7 @@ export async function extractRepresentativeFrame(video: Uint8Array): Promise<Uin
     const output = path.join(tempRoot, "preview.jpg");
     await writeFile(source, video);
     await execFileAsync(env().FFMPEG_PATH, [
-      "-y", "-ss", "1", "-i", source, "-frames:v", "1",
+      "-y", "-nostdin", "-threads", "1", "-filter_threads", "1", "-ss", "1", "-i", source, "-frames:v", "1",
       "-vf", "scale=768:-2", "-q:v", "3", output,
     ], { maxBuffer: 8 * 1024 * 1024 });
     return new Uint8Array(await readFile(output));
@@ -177,7 +177,7 @@ export async function extractFinalFrame(video: Uint8Array): Promise<Uint8Array> 
     const output = path.join(tempRoot, "final.jpg");
     await writeFile(source, video);
     await execFileAsync(env().FFMPEG_PATH, [
-      "-y", "-sseof", "-0.12", "-i", source, "-frames:v", "1",
+      "-y", "-nostdin", "-threads", "1", "-filter_threads", "1", "-sseof", "-0.12", "-i", source, "-frames:v", "1",
       "-vf", "scale=1024:-2", "-q:v", "2", output,
     ], { maxBuffer: 8 * 1024 * 1024 });
     return new Uint8Array(await readFile(output));
