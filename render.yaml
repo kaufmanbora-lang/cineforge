@@ -82,7 +82,7 @@ services:
     region: frankfurt
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    dockerCommand: ./node_modules/.bin/tsx src/server/worker/index.ts
+    dockerCommand: node --max-old-space-size=320 --import tsx src/server/worker/index.ts
     autoDeployTrigger: commit
     maxShutdownDelaySeconds: 300
     envVars:
