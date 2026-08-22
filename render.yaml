@@ -1,0 +1,163 @@
+envVarGroups:
+  - name: cineforge-runtime
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_ENCRYPTION_KEY
+        generateValue: true
+      - key: DEFAULT_WORKSPACE_ID
+        value: 00000000-0000-0000-0000-000000000001
+      - key: S3_REGION
+        value: us-east-1
+      - key: S3_BUCKET
+        value: cineforge
+      - key: S3_FORCE_PATH_STYLE
+        value: "true"
+      - key: FFMPEG_PATH
+        value: ffmpeg
+      - key: FFPROBE_PATH
+        value: ffprobe
+      - key: WORKER_CONCURRENCY
+        value: "2"
+      - key: MAX_AUTO_RETRIES
+        value: "2"
+      - key: QC_RETRY_THRESHOLD
+        value: "75"
+      - key: QC_FLAG_THRESHOLD
+        value: "90"
+
+services:
+  - type: web
+    name: cineforge-web
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: node standalone/server.js
+    preDeployCommand: ./node_modules/.bin/tsx scripts/migrate.ts
+    healthCheckPath: /
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - fromGroup: cineforge-runtime
+      - key: HOSTNAME
+        value: 0.0.0.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: cineforge-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: cineforge-queue
+          property: connectionString
+      - key: S3_ENDPOINT
+        fromService:
+          type: web
+          name: cineforge-storage
+          property: hostport
+      - key: S3_PUBLIC_ENDPOINT
+        fromService:
+          type: web
+          name: cineforge-storage
+          envVarKey: RENDER_EXTERNAL_HOSTNAME
+      - key: S3_ACCESS_KEY
+        fromService:
+          type: web
+          name: cineforge-storage
+          envVarKey: MINIO_ROOT_USER
+      - key: S3_SECRET_KEY
+        fromService:
+          type: web
+          name: cineforge-storage
+          envVarKey: MINIO_ROOT_PASSWORD
+
+  - type: worker
+    name: cineforge-worker
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: ./node_modules/.bin/tsx src/server/worker/index.ts
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 300
+    envVars:
+      - fromGroup: cineforge-runtime
+      - key: DATABASE_URL
+        fromDatabase:
+          name: cineforge-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: cineforge-queue
+          property: connectionString
+      - key: S3_ENDPOINT
+        fromService:
+          type: web
+          name: cineforge-storage
+          property: hostport
+      - key: S3_PUBLIC_ENDPOINT
+        fromService:
+          type: web
+          name: cineforge-storage
+          envVarKey: RENDER_EXTERNAL_HOSTNAME
+      - key: S3_ACCESS_KEY
+        fromService:
+          type: web
+          name: cineforge-storage
+          envVarKey: MINIO_ROOT_USER
+      - key: S3_SECRET_KEY
+        fromService:
+          type: web
+          name: cineforge-storage
+          envVarKey: MINIO_ROOT_PASSWORD
+
+  - type: keyvalue
+    name: cineforge-queue
+    plan: starter
+    region: frankfurt
+    ipAllowList: []
+    maxmemoryPolicy: noeviction
+    persistenceMode: journal-snapshot
+
+  - type: web
+    name: cineforge-storage
+    runtime: image
+    plan: starter
+    region: frankfurt
+    image:
+      url: cgr.dev/chainguard/minio
+    dockerCommand: >-
+      /bin/sh -c mkdir -p /data &&
+      exec minio server --address $HOST:$PORT /data
+    healthCheckPath: /minio/health/live
+    autoDeployTrigger: "off"
+    disk:
+      name: cineforge-media
+      mountPath: /data
+      sizeGB: 50
+    envVars:
+      - key: MINIO_ROOT_USER
+        generateValue: true
+      - key: MINIO_ROOT_PASSWORD
+        generateValue: true
+      - key: MINIO_BROWSER
+        value: "off"
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: "9000"
+
+databases:
+  - name: cineforge-postgres
+    plan: basic-256mb
+    region: frankfurt
+    postgresMajorVersion: "17"
+    databaseName: cineforge
+    user: cineforge
+    diskSizeGB: 15
+    storageAutoscalingEnabled: true
+    ipAllowList: []
