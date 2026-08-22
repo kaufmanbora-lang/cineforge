@@ -58,7 +58,8 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       queued = await enqueueJobs(planGenerationJobs(id, plan.scenes, { fastDraft: rows[0].render_tier === "draft" }));
       if (!queued) {
         const recoverable = await query<{ count: number }>(
-          "SELECT count(*)::int count FROM jobs WHERE project_id=$1 AND state IN ('paused','retrying','failed') AND attempt < max_attempts",
+          `SELECT count(*)::int count FROM jobs WHERE project_id=$1 AND state IN ('paused','retrying','failed')
+             AND (attempt < max_attempts OR (state='failed' AND COALESCE(last_error->>'message','') ~* 'ECONNREFUSED|connection refused'))`,
           [id],
         );
         if (recoverable[0]?.count) queued = await resumeProjectJobs(id);

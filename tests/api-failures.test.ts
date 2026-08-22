@@ -20,6 +20,9 @@ describe("API failure policy", () => {
     expect(retryDecision({ failure: "server", attempt: 1, maxAttempts: 3, baseMs: 1000 })).toEqual({ retry: true, pauseProject: false, delayMs: 2300 });
     expect(retryDecision({ failure: "server", attempt: 3, maxAttempts: 3 })).toEqual({ retry: false, pauseProject: false, delayMs: 0 });
   });
+  it("classifies a refused PostgreSQL connection as a recoverable network failure", () => {
+    expect(classifyFailure(Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:5432"), { code: "ECONNREFUSED" }))).toBe("network");
+  });
   it("does not automatically retry moderation rejection", () => {
     expect(retryDecision({ failure: "moderation", attempt: 1, maxAttempts: 3 }).retry).toBe(false);
   });

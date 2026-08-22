@@ -139,14 +139,17 @@ export async function resumeProjectJobs(projectId: string): Promise<number> {
   const rows = await transaction(async (client) => {
     const completed = await client.query<{ id: string }>("SELECT id FROM shots WHERE project_id=$1 AND state='completed'", [projectId]);
     const completedIds = new Set(completed.rows.map((row) => row.id));
-    const candidates = await client.query<{ id: string; type: string; idempotency_key: string; state: string; payload: { shot?: { dependencies?: string[] } } }>(
-      "SELECT id,type,idempotency_key,state,payload FROM jobs WHERE project_id=$1 AND state IN ('paused','retrying','failed') AND attempt < max_attempts FOR UPDATE",
+    const candidates = await client.query<{ id: string; type: string; idempotency_key: string; state: string; attempt: number; max_attempts: number; payload: { shot?: { dependencies?: string[] } } }>(
+      `SELECT id,type,idempotency_key,state,attempt,max_attempts,payload FROM jobs
+       WHERE project_id=$1 AND state IN ('paused','retrying','failed')
+         AND (attempt < max_attempts OR (state='failed' AND COALESCE(last_error->>'message','') ~* 'ECONNREFUSED|connection refused'))
+       FOR UPDATE`,
       [projectId],
     );
     const ready = candidates.rows.filter((job) => job.type !== "generate-shot" || (job.payload.shot?.dependencies ?? []).every((id) => completedIds.has(id)));
     const waiting = candidates.rows.filter((job) => !ready.includes(job));
-    if (ready.length) await client.query("UPDATE jobs SET state='queued',available_at=now(),last_error=NULL WHERE id=ANY($1::uuid[])", [ready.map((row) => row.id)]);
-    if (waiting.length) await client.query("UPDATE jobs SET state='planned',available_at=now(),last_error=NULL WHERE id=ANY($1::uuid[])", [waiting.map((row) => row.id)]);
+    if (ready.length) await client.query("UPDATE jobs SET state='queued',attempt=CASE WHEN attempt>=max_attempts THEN 0 ELSE attempt END,available_at=now(),last_error=NULL WHERE id=ANY($1::uuid[])", [ready.map((row) => row.id)]);
+    if (waiting.length) await client.query("UPDATE jobs SET state='planned',attempt=CASE WHEN attempt>=max_attempts THEN 0 ELSE attempt END,available_at=now(),last_error=NULL WHERE id=ANY($1::uuid[])", [waiting.map((row) => row.id)]);
     return ready;
   });
   for (const row of rows) {

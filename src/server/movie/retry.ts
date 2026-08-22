@@ -16,7 +16,7 @@ export function classifyFailure(error: unknown): FailureClass {
   if (/moderation|safety|blocked/.test(message)) return "moderation";
   if (/corrupt|invalid media|ffprobe/.test(message)) return "corrupt";
   if (/upload|s3/.test(message)) return "upload";
-  if (/network|econnreset|fetch failed/.test(message)) return "network";
+  if (/network|econnreset|econnrefused|connection refused|fetch failed/.test(message)) return "network";
   return "fatal";
 }
 
