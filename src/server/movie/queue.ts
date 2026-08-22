@@ -149,11 +149,13 @@ export async function requeueDatabaseJob(input: { databaseJobId: string; attempt
 }
 
 export async function pauseProjectJobs(projectId: string, reason: Record<string, unknown>): Promise<void> {
-  await query(
-    `UPDATE jobs SET state='paused', last_error=$2 WHERE project_id=$1 AND state IN ('planned','queued','retrying');
-     UPDATE projects SET status='paused', last_error=$2 WHERE id=$1`,
-    [projectId, JSON.stringify(reason)],
-  );
+  await transaction(async (client) => {
+    await client.query(
+      "UPDATE jobs SET state='paused',last_error=$2 WHERE project_id=$1 AND state IN ('planned','queued','retrying')",
+      [projectId, JSON.stringify(reason)],
+    );
+    await client.query("UPDATE projects SET status='paused',last_error=$2 WHERE id=$1", [projectId, JSON.stringify(reason)]);
+  });
 }
 
 export async function resumeProjectJobs(projectId: string): Promise<number> {
