@@ -10,6 +10,30 @@ CineForge превращает один замысел в восстанавли
 
 Папка проекта подготовлена для GitHub Web Upload и содержит меньше 100 файлов. Загружайте содержимое папки `cineforge`, включая `.gitignore`, но никогда не добавляйте `node_modules`, `.next`, `.env` или локальные media из `storage`. После клонирования зависимости и production build восстанавливаются командами `pnpm install` и `pnpm build`.
 
+## Windows desktop application
+
+CineForge собирается как настоящее 64-bit Windows-приложение на Electron с локально упакованным интерфейсом Next.js. Оно запускается без браузерной панели, использует системные диалоги сохранения файлов и хранит адрес backend только в профиле Windows. Renderer работает с `contextIsolation`, Chromium sandbox, отключённым `nodeIntegration` и запретом произвольных окон/permissions.
+
+```powershell
+pnpm install
+pnpm desktop:unpacked
+```
+
+Готовое приложение появляется в `release/win-unpacked/CineForge.exe`. Команда `pnpm desktop:build` дополнительно создаёт NSIS installer, если он понадобится. На первом запуске Windows-клиент запрашивает HTTPS URL облачного CineForge backend из `render.yaml`; после подключения Google/OpenAI keys добавляются в **Settings → API** и не встраиваются в `.exe`.
+
+Desktop-клиент и облачный Movie Engine разделены намеренно: закрытие Windows-приложения не останавливает background worker, checkpoints и уже подтверждённые video jobs. Без интернета невозможно обращаться к Google/OpenAI API, а без облачного backend невозможно продолжать рендер при выключенном компьютере.
+
+## Постоянный хостинг на Render.com
+
+В корне находится `render.yaml`: Render Blueprint создаёт Web Service, отдельный Background Worker, PostgreSQL 17, persistent Key Value для BullMQ и MinIO с 50 GB persistent disk. Docker-образ устанавливает FFmpeg/ffprobe. Поэтому сайт, checkpoints и генерация продолжают работать в облаке, когда локальный компьютер выключен.
+
+1. Загрузите репозиторий на GitHub.
+2. В Render откройте **New → Blueprint**, подключите репозиторий и подтвердите ресурсы из `render.yaml`.
+3. После первого запуска откройте публичный URL `cineforge-web`.
+4. В приложении откройте **Settings → API** и сохраните новые Google/OpenAI keys. Они шифруются общим автоматически созданным `APP_ENCRYPTION_KEY` и хранятся в PostgreSQL; ключи не нужно добавлять в GitHub или Blueprint.
+
+Конфигурация использует платные `starter`/`basic` ресурсы: бесплатный web service может засыпать, бесплатный PostgreSQL ограничен по сроку, а background worker и persistent disk требуют платного плана. Перед подтверждением Blueprint проверьте актуальную итоговую стоимость в Render Dashboard. MinIO S3 API имеет публичный TLS endpoint для подписанных media URLs, но сами объекты доступны только по временным signed URLs или с автоматически созданными credentials.
+
 ## Что реализовано
 
 - Next.js 16 / React 19 / TypeScript, server-only provider adapters.
@@ -24,7 +48,7 @@ CineForge превращает один замысел в восстанавли
 - Project Memory: Character Bible, Voice Bible, Wardrobe Memory, Location Bible, locks, structured continuity state и reference IDs.
 - Model-specific prompt adapters для Veo и Omni.
 - PostgreSQL Scene Graph: Movie → Acts → Sequences → Scenes → Shots → Versions → Assets → Timeline → Exports.
-- BullMQ / Redis background jobs, dependency graph, idempotency, bounded retries, pause/resume, budget gate и recovery после worker restart.
+- BullMQ / Redis background jobs, enforced dependency graph, idempotency, bounded retries, pause/resume, transactional budget reservations и recovery после worker restart.
 - Checkpoint после каждого принятого shot; completed shots исключаются из resume.
 - Reference image loader и передача final frame предыдущего shot как first-frame reference, когда выбранная модель это поддерживает.
 - AI Director QC каждого shot по metadata и representative frame. Низкий score улучшает prompt и ставит только этот shot на ограниченный retry.
@@ -118,7 +142,7 @@ GEMINI_API_KEY=
 6. Уже созданные clips доступны через `/api/projects/{id}/preview` во время генерации.
 7. При quota/rate-limit/network failure проект не обнуляется. `Resume` продолжает с unfinished shot IDs.
 8. `Editor`: AI edit сначала строит Impact Analysis. Dialogue edit создаёт только новую audio/video-container version; visual edit ставит в очередь только affected shot.
-9. `Export`: FFmpeg собирает master и запускает Final QC. Только прошедший QC файл становится `final_movie_storage_key`.
+9. После последнего video/dialogue checkpoint Movie Engine автоматически ставит MP4 assembly и Final QC в очередь. `Export` в Editor создаёт новый master после последующих правок. Только прошедший QC файл становится `final_movie_storage_key`.
 
 ## Архитектура
 
@@ -148,7 +172,7 @@ flowchart LR
 - `jobs.idempotency_key` и Bull job IDs предотвращают двойную генерацию.
 - `contentHash(prompt + references + audio + settings)` включает все generation inputs.
 - API operation ID сохраняется на shot; worker restart переводит interrupted jobs обратно в очередь.
-- Quota и maximum budget переводят проект в `paused`, а не `failed` и не удаляют assets.
+- Quota и maximum budget переводят проект в `paused`, а не `failed` и не удаляют assets; параллельные jobs сначала атомарно резервируют стоимость в PostgreSQL, поэтому вместе не могут превысить лимит.
 - Retry policy различает quota, rate limit, timeout, server, moderation, corrupted media, upload и fatal error.
 - Retry ограничен `MAX_AUTO_RETRIES`; бесконечных циклов нет.
 - Каждая активная версия shot хранится отдельно; предыдущие versions остаются доступными.

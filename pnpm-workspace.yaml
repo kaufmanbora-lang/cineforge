@@ -1,5 +1,7 @@
 allowBuilds:
   '@google/genai': true
+  electron: true
+  electron-winstaller: false
   esbuild: true
   msgpackr-extract: true
   protobufjs: true

@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "main": "desktop/main.cjs",
+  "author": "CineForge",
   "description": "Autonomous AI movie studio powered by OpenAI Responses API and Google Gemini video models.",
   "scripts": {
     "dev": "next dev",
@@ -13,7 +15,11 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "db:migrate": "tsx scripts/migrate.ts",
-    "worker": "tsx src/server/worker/index.ts"
+    "worker": "tsx src/server/worker/index.ts",
+    "desktop:runtime": "node scripts/prepare-standalone.mjs --desktop",
+    "desktop:dev": "pnpm build && electron .",
+    "desktop:unpacked": "pnpm build && node scripts/prepare-standalone.mjs --desktop && electron-builder --win --x64 --dir",
+    "desktop:build": "pnpm build && node scripts/prepare-standalone.mjs --desktop && electron-builder --win nsis --x64"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1116.0",
@@ -40,6 +46,8 @@
     "@types/react": "19.2.2",
     "@types/react-dom": "19.2.2",
     "@vitest/coverage-v8": "4.1.11",
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3",
     "eslint": "9.39.1",
     "eslint-config-next": "16.3.2",
     "tsx": "4.20.6",
@@ -49,5 +57,60 @@
   "packageManager": "pnpm@11.19.0",
   "engines": {
     "node": ">=22.0.0"
+  },
+  "build": {
+    "appId": "com.cineforge.studio",
+    "productName": "CineForge Studio",
+    "executableName": "CineForge",
+    "artifactName": "CineForge-Setup-${version}-${arch}.${ext}",
+    "asar": true,
+    "compression": "maximum",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "desktop/**/*",
+      "package.json",
+      "!node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": ".desktop-runtime/server",
+        "to": "server",
+        "filter": [
+          "**/*",
+          "!node_modules/**/*"
+        ]
+      },
+      {
+        "from": ".desktop-runtime/server/node_modules",
+        "to": "server/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "public/cineforge-icon.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "CineForge Studio",
+      "uninstallDisplayName": "CineForge Studio",
+      "deleteAppDataOnUninstall": false
+    }
   }
 }

@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS projects (
   maximum_budget_usd numeric(12,2) NOT NULL DEFAULT 20,
   estimated_cost_usd numeric(12,2) NOT NULL DEFAULT 0,
   spent_usd numeric(12,2) NOT NULL DEFAULT 0,
+  reserved_usd numeric(12,2) NOT NULL DEFAULT 0,
   completed_shots integer NOT NULL DEFAULT 0,
   total_shots integer NOT NULL DEFAULT 0,
   current_plan_version integer NOT NULL DEFAULT 0,
@@ -224,6 +225,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   priority integer NOT NULL DEFAULT 0,
   attempt integer NOT NULL DEFAULT 0,
   max_attempts integer NOT NULL DEFAULT 3,
+  reserved_cost_usd numeric(12,2) NOT NULL DEFAULT 0,
   payload jsonb NOT NULL,
   result jsonb,
   last_error jsonb,
@@ -305,6 +307,9 @@ CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(state, available_at, priority 
 CREATE INDEX IF NOT EXISTS idx_checkpoints_project_sequence ON checkpoints(project_id, sequence DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_assets_project_shot ON generation_assets(project_id, shot_id);
+
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS reserved_usd numeric(12,2) NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reserved_cost_usd numeric(12,2) NOT NULL DEFAULT 0;
 
 CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger AS $$
 BEGIN NEW.updated_at = now(); RETURN NEW; END; $$ LANGUAGE plpgsql;

@@ -1,10 +1,11 @@
 import "server-only";
 import type { PoolClient } from "pg";
-import type { MoviePlan, ProjectRecord, Scene, ShotArtifact } from "@/domain/movie";
+import { scopeMoviePlanIds, type MoviePlan, type ProjectRecord, type Scene, type ShotArtifact } from "@/domain/movie";
 import { contentHash } from "./content-hash";
 import { transaction, query } from "@/server/db";
 
 export async function persistMoviePlan(plan: MoviePlan): Promise<void> {
+  plan = scopeMoviePlanIds(plan);
   const hash = contentHash(plan);
   await transaction(async (client) => {
     const versionResult = await client.query<{ current_plan_version: number }>(

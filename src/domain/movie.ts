@@ -258,3 +258,76 @@ export interface ShotArtifact {
   continuityScore: number | null;
   active: boolean;
 }
+
+/**
+ * Closed models frequently reuse convenient IDs such as `scene-1`. The database
+ * intentionally stores graph nodes by stable text ID, so every generated ID and
+ * every internal reference is namespaced before persistence.
+ */
+export function scopeMoviePlanIds(input: MoviePlan): MoviePlan {
+  const prefix = `${input.projectId}:`;
+  const graphId = (kind: string, value: string) => value.startsWith(prefix) ? value : `${prefix}${kind}:${value}`;
+  const wardrobeGraphId = (characterId: string, value: string) => value.startsWith(prefix) ? value : `${prefix}wardrobe:${characterId}:${value}`;
+  const characterIds = new Map(input.characters.map((item) => [item.id, graphId("character",item.id)]));
+  const locationIds = new Map(input.locations.map((item) => [item.id, graphId("location",item.id)]));
+  const actIds = new Map(input.acts.map((item) => [item.id, graphId("act",item.id)]));
+  const sequenceIds = new Map(input.scenes.map((item) => [item.sequenceId, graphId("sequence",item.sequenceId)]));
+  const sceneIds = new Map(input.scenes.map((item) => [item.id, graphId("scene",item.id)]));
+  const shotIds = new Map(input.scenes.flatMap((scene) => scene.shots.map((item) => [item.id, graphId("shot",item.id)] as const)));
+  const dialogueIds = new Map(input.scenes.flatMap((scene) => scene.shots.flatMap((shot) => shot.audioContext.dialogue.map((item) => [item.id, graphId("dialogue",item.id)] as const))));
+  const wardrobeIds = new Map<string, Map<string, string>>();
+  for (const character of input.characters) wardrobeIds.set(character.id, new Map(character.wardrobe.map((item) => [item.id, wardrobeGraphId(character.id,item.id)])));
+  const reference = (map: Map<string,string>, value: string) => map.get(value) ?? value;
+
+  return {
+    ...input,
+    id: graphId("plan",input.id),
+    characters: input.characters.map((character) => ({
+      ...character,
+      id: reference(characterIds, character.id),
+      wardrobe: character.wardrobe.map((wardrobe) => ({
+        ...wardrobe,
+        id: wardrobeIds.get(character.id)?.get(wardrobe.id) ?? wardrobeGraphId(character.id,wardrobe.id),
+        validFromSceneId: reference(sceneIds, wardrobe.validFromSceneId),
+        validToSceneId: wardrobe.validToSceneId ? reference(sceneIds, wardrobe.validToSceneId) : null,
+      })),
+      relationships: Object.fromEntries(Object.entries(character.relationships).map(([id,value]) => [reference(characterIds,id),value])),
+    })),
+    locations: input.locations.map((location) => ({ ...location, id: reference(locationIds,location.id) })),
+    acts: input.acts.map((act) => ({ ...act, id: reference(actIds,act.id) })),
+    scenes: input.scenes.map((scene) => ({
+      ...scene,
+      id: reference(sceneIds,scene.id),
+      actId: reference(actIds,scene.actId),
+      sequenceId: reference(sequenceIds,scene.sequenceId),
+      locationId: reference(locationIds,scene.locationId),
+      characterIds: scene.characterIds.map((id) => reference(characterIds,id)),
+      shots: scene.shots.map((shot) => ({
+        ...shot,
+        id: reference(shotIds,shot.id),
+        sceneId: reference(sceneIds,shot.sceneId),
+        dependencies: shot.dependencies.map((id) => reference(shotIds,id)),
+        audioContext: {
+          ...shot.audioContext,
+          speakers: shot.audioContext.speakers.map((id) => reference(characterIds,id)),
+          silentCharacters: shot.audioContext.silentCharacters.map((id) => reference(characterIds,id)),
+          dialogue: shot.audioContext.dialogue.map((dialogue) => ({ ...dialogue, id: reference(dialogueIds,dialogue.id), characterId: reference(characterIds,dialogue.characterId) })),
+        },
+        continuity: {
+          ...shot.continuity,
+          characterStates: Object.fromEntries(Object.entries(shot.continuity.characterStates).map(([characterId,state]) => [
+            reference(characterIds,characterId),
+            {
+              ...state,
+              locationId: reference(locationIds,state.locationId),
+              wardrobeId: wardrobeIds.get(characterId)?.get(state.wardrobeId) ?? wardrobeGraphId(characterId,state.wardrobeId),
+            },
+          ])),
+          locationId: reference(locationIds,shot.continuity.locationId),
+          previousShotId: shot.continuity.previousShotId ? reference(shotIds,shot.continuity.previousShotId) : null,
+          nextShotId: shot.continuity.nextShotId ? reference(shotIds,shot.continuity.nextShotId) : null,
+        },
+      })),
+    })),
+  };
+}

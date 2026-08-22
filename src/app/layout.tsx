@@ -4,6 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "CineForge — Autonomous AI Movie Studio",
   description: "Screenwriting, continuity, generation, editing and export in one recoverable AI movie pipeline.",
+  icons: { icon: "/cineforge-icon.png", apple: "/cineforge-icon.png" },
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

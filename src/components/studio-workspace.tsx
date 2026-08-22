@@ -1,326 +1,197 @@
 "use client";
 
-import Image from "next/image";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Aperture,
-  AudioLines,
-  Check,
-  ChevronDown,
-  CircleDollarSign,
-  Clapperboard,
-  Expand,
-  Eye,
-  Film,
-  Gauge,
-  ImageIcon,
-  Lightbulb,
-  ListVideo,
-  Lock,
-  Maximize,
-  MessageSquareText,
-  Music2,
-  Pause,
-  Play,
-  RotateCcw,
-  Sparkles,
-  Square,
-  Subtitles,
-  Volume2,
-  Waves,
-  X,
-  Zap,
-  ZoomIn,
-  ZoomOut,
+  Aperture, Check, CircleDollarSign, Clapperboard, Expand, Eye, Film, Gauge,
+  ImageIcon, Lightbulb, ListVideo, Lock, MessageSquareText, Music2, Play,
+  Sparkles, Square, Subtitles, Volume2, Waves, X, Zap, ZoomIn, ZoomOut,
 } from "lucide-react";
 import { estimateGeneration, formatDuration } from "@/domain/estimation";
-import { GOOGLE_VIDEO_MODELS, normalizeResolution, type Resolution } from "@/domain/video-models";
+import type { MoviePlan, ProjectRecord, Scene } from "@/domain/movie";
+import { GOOGLE_VIDEO_MODELS, normalizeResolution, type AspectRatio, type Resolution } from "@/domain/video-models";
 import { Button, Segmented, StatusDot } from "./ui";
 
-const sceneImages = [
-  "/assets/glass-horizon-interrogation.png",
-  "/assets/glass-horizon-street.png",
-  "/assets/glass-horizon-rooftop.png",
-];
-
-const scenes = [
-  { number: 10, title: "The interview", duration: "00:34", image: sceneImages[0] },
-  { number: 11, title: "Cold trail", duration: "00:29", image: sceneImages[1] },
-  { number: 12, title: "Street signal", duration: "00:36", image: sceneImages[1] },
-  { number: 13, title: "Rooftop witness", duration: "00:41", image: sceneImages[2] },
-];
-
-const tracks = [
-  { label: "Video", icon: Film, tone: "video", clips: ["Scene 8", "Scene 9", "Scene 10", "Scene 11", "Scene 12", "Scene 13", "Scene 14", "Scene 15"] },
-  { label: "Dialogue", icon: MessageSquareText, tone: "dialogue", clips: ["DETECTIVE: You said…", "WITNESS: I only…", "DETECTIVE: Where were…", "MOGUL: This city…", "DETECTIVE: It all ends…"] },
-  { label: "Music", icon: Music2, tone: "music", clips: ["Noir Pulse", "Tension Rise", "Resolution Theme"] },
-  { label: "SFX", icon: Volume2, tone: "sfx", clips: ["Footsteps", "Door creak", "Phone ring", "Car door", "Glass break", "Distant siren"] },
-  { label: "Ambience", icon: Waves, tone: "ambience", clips: ["NYC winter night ambience", "Interior room tone", "Alleyway wind", "Street ambience"] },
-  { label: "Subtitles", icon: Subtitles, tone: "subtitles", clips: ["You think I don't see…", "I just want the truth.", "Everything comes…", "It all ends tonight."] },
-];
+type JobRow = { id: string; type: string; state: string; scene_id: string | null; shot_id: string | null; last_error: unknown };
+type CheckpointRow = { sequence: string; event_type: string; completed_shot_ids: string[]; failed_shot_ids: string[]; pending_shot_ids: string[]; created_at: string };
+type DetailPayload = { project: ProjectRecord; plan: MoviePlan | null; jobs: JobRow[]; checkpoints: CheckpointRow[] };
+type PreviewClip = { shot_id: string; scene_id: string; url: string; version: number; continuity_score: string | null };
+type PreviewPayload = { clips: PreviewClip[]; movieUrl: string | null };
+type Track = { label: string; icon: typeof Film; tone: string; clips: Array<{ id: string; sceneId: string; label: string; duration: number }> };
 
 export function StudioWorkspace() {
-  const [mode, setMode] = useState<"quick" | "advanced">("advanced");
-  const [prompt, setPrompt] = useState("A gritty detective film set in winter New York City. A world-weary investigative journalist uncovers a web of corruption tied to a powerful real estate mogul. Mood is noir, realistic, and grounded. Snow falls lightly on rain-slick streets. Include tense interrogations, shadowy alleyways, and stunning cityscapes. End with a moral choice that changes everything.");
-  const [duration, setDuration] = useState(1_200);
+  const [mode, setMode] = useState<"quick" | "advanced">("quick");
+  const [prompt, setPrompt] = useState("");
+  const [duration, setDuration] = useState(60);
   const [customDuration, setCustomDuration] = useState(false);
-  const [modelId, setModelId] = useState("gemini-omni-flash-preview");
+  const [modelId, setModelId] = useState("veo-3.1-fast-generate-preview");
   const [resolution, setResolution] = useState<Resolution>("720p");
+  const [aspectRatio, setAspectRatio] = useState<AspectRatio>("16:9");
   const [draft, setDraft] = useState(true);
   const [budget, setBudget] = useState(25);
-  const [selectedScene, setSelectedScene] = useState(12);
-  const [playing, setPlaying] = useState(false);
+  const [projectId, setProjectId] = useState("");
+  const [detail, setDetail] = useState<DetailPayload | null>(null);
+  const [preview, setPreview] = useState<PreviewPayload>({ clips: [], movieUrl: null });
+  const [selectedSceneId, setSelectedSceneId] = useState("");
   const [rightTab, setRightTab] = useState<"overview" | "scenes" | "memory">("overview");
   const [budgetOpen, setBudgetOpen] = useState(false);
-  const [planReady, setPlanReady] = useState(false);
-  const [productionStarted, setProductionStarted] = useState(false);
-  const [queuedJobs, setQueuedJobs] = useState(0);
   const [busy, setBusy] = useState<"planning" | "generating" | null>(null);
-  const [notice, setNotice] = useState("Preview ready");
+  const [notice, setNotice] = useState("Enter a movie idea to begin.");
   const [accountModelIds, setAccountModelIds] = useState<Set<string> | null>(null);
+  const [timelineZoom, setTimelineZoom] = useState(100);
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   const model = GOOGLE_VIDEO_MODELS[modelId];
   const estimate = useMemo(() => estimateGeneration({ durationSeconds: duration, modelId, resolution }), [duration, modelId, resolution]);
-  const previewImage = scenes.find((scene) => scene.number === selectedScene)?.image ?? sceneImages[1];
+  const plan = detail?.plan;
+  const scenes = plan?.scenes ?? [];
+  const selectedScene = scenes.find((scene) => scene.id === selectedSceneId) ?? scenes[0];
+  const selectedPreview = preview.clips.find((clip) => clip.scene_id === selectedScene?.id) ?? null;
+  const activeJobs = detail?.jobs.filter((job) => ["queued","generating","validating","retrying"].includes(job.state)) ?? [];
+  const latestCheckpoint = detail?.checkpoints[0];
+  const progress = detail?.project.progress ?? 0;
+
+  const loadProject = useCallback(async (id: string, quiet = false) => {
+    if (!id) return;
+    try {
+      const [detailResponse, previewResponse] = await Promise.all([
+        fetch(`/api/projects?id=${encodeURIComponent(id)}`, { cache: "no-store" }),
+        fetch(`/api/projects/${id}/preview`, { cache: "no-store" }),
+      ]);
+      const payload = await detailResponse.json();
+      if (!detailResponse.ok || payload.infrastructure === "offline") throw new Error(payload.error ?? "Project infrastructure is offline.");
+      setDetail(payload); setProjectId(id); localStorage.setItem("cineforge.projectId", id);
+      setPrompt(payload.project.prompt); setDuration(payload.project.durationSeconds); setModelId(payload.project.modelId);
+      setResolution(payload.project.resolution); setAspectRatio(payload.project.aspectRatio); setBudget(Number(payload.project.maximumBudgetUsd));
+      setDraft(payload.project.renderTier !== "final");
+      setSelectedSceneId((current) => current && payload.plan?.scenes.some((scene: Scene) => scene.id === current) ? current : payload.plan?.scenes?.[0]?.id ?? "");
+      if (previewResponse.ok) setPreview(await previewResponse.json());
+      if (!quiet) setNotice(payload.plan ? `${payload.plan.scenes.length} scenes loaded from Project Memory.` : "Project has no screenplay yet.");
+    } catch (error) { if (!quiet) setNotice(error instanceof Error ? error.message : "Unable to load the project."); }
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(async () => {
       const preparedRaw = sessionStorage.getItem("cineforge.preparedProject");
-      if (preparedRaw) {
-        try {
-          const prepared = JSON.parse(preparedRaw) as { durationSeconds: number; modelId: string; resolution: Resolution; shots: number };
-          if (GOOGLE_VIDEO_MODELS[prepared.modelId]) {
-            setDuration(prepared.durationSeconds);
-            setModelId(prepared.modelId);
-            setResolution(normalizeResolution(prepared.modelId, prepared.resolution));
-            setPlanReady(true);
-            setBudgetOpen(true);
-            setNotice(`${prepared.shots} shots prepared by AI Screenwriter`);
-          }
-        } catch { sessionStorage.removeItem("cineforge.preparedProject"); }
+      const queryId = new URL(window.location.href).searchParams.get("project");
+      let prepared: { projectId?: string; durationSeconds: number; modelId: string; resolution: Resolution; shots: number } | null = null;
+      if (preparedRaw) try { prepared = JSON.parse(preparedRaw); } catch { sessionStorage.removeItem("cineforge.preparedProject"); }
+      const existingId = queryId ?? prepared?.projectId ?? null;
+      if (prepared && GOOGLE_VIDEO_MODELS[prepared.modelId]) {
+        setDuration(prepared.durationSeconds); setModelId(prepared.modelId); setResolution(normalizeResolution(prepared.modelId, prepared.resolution)); setBudgetOpen(Boolean(existingId));
+        setNotice(`${prepared.shots} shots prepared by AI Screenwriter.`);
       }
+      if (existingId) await loadProject(existingId);
       try {
-        const response = await fetch("/api/models/google", { cache: "no-store" });
-        const payload = await response.json();
-        if (!payload.connected) return;
+        const response = await fetch("/api/models/google", { cache: "no-store" }); const payload = await response.json();
+        if (!payload.connected) { setAccountModelIds(new Set()); setNotice((current) => existingId ? current : "Connect Google API in Settings before video generation."); return; }
         const available = new Set<string>((payload.models ?? []).filter((entry: { available?: boolean; selectable?: boolean }) => entry.available && entry.selectable !== false).map((entry: { id: string }) => entry.id));
         setAccountModelIds(available);
-        if (available.size) setModelId((current) => {
-          if (available.has(current)) return current;
-          const next = [...available][0];
-          setResolution((resolutionValue) => normalizeResolution(next, resolutionValue));
-          return next;
-        });
-        if (!available.size) setNotice("No supported Google video model is enabled for this API project.");
-      } catch { /* The registry remains visible until a key is connected. */ }
+        if (available.size) setModelId((current) => { if (available.has(current)) return current; const next = [...available][0]; setResolution((value) => normalizeResolution(next, value)); return next; });
+        else setNotice("No supported Google video model is enabled for this API project.");
+      } catch { setAccountModelIds(new Set()); setNotice("Unable to verify Google video model access."); }
     }, 0);
     return () => window.clearTimeout(timer);
-  }, []);
+  }, [loadProject]);
 
-  function changeModel(nextId: string) {
-    setModelId(nextId);
-    setResolution((current) => normalizeResolution(nextId, current));
+  useEffect(() => {
+    if (!projectId || !detail || ["draft","planned","completed","paused","failed","cancelled"].includes(detail.project.status)) return;
+    const interval = window.setInterval(() => void loadProject(projectId, true), 5_000);
+    return () => window.clearInterval(interval);
+  }, [detail, loadProject, projectId]);
+
+  function changeModel(nextId: string) { setModelId(nextId); setResolution((current) => normalizeResolution(nextId, current)); }
+  function startNewProject() {
+    setProjectId(""); setDetail(null); setPreview({ clips: [], movieUrl: null }); setSelectedSceneId(""); setPrompt(""); setBudgetOpen(false);
+    localStorage.removeItem("cineforge.projectId"); sessionStorage.removeItem("cineforge.preparedProject"); setNotice("Enter a movie idea to begin a new project.");
   }
 
-  async function createPlan(): Promise<string | null> {
-    setBusy("planning");
-    setNotice("Planning story…");
+  async function createPlan() {
+    if (prompt.trim().length < 10) { setNotice("Describe the movie in at least 10 characters."); return; }
+    if (accountModelIds && !accountModelIds.has(modelId)) { setNotice("The selected Google video model is not available for this API key."); return; }
+    setBusy("planning"); setNotice("Creating the Movie Project…");
     try {
-      const created = await fetch("/api/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title: "Glass Horizon",
-          prompt,
-          durationSeconds: duration,
-          modelId,
-          resolution,
-          aspectRatio: "16:9",
-          mode,
-          renderTier: draft ? "draft" : "final",
-          maximumBudgetUsd: budget,
-        }),
-      });
-      const payload = await created.json();
-      if (!created.ok) throw new Error(payload.error ?? "Unable to create project.");
-      localStorage.setItem("cineforge.projectId", payload.projectId);
-      setNotice("Creating screenplay and shot graph…");
-      const planned = await fetch(`/api/projects/${payload.projectId}/plan`, { method: "POST" });
-      const planPayload = await planned.json();
-      if (!planned.ok) throw new Error(planPayload.error ?? "Unable to plan movie.");
-      setPlanReady(true);
-      setBudgetOpen(true);
-      setNotice(`${planPayload.shots} shots planned`);
-      return payload.projectId as string;
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Planning failed");
-      setPlanReady(false);
-      return null;
-    } finally {
-      setBusy(null);
-    }
+      const created = await fetch("/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: "Untitled Movie", prompt, durationSeconds: duration, modelId, resolution, aspectRatio, mode, renderTier: draft ? "draft" : "final", maximumBudgetUsd: budget }) });
+      const createdPayload = await created.json(); if (!created.ok) throw new Error(createdPayload.error ?? "Unable to create project.");
+      const id = createdPayload.projectId as string; setProjectId(id); localStorage.setItem("cineforge.projectId", id); setNotice("Creating screenplay and shot graph…");
+      const planned = await fetch(`/api/projects/${id}/plan`, { method: "POST" }); const planPayload = await planned.json(); if (!planned.ok) throw new Error(planPayload.error ?? "Unable to plan movie.");
+      await loadProject(id, true); setBudgetOpen(true); setNotice(`${planPayload.scenes} scenes and ${planPayload.shots} shots planned.`);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "Planning failed."); }
+    finally { setBusy(null); }
   }
 
   async function confirmGeneration() {
-    let projectId = localStorage.getItem("cineforge.projectId");
-    if (!projectId) {
-      projectId = await createPlan();
-      if (!projectId) return;
-    }
-    setBusy("generating");
-    setNotice("Queueing generation…");
+    if (!projectId || !plan) { setNotice("Plan the movie before starting generation."); return; }
+    setBusy("generating"); setNotice("Queueing generation jobs…");
     try {
-      const response = await fetch(`/api/projects/${projectId}/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ confirmed: true, maximumBudgetUsd: budget }),
-      });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error ?? "Unable to start generation.");
-      setQueuedJobs(payload.queued);
-      setProductionStarted(true);
-      setNotice(`${payload.queued} generation jobs queued`);
-      setBudgetOpen(false);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Generation failed");
-    } finally {
-      setBusy(null);
-    }
+      const response = await fetch(`/api/projects/${projectId}/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, maximumBudgetUsd: budget }) });
+      const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Unable to start generation.");
+      setBudgetOpen(false); setNotice(`${payload.queued} new jobs queued. Existing completed shots were not duplicated.`); await loadProject(projectId, true);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "Generation failed."); }
+    finally { setBusy(null); }
   }
 
-  return (
-    <div className="studio-grid">
-      <section className="brief-panel" aria-label="Movie brief">
-        <div className="section-title"><h1>Describe your movie</h1><button aria-label="Collapse brief" type="button">«</button></div>
-        <Segmented value={mode} onChange={setMode} options={[{ value: "quick", label: "Quick Create" }, { value: "advanced", label: "Advanced" }]} />
-        <div className="prompt-box">
-          <textarea aria-label="Describe your movie" maxLength={20_000} onChange={(event) => setPrompt(event.target.value)} value={prompt} />
-          <span>{prompt.length} / 20,000</span>
-        </div>
-        <div className="control-stack">
-          <label><span><Aperture size={15} />Duration</span><select onChange={(event) => { if (event.target.value === "custom") setCustomDuration(true); else { setCustomDuration(false); setDuration(Number(event.target.value)); } }} value={customDuration ? "custom" : duration}>
-            {[10,30,60,180,300,600,900,1200,1800,2700,3600].map((seconds) => <option key={seconds} value={seconds}>{formatDuration(seconds)}</option>)}<option value="custom">Custom Duration…</option>
-          </select></label>
-          {customDuration ? <label><span>Seconds</span><input aria-label="Custom duration in seconds" max="3600" min="1" onChange={(event) => setDuration(Math.max(1, Math.min(3600, Number(event.target.value))))} type="number" value={duration} /></label> : null}
-          <label><span><Sparkles size={15} />Model</span><select onChange={(event) => changeModel(event.target.value)} value={modelId}>
-            {Object.values(GOOGLE_VIDEO_MODELS).map((entry) => <option disabled={accountModelIds !== null && !accountModelIds.has(entry.id)} key={entry.id} value={entry.id}>{entry.displayName}{accountModelIds !== null && !accountModelIds.has(entry.id) ? " · unavailable for this key" : ""}</option>)}
-          </select></label>
-          <div className="split-control">
-            <label><span><ImageIcon size={15} />Resolution</span><select onChange={(event) => setResolution(event.target.value as Resolution)} value={resolution}>
-              {model.resolutions.map((entry) => <option key={entry} value={entry}>{entry === "preview" ? "Preview / Draft" : entry}</option>)}
-            </select></label>
-            <label className="aspect"><span>Aspect</span><select defaultValue="16:9"><option>16:9</option><option>9:16</option></select></label>
-          </div>
-          <label className="toggle-row"><span><Zap size={15} />Fast Draft</span><button aria-pressed={draft} className={draft ? "toggle on" : "toggle"} onClick={() => setDraft((value) => !value)} type="button"><i /></button></label>
-        </div>
-        <div className="estimate-lines">
-          <div><span>Estimated shots</span><strong>{estimate.shots} shots</strong></div>
-          <div><span>Video generation</span><strong>${estimate.videoUsd.toFixed(2)}</strong></div>
-          <div><span>Retries reserve</span><strong>${estimate.retriesReserveUsd.toFixed(2)}</strong></div>
-          <div className="budget-line"><span>Maximum budget</span><label>$<input aria-label="Maximum generation budget" min="0" onChange={(event) => setBudget(Number(event.target.value))} type="number" value={budget} /></label></div>
-        </div>
-        <Button className="plan-button" loading={busy === "planning"} onClick={() => void createPlan()} variant="primary">Plan movie<Clapperboard size={16} /></Button>
-        <p className="approx-note">Cost is approximate and based on current official per-second pricing.</p>
-      </section>
+  function selectRelative(offset: number) { const index = scenes.findIndex((scene) => scene.id === selectedScene?.id); const next = scenes[Math.max(0, Math.min(scenes.length - 1, index + offset))]; if (next) setSelectedSceneId(next.id); }
+  async function togglePreview() { if (!videoRef.current) return; if (videoRef.current.paused) await videoRef.current.play(); else videoRef.current.pause(); }
+  async function openFullscreen() { const node = videoRef.current?.parentElement; if (node?.requestFullscreen) await node.requestFullscreen(); }
 
-      <section className="preview-panel" aria-label="Movie preview">
-        <div className="preview-frame">
-          <Image alt="Glass Horizon — selected scene preview" fill priority sizes="(max-width: 1200px) 60vw, 50vw" src={previewImage} />
-          <div className="preview-corner"><span>SCENE {selectedScene}</span><strong>{scenes.find((scene) => scene.number === selectedScene)?.title}</strong></div>
-        </div>
-        <div className="transport">
-          <strong>00:03:56:12</strong>
-          <button className="fit-control" type="button">Fit<ChevronDown size={13} /></button>
-          <div className="transport-center">
-            <button aria-label="Previous scene" type="button"><RotateCcw size={17} /></button>
-            <button aria-label={playing ? "Pause" : "Play"} className="play-control" onClick={() => setPlaying((value) => !value)} type="button">
-              {playing ? <Pause size={21} fill="currentColor" /> : <Play size={21} fill="currentColor" />}
-            </button>
-            <button aria-label="Next scene" type="button"><Play size={17} /></button>
-          </div>
-          <div className="transport-actions"><button aria-label="Capture frame" type="button"><Aperture size={17} /></button><button aria-label="Fullscreen" type="button"><Expand size={17} /></button></div>
-        </div>
-        <div className="seek-line"><i style={{ width: "37%" }} /><b style={{ left: "37%" }} /></div>
-      </section>
+  const tracks = buildTracks(scenes);
+  const planReady = Boolean(plan);
+  const costOverBudget = estimate.estimatedTotalUsd > budget;
 
-      <aside className="production-panel">
-        <div className="panel-tabs">
-          {(["overview","scenes","memory"] as const).map((tab) => <button className={rightTab === tab ? "active" : ""} key={tab} onClick={() => setRightTab(tab)} type="button">{tab[0].toUpperCase()+tab.slice(1)}</button>)}
-        </div>
-        {rightTab === "overview" ? <ProductionOverview planReady={planReady} productionStarted={productionStarted} selectedScene={selectedScene} setSelectedScene={setSelectedScene} /> : null}
-        {rightTab === "scenes" ? <SceneList selectedScene={selectedScene} setSelectedScene={setSelectedScene} /> : null}
-        {rightTab === "memory" ? <MemorySummary /> : null}
-      </aside>
+  return <div className="studio-grid">
+    <section className="brief-panel" aria-label="Movie brief">
+      <div className="section-title"><h1>{plan ? detail?.project.title : "Describe your movie"}</h1>{plan ? <Button onClick={startNewProject} variant="ghost">New project</Button> : null}</div>
+      {plan ? <div className="secure-note"><StatusDot tone="green"/>Structured MoviePlan is persisted. Use AI Screenwriter for targeted screenplay changes.</div> : <Segmented value={mode} onChange={setMode} options={[{ value: "quick", label: "Quick Create" }, { value: "advanced", label: "Advanced" }]}/>} 
+      <div className="prompt-box"><textarea aria-label="Describe your movie" disabled={Boolean(plan)} maxLength={20_000} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe the story, characters, setting and desired tone…" value={prompt}/><span>{prompt.length} / 20,000</span></div>
+      <div className="control-stack">
+        <label><span><Aperture size={15}/>Duration</span><select disabled={Boolean(plan)} onChange={(event) => { if (event.target.value === "custom") setCustomDuration(true); else { setCustomDuration(false); setDuration(Number(event.target.value)); } }} value={customDuration ? "custom" : duration}>{[10,30,60,180,300,600,900,1200,1800,2700,3600].map((seconds) => <option key={seconds} value={seconds}>{formatDuration(seconds)}</option>)}<option value="custom">Custom Duration…</option></select></label>
+        {customDuration ? <label><span>Seconds</span><input aria-label="Custom duration in seconds" max="3600" min="1" onChange={(event) => setDuration(Math.max(1, Math.min(3600, Number(event.target.value) || 1)))} type="number" value={duration}/></label> : null}
+        <label><span><Sparkles size={15}/>Model</span><select disabled={Boolean(plan)} onChange={(event) => changeModel(event.target.value)} value={modelId}>{Object.values(GOOGLE_VIDEO_MODELS).map((entry) => <option disabled={accountModelIds !== null && !accountModelIds.has(entry.id)} key={entry.id} value={entry.id}>{entry.displayName}{accountModelIds !== null && !accountModelIds.has(entry.id) ? " · unavailable" : ""}</option>)}</select></label>
+        <div className="split-control"><label><span><ImageIcon size={15}/>Resolution</span><select disabled={Boolean(plan)} onChange={(event) => setResolution(event.target.value as Resolution)} value={resolution}>{model.resolutions.map((entry) => <option key={entry} value={entry}>{entry === "preview" ? "Preview / Draft" : entry}</option>)}</select></label><label className="aspect"><span>Aspect</span><select disabled={Boolean(plan)} onChange={(event) => setAspectRatio(event.target.value as AspectRatio)} value={aspectRatio}>{model.aspectRatios.map((entry) => <option key={entry}>{entry}</option>)}</select></label></div>
+        <label className="toggle-row"><span><Zap size={15}/>Fast Draft</span><button aria-pressed={draft} className={draft ? "toggle on" : "toggle"} disabled={Boolean(plan)} onClick={() => setDraft((value) => !value)} type="button"><i/></button></label>
+      </div>
+      <div className="estimate-lines"><div><span>Estimated shots</span><strong>{estimate.shots} shots</strong></div><div><span>Video generation</span><strong>${estimate.videoUsd.toFixed(2)}</strong></div><div><span>Audio</span><strong>${estimate.audioUsd.toFixed(2)}</strong></div><div><span>Retries reserve</span><strong>${estimate.retriesReserveUsd.toFixed(2)}</strong></div><div className="budget-line"><span>Maximum budget</span><label>$<input aria-label="Maximum generation budget" min="0" onChange={(event) => setBudget(Math.max(0, Number(event.target.value) || 0))} type="number" value={budget}/></label></div></div>
+      <Button className="plan-button" disabled={Boolean(plan) || prompt.trim().length < 10 || busy !== null} loading={busy === "planning"} onClick={() => void createPlan()} variant="primary">{plan ? "Movie plan saved" : "Plan movie"}<Clapperboard size={16}/></Button>
+      <p className="approx-note">Estimate is approximate. Paid video jobs start only after the separate confirmation.</p>
+    </section>
 
-      <section className="timeline-panel" aria-label="Movie timeline">
-        <div className="timeline-toolbar">
-          <div><strong>TIMELINE</strong><button type="button">Sequence 01<ChevronDown size={13} /></button><button aria-label="Add track" type="button">+</button></div>
-          <strong className="timeline-time">00:03:56:12</strong>
-          <div><button aria-label="Zoom out" type="button"><ZoomOut size={15} /></button><input aria-label="Timeline zoom" defaultValue="42" type="range" /><button aria-label="Zoom in" type="button"><ZoomIn size={15} /></button><button aria-label="Fit timeline" type="button"><Maximize size={15} /></button></div>
-        </div>
-        <div className="time-ruler"><span>00:00:00:00</span><span>00:01:00:00</span><span>00:02:00:00</span><span>00:03:00:00</span><span>00:05:00:00</span><span>00:09:00:00</span><span>00:11:00:00</span></div>
-        <div className="tracks"><div className="playhead" style={{ left: "43.8%" }}><i /></div>{tracks.map((track, trackIndex) => <TimelineTrack key={track.label} track={track} selectedScene={selectedScene} setSelectedScene={setSelectedScene} trackIndex={trackIndex} />)}</div>
-      </section>
+    <section className="preview-panel" aria-label="Movie preview">
+      <div className="preview-frame">{selectedPreview ? <video controls key={selectedPreview.url} ref={videoRef} src={selectedPreview.url}/> : <div className="preview-empty"><Film size={36}/><strong>{selectedScene ? "Shot not generated yet" : "No planned scene selected"}</strong><span>{selectedScene ? "Its real media appears after a completed checkpoint." : "Plan a movie to build the Scene Graph."}</span></div>}{selectedScene ? <div className="preview-corner"><span>SCENE {selectedScene.number}</span><strong>{selectedScene.title}</strong></div> : null}</div>
+      <div className="transport"><strong>{selectedScene ? formatTimecode(sceneStart(scenes, selectedScene.id)) : "00:00:00"}</strong><span className="fit-control">{selectedPreview ? `Shot ${selectedPreview.shot_id} · v${selectedPreview.version}` : "No media"}</span><div className="transport-center"><button aria-label="Previous scene" disabled={!selectedScene || scenes[0]?.id === selectedScene.id} onClick={() => selectRelative(-1)} type="button"><Play size={17} style={{ transform: "rotate(180deg)" }}/></button>{selectedPreview ? <button aria-label="Play or pause" className="play-control" onClick={() => void togglePreview()} type="button"><Play size={21} fill="currentColor"/></button> : null}<button aria-label="Next scene" disabled={!selectedScene || scenes.at(-1)?.id === selectedScene.id} onClick={() => selectRelative(1)} type="button"><Play size={17}/></button></div><div className="transport-actions">{selectedPreview ? <button aria-label="Fullscreen preview" onClick={() => void openFullscreen()} type="button"><Expand size={17}/></button> : null}</div></div>
+      <div className="seek-line"><i style={{ width: `${progress}%` }}/><b style={{ left: `${progress}%` }}/></div>
+    </section>
 
-      {budgetOpen ? <BudgetConfirmation budget={budget} estimate={estimate} modelName={model.displayName} onClose={() => setBudgetOpen(false)} onConfirm={confirmGeneration} busy={busy === "generating"} duration={duration} resolution={resolution} /> : planReady ? <div className="budget-collapsed"><Button onClick={() => setBudgetOpen(true)} variant="primary"><CircleDollarSign size={15} />Review cost</Button></div> : null}
+    <aside className="production-panel"><div className="panel-tabs">{(["overview","scenes","memory"] as const).map((tab) => <button className={rightTab === tab ? "active" : ""} key={tab} onClick={() => setRightTab(tab)} type="button">{tab[0].toUpperCase()+tab.slice(1)}</button>)}</div>{rightTab === "overview" ? <ProductionOverview detail={detail} onShowScenes={() => setRightTab("scenes")} selectedSceneId={selectedScene?.id ?? ""} setSelectedSceneId={setSelectedSceneId}/> : null}{rightTab === "scenes" ? <SceneList scenes={scenes} selectedSceneId={selectedScene?.id ?? ""} setSelectedSceneId={setSelectedSceneId}/> : null}{rightTab === "memory" ? <MemorySummary plan={plan}/> : null}</aside>
 
-      <footer className="studio-statusbar">
-        <div><Gauge size={15} /><span>Background queue</span><b>{queuedJobs}</b></div>
-        <div className="status-progress"><span>{productionStarted ? "Generation queued · checkpoints enabled" : planReady ? "Generation plan ready" : "No active generation"}</span><i><b style={{ width: productionStarted ? "4%" : "0%" }} /></i><strong>{productionStarted ? "Queued" : "Idle"}</strong></div>
-        <div className="status-progress spend"><span>Project API spend</span><i><b style={{ width: "0%" }} /></i><strong>$0.00 / ${budget.toFixed(2)}</strong></div>
-        <div><StatusDot /><span>{notice}</span></div>
-        <div><span>720p · H.264</span><Button variant="ghost">Test playback</Button></div>
-      </footer>
-    </div>
-  );
+    <section className="timeline-panel" aria-label="Movie timeline"><div className="timeline-toolbar"><div><strong>MASTER TIMELINE</strong></div><strong className="timeline-time">{selectedScene ? formatTimecode(sceneStart(scenes, selectedScene.id)) : "00:00:00"} / {formatTimecode(duration)}</strong><div><button aria-label="Zoom out" onClick={() => setTimelineZoom((value) => Math.max(50,value-25))} type="button"><ZoomOut size={15}/></button><input aria-label="Timeline zoom" max="250" min="50" onChange={(event) => setTimelineZoom(Number(event.target.value))} type="range" value={timelineZoom}/><button aria-label="Zoom in" onClick={() => setTimelineZoom((value) => Math.min(250,value+25))} type="button"><ZoomIn size={15}/></button></div></div><div className="time-ruler">{[0,.2,.4,.6,.8,1].map((ratio) => <span key={ratio}>{formatTimecode(duration*ratio)}</span>)}</div><div className="tracks" style={{ minWidth: `${timelineZoom}%` }}><div className="playhead" style={{ left: `${selectedScene && duration ? sceneStart(scenes,selectedScene.id)/duration*100 : 0}%` }}><i/></div>{tracks.map((track) => <TimelineTrack key={track.label} track={track} selectedSceneId={selectedScene?.id ?? ""} setSelectedSceneId={setSelectedSceneId}/>)}</div></section>
+
+    {budgetOpen && plan ? <BudgetConfirmation budget={budget} estimate={estimate} modelName={model.displayName} onClose={() => setBudgetOpen(false)} onConfirm={() => void confirmGeneration()} busy={busy === "generating"} duration={duration} resolution={resolution} overBudget={costOverBudget}/> : planReady ? <div className="budget-collapsed"><Button onClick={() => setBudgetOpen(true)} variant="primary"><CircleDollarSign size={15}/>Review cost</Button></div> : null}
+
+    <footer className="studio-statusbar"><div><Gauge size={15}/><span>Active queue</span><b>{activeJobs.length}</b></div><div className="status-progress"><span>{detail ? `${detail.project.status} · ${detail.project.completedShots}/${detail.project.totalShots} shots` : "No active production"}</span><i><b style={{ width: `${progress}%` }}/></i><strong>{progress}%</strong></div><div className="status-progress spend"><span>Project API spend</span><i><b style={{ width: `${detail?.project.maximumBudgetUsd ? Math.min(100,detail.project.spentUsd/detail.project.maximumBudgetUsd*100) : 0}%` }}/></i><strong>${Number(detail?.project.spentUsd ?? 0).toFixed(2)} / ${Number(detail?.project.maximumBudgetUsd ?? budget).toFixed(2)}</strong></div><div><StatusDot tone={detail?.project.status === "failed" ? "red" : detail?.project.status === "paused" ? "amber" : "teal"}/><span>{notice}</span></div><div><span>{resolution} · {aspectRatio}{latestCheckpoint ? ` · CP ${latestCheckpoint.sequence}` : ""}</span></div></footer>
+  </div>;
 }
 
-function ProductionOverview({ planReady, productionStarted, selectedScene, setSelectedScene }: { planReady: boolean; productionStarted: boolean; selectedScene: number; setSelectedScene: (scene: number) => void }) {
-  const plannedStatus = planReady ? "complete" : "waiting";
+function ProductionOverview({ detail, selectedSceneId, setSelectedSceneId, onShowScenes }: { detail: DetailPayload | null; selectedSceneId: string; setSelectedSceneId: (id: string) => void; onShowScenes: () => void }) {
+  const plan = detail?.plan; const status = detail?.project.status; const jobs = detail?.jobs ?? []; const checkpoints = detail?.checkpoints ?? [];
   const stages = [
-    ["Story", plannedStatus], ["Characters", plannedStatus], ["Storyboard", plannedStatus],
-    ["Scene generation", productionStarted ? "active" : "waiting"], ["Continuity", "waiting"], ["Audio", "waiting"], ["Assembly", "waiting"], ["Final QC", "waiting"],
+    ["Story", plan ? "complete" : "waiting"], ["Characters", plan?.characters.length ? "complete" : "waiting"], ["Storyboard", plan?.scenes.length ? "complete" : "waiting"],
+    ["Scene generation", ["queued","generating"].includes(status ?? "") ? "active" : status === "completed" ? "complete" : "waiting"],
+    ["Continuity", jobs.some((job) => job.state === "validating") ? "active" : status === "completed" ? "complete" : "waiting"],
+    ["Assembly", status === "assembling" ? "active" : status === "completed" ? "complete" : "waiting"], ["Final QC", status === "completed" ? "complete" : "waiting"],
   ];
-  return <div className="production-content">
-    <h2>Production stages</h2>
-    <div className="stage-list">{stages.map(([name,status]) => <div key={name}><span className={`stage-icon ${status}`}>{status === "complete" ? <Check size={12} /> : status === "active" ? <span /> : <Square size={10} />}</span><strong>{name}</strong><em>{status === "active" ? "Queued with dependency graph" : status === "complete" ? "" : "Waiting"}</em>{status === "active" ? <b>Ready</b> : null}</div>)}</div>
-    <div className="score-card"><span>{productionStarted ? "Continuity validation" : "Project memory readiness"}</span><div><AudioLines size={24} /><strong>{planReady ? "Ready" : "—"}</strong><em>{planReady ? "Structured context" : "Plan the movie first"}</em><Button variant="ghost">Details</Button></div></div>
-    <div className="checkpoint-card"><div><span>Checkpoints</span><Button variant="ghost">View all</Button></div><p><Check size={13} />{productionStarted ? "Enabled after every shot" : "Ready when generation starts"}</p></div>
-    <h2>Recent scenes</h2>
-    <div className="scene-strip">{scenes.map((scene) => <button className={selectedScene === scene.number ? "selected" : ""} key={scene.number} onClick={() => setSelectedScene(scene.number)} type="button"><span><Image alt="" fill sizes="100px" src={scene.image} /></span><strong>Scene {scene.number}</strong><small>{scene.duration}</small></button>)}</div>
-  </div>;
+  return <div className="production-content"><h2>Production stages</h2><div className="stage-list">{stages.map(([name,state]) => <div key={name}><span className={`stage-icon ${state}`}>{state === "complete" ? <Check size={12}/> : state === "active" ? <span/> : <Square size={10}/>}</span><strong>{name}</strong><em>{state === "active" ? "In progress" : state === "complete" ? "Ready" : "Waiting"}</em></div>)}</div><div className="score-card"><span>Project state</span><div><Lightbulb size={20}/><p>{detail ? `${detail.project.completedShots} completed · ${detail.project.totalShots-detail.project.completedShots} pending` : "Plan the movie first"}<br/><small>{jobs.filter((job) => job.state === "failed").length} failed jobs</small></p></div></div><div className="checkpoint-card"><div><span>Persistent checkpoints</span></div><p><Check size={13}/>{checkpoints.length ? `${checkpoints.length} recent checkpoints loaded; latest sequence ${checkpoints[0].sequence}` : "No shot checkpoint has been written yet"}</p></div><h2>Scenes</h2><div className="scene-strip">{(plan?.scenes ?? []).slice(0,4).map((scene) => <button className={selectedSceneId === scene.id ? "selected" : ""} key={scene.id} onClick={() => setSelectedSceneId(scene.id)} type="button"><span className="resource-placeholder"><Film size={16}/></span><strong>Scene {scene.number}</strong><small>{formatTimecode(scene.durationSeconds)}</small></button>)}</div>{(plan?.scenes.length ?? 0) > 4 ? <Button className="wide-inline" onClick={onShowScenes} variant="ghost">Open all {plan?.scenes.length} scenes</Button> : null}</div>;
 }
-
-function SceneList({ selectedScene, setSelectedScene }: { selectedScene: number; setSelectedScene: (scene: number) => void }) {
-  return <div className="production-content"><h2>Scene graph</h2><div className="inspector-list">{scenes.map((scene) => <button className={selectedScene === scene.number ? "selected" : ""} key={scene.number} onClick={() => setSelectedScene(scene.number)} type="button"><ListVideo size={15} /><span><strong>Scene {scene.number}</strong><small>{scene.title}</small></span><em>{scene.duration}</em></button>)}</div></div>;
-}
-
-function MemorySummary() {
-  return <div className="production-content"><h2>Locked project memory</h2><div className="memory-facts"><p><Lock size={13} />Elias · face and charcoal coat</p><p><Lock size={13} />Mara · voice identity</p><p><Lock size={13} />Apartment 4B · object layout</p><p><Lock size={13} />Evidence drive · silver</p></div><div className="score-card"><span>Context for next shot</span><div><Lightbulb size={20} /><p>8 relevant facts · 3 references<br/><small>Previous and next shot states included</small></p></div></div></div>;
-}
-
-function TimelineTrack({ track, trackIndex, selectedScene, setSelectedScene }: { track: typeof tracks[number]; trackIndex: number; selectedScene: number; setSelectedScene: (scene: number) => void }) {
-  const Icon = track.icon;
-  return <div className={`timeline-track tone-${track.tone}`}>
-    <div className="track-head"><Icon size={14} /><span>{track.label}</span><Eye size={13} /><Lock size={12} /></div>
-    <div className="track-clips">{track.clips.map((clip,index) => {
-      const sceneNumber = 8 + index;
-      const selected = trackIndex === 0 && sceneNumber === selectedScene;
-      return <button className={selected ? "selected" : ""} key={`${clip}-${index}`} onClick={() => trackIndex === 0 && setSelectedScene(sceneNumber)} style={{ flex: index % 3 === 1 ? 1.25 : 1 }} type="button">
-        {trackIndex === 0 ? <span className="clip-image"><Image alt="" fill sizes="150px" src={sceneImages[index % sceneImages.length]} /></span> : null}<span>{clip}</span>
-      </button>;
-    })}</div>
-  </div>;
-}
-
-function BudgetConfirmation({ budget, estimate, modelName, onClose, onConfirm, busy, duration, resolution }: {
-  budget: number; estimate: ReturnType<typeof estimateGeneration>; modelName: string; onClose: () => void; onConfirm: () => void; busy: boolean; duration: number; resolution: Resolution;
-}) {
-  return <aside className="budget-confirm">
-    <div className="budget-title"><strong>Confirm budget</strong><button aria-label="Close cost confirmation" onClick={onClose} type="button"><X size={15} /></button></div>
-    <dl><div><dt>Model</dt><dd>{modelName}</dd></div><div><dt>Duration</dt><dd>{formatDuration(duration)}</dd></div><div><dt>Resolution</dt><dd>{resolution} · 16:9</dd></div><div><dt>Estimated shots</dt><dd>{estimate.shots} shots</dd></div><div><dt>Maximum budget</dt><dd>${budget.toFixed(2)}</dd></div></dl>
-    <div className="cost-total"><span>Approx. cost</span><strong>${estimate.estimatedTotalUsd.toFixed(2)} USD</strong></div>
-    <Button disabled={estimate.estimatedTotalUsd > budget} loading={busy} onClick={onConfirm} variant="primary"><Lock size={14} />Confirm paid generation</Button>
-    <p>{estimate.estimatedTotalUsd > budget ? `Increase the maximum budget to at least $${estimate.estimatedTotalUsd.toFixed(2)} before generation.` : "You will only be charged by providers for successful usage. The project pauses automatically at its budget."}</p>
-  </aside>;
-}
+function SceneList({ scenes, selectedSceneId, setSelectedSceneId }: { scenes: Scene[]; selectedSceneId: string; setSelectedSceneId: (id: string) => void }) { return <div className="production-content"><h2>Scene graph</h2><div className="inspector-list">{scenes.map((scene) => <button className={selectedSceneId === scene.id ? "selected" : ""} key={scene.id} onClick={() => setSelectedSceneId(scene.id)} type="button"><ListVideo size={15}/><span><strong>Scene {scene.number}</strong><small>{scene.title}</small></span><em>{formatTimecode(scene.durationSeconds)}</em></button>)}</div>{!scenes.length ? <p className="field-help">No screenplay has been planned.</p> : null}</div>; }
+function MemorySummary({ plan }: { plan: MoviePlan | null | undefined }) { const facts = [...(plan?.characters ?? []).flatMap((character) => Object.entries(character.locks).filter(([,locked]) => locked).map(([key]) => `${character.name} · ${key}`)), ...(plan?.locations ?? []).filter((location) => location.designLocked).map((location) => `${location.name} · design`)]; return <div className="production-content"><h2>Locked project memory</h2><div className="memory-facts">{facts.map((fact) => <p key={fact}><Lock size={13}/>{fact}</p>)}{!facts.length ? <p>No continuity values are locked.</p> : null}</div><div className="score-card"><span>Context builder</span><div><Lightbulb size={20}/><p>{plan ? `${plan.characters.length} characters · ${plan.locations.length} locations` : "No Project Memory yet"}<br/><small>Only relevant scene context is sent per shot.</small></p></div></div></div>; }
+function TimelineTrack({ track, selectedSceneId, setSelectedSceneId }: { track: Track; selectedSceneId: string; setSelectedSceneId: (id: string) => void }) { const Icon = track.icon; return <div className={`timeline-track tone-${track.tone}`}><div className="track-head"><Icon size={14}/><span>{track.label}</span><Eye size={13}/><Lock size={12}/></div><div className="track-clips">{track.clips.map((clip) => <button className={selectedSceneId === clip.sceneId ? "selected" : ""} key={clip.id} onClick={() => setSelectedSceneId(clip.sceneId)} style={{ flexGrow: Math.max(.5,clip.duration) }} type="button"><span>{clip.label}</span></button>)}</div></div>; }
+function BudgetConfirmation({ estimate, budget, modelName, duration, resolution, onClose, onConfirm, busy, overBudget }: { estimate: ReturnType<typeof estimateGeneration>; budget: number; modelName: string; duration: number; resolution: Resolution; onClose: () => void; onConfirm: () => void; busy: boolean; overBudget: boolean }) { return <div className="budget-confirm"><div className="budget-title"><strong>Confirm paid generation</strong><button aria-label="Close cost confirmation" onClick={onClose} type="button"><X size={15}/></button></div><dl><div><dt>Model</dt><dd>{modelName}</dd></div><div><dt>Movie</dt><dd>{formatDuration(duration)} · {resolution}</dd></div><div><dt>Planned generations</dt><dd>{estimate.shots}</dd></div><div><dt>Video</dt><dd>${estimate.videoUsd.toFixed(2)}</dd></div><div><dt>Audio</dt><dd>${estimate.audioUsd.toFixed(2)}</dd></div><div><dt>Retry reserve</dt><dd>${estimate.retriesReserveUsd.toFixed(2)}</dd></div></dl><div className="cost-total"><span>Approximate total</span><strong>${estimate.estimatedTotalUsd.toFixed(2)}</strong></div><Button disabled={overBudget} loading={busy} onClick={onConfirm} variant="primary">{overBudget ? `Increase $${budget.toFixed(2)} budget` : `Confirm & generate · max $${budget.toFixed(2)}`}</Button><p>No provider call starts until confirmation. Generation pauses instead of exceeding the project budget.</p></div>; }
+function buildTracks(scenes: Scene[]): Track[] { const shotRows = scenes.flatMap((scene) => scene.shots.map((shot) => ({ scene, shot }))); return [
+  { label: "Video", icon: Film, tone: "video", clips: shotRows.map(({scene,shot}) => ({ id: `v:${shot.id}`, sceneId: scene.id, label: shot.title, duration: shot.durationSeconds })) },
+  { label: "Dialogue", icon: MessageSquareText, tone: "dialogue", clips: shotRows.map(({scene,shot}) => ({ id: `d:${shot.id}`, sceneId: scene.id, label: shot.audioContext.dialogue.map((line) => `${line.characterName}: ${line.text}`).join(" · ") || "No dialogue", duration: shot.durationSeconds })) },
+  { label: "Music", icon: Music2, tone: "music", clips: shotRows.map(({scene,shot}) => ({ id: `m:${shot.id}`, sceneId: scene.id, label: shot.audioContext.musicCue ?? "No music", duration: shot.durationSeconds })) },
+  { label: "SFX", icon: Volume2, tone: "sfx", clips: shotRows.map(({scene,shot}) => ({ id: `s:${shot.id}`, sceneId: scene.id, label: shot.audioContext.soundEffects.join(", ") || "No SFX", duration: shot.durationSeconds })) },
+  { label: "Ambience", icon: Waves, tone: "ambience", clips: shotRows.map(({scene,shot}) => ({ id: `a:${shot.id}`, sceneId: scene.id, label: shot.audioContext.ambience.join(", ") || "No ambience", duration: shot.durationSeconds })) },
+  { label: "Subtitles", icon: Subtitles, tone: "subtitles", clips: shotRows.map(({scene,shot}) => ({ id: `t:${shot.id}`, sceneId: scene.id, label: shot.audioContext.dialogue.map((line) => line.text).join(" · ") || "No subtitles", duration: shot.durationSeconds })) },
+]; }
+function sceneStart(scenes: Scene[], sceneId: string) { let cursor = 0; for (const scene of scenes) { if (scene.id === sceneId) return cursor; cursor += scene.durationSeconds; } return 0; }
+function formatTimecode(seconds: number) { const value = Math.max(0,Math.floor(seconds)); const hours = Math.floor(value/3600); const minutes = Math.floor(value%3600/60); const secs = value%60; return `${String(hours).padStart(2,"0")}:${String(minutes).padStart(2,"0")}:${String(secs).padStart(2,"0")}`; }

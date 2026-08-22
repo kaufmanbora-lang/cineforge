@@ -1,6 +1,5 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Download, Film, Play, RefreshCw, RotateCcw } from "lucide-react";
@@ -10,8 +9,6 @@ import { Button, StatusDot } from "./ui";
 type RenderFilter = "Active" | "Completed" | "Paused" | "Failed";
 
 const activeStatuses = new Set(["planned", "queued", "generating", "validating", "retrying", "assembling"]);
-const fallbackPosters = ["/assets/glass-horizon-street.png", "/assets/glass-horizon-interrogation.png", "/assets/glass-horizon-rooftop.png"];
-
 export function RendersWorkspace() {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [filter, setFilter] = useState<RenderFilter>("Active");
@@ -71,18 +68,18 @@ export function RendersWorkspace() {
     <div className="filter-tabs">{(["Active", "Completed", "Paused", "Failed"] as RenderFilter[]).map((item) => <button className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)} type="button">{item}</button>)}</div>
     {notice ? <div className="secure-note" style={{ marginBottom: 12 }}><StatusDot tone={offline ? "red" : "teal"}/>{notice}</div> : null}
     <div className="settings-content">
-      {visible.map((project, index) => {
+      {visible.map((project) => {
         const complete = project.status === "completed";
         const recoverable = project.status === "paused" || project.status === "failed";
         return <section className="settings-card" key={project.id}>
           <header className="settings-card-head"><span className="provider-mark"><StatusDot tone={complete ? "green" : recoverable ? "amber" : "teal"}/></span><div><h2>{project.title} · {project.renderTier === "draft" ? "Fast Draft" : "Final Quality"}</h2><p>{project.completedShots} of {project.totalShots} shots checkpointed · {project.modelId}</p></div><span className="connection" style={{ color: complete ? "var(--green)" : recoverable ? "var(--amber)" : "var(--teal)" }}>{project.status} · {project.progress}%</span></header>
           <div className="settings-card-body" style={{ display: "grid", gridTemplateColumns: "180px minmax(0,1fr) auto", gap: 14, alignItems: "center" }}>
-            <div className="resource-image" style={{ aspectRatio: "16/9", borderRadius: 4, overflow: "hidden" }}><Image alt={`${project.title} render`} fill sizes="180px" src={project.posterUrl || fallbackPosters[index % fallbackPosters.length]}/></div>
+            <div className="resource-image resource-placeholder" style={{ aspectRatio: "16/9", borderRadius: 4, overflow: "hidden" }}><Film size={24}/><span>{project.completedShots ? `${project.completedShots} shots ready` : "Awaiting first shot"}</span></div>
             <div><div className="project-progress"><i style={{ width: `${project.progress}%` }}/></div><p className="field-help">{project.completedShots} completed · {Math.max(0, project.totalShots - project.completedShots)} unfinished · checkpoints are persistent</p><div className="memory-chips"><span>{project.resolution}</span><span>{project.aspectRatio}</span><span>${Number(project.spentUsd).toFixed(2)} / ${Number(project.maximumBudgetUsd).toFixed(2)}</span></div></div>
             <div className="page-actions" style={{ justifyContent: "flex-end" }}>
-              {complete ? <><a className="button button-primary" href={`/api/projects/${project.id}/downloads/mp4`}><Download size={13}/>MP4</a><a className="button" href={`/api/projects/${project.id}/downloads/srt`}>SRT</a><a className="button" href={`/api/projects/${project.id}/downloads/archive`}>Archive</a></> : null}
+              {complete ? <><Link className="button button-teal" href={`/editor?project=${project.id}`} onClick={() => localStorage.setItem("cineforge.projectId", project.id)}><Play size={13}/>Edit</Link><a className="button button-primary" href={`/api/projects/${project.id}/downloads/mp4`}><Download size={13}/>MP4</a><a className="button" href={`/api/projects/${project.id}/downloads/srt`}>SRT</a><a className="button" href={`/api/projects/${project.id}/downloads/archive`}>Archive</a></> : null}
               {recoverable ? <Button loading={resuming === project.id} onClick={() => void resume(project.id)} variant="primary"><RotateCcw size={13}/>Resume</Button> : null}
-              {activeStatuses.has(project.status) ? <Link className="button button-teal" href={`/editor?project=${project.id}`}><Play size={13}/>Open preview</Link> : null}
+              {activeStatuses.has(project.status) ? <Link className="button button-teal" href={`/editor?project=${project.id}`} onClick={() => localStorage.setItem("cineforge.projectId", project.id)}><Play size={13}/>Open preview</Link> : null}
             </div>
           </div>
         </section>;

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildContinuityState, validateContinuity } from "@/server/movie/continuity";
+import { scopeMoviePlanIds, type MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
 
 describe("Project Memory and continuity", () => {
@@ -20,5 +21,21 @@ describe("Project Memory and continuity", () => {
     const result = validateContinuity(expected, actual);
     expect(result.score).toBe(64);
     expect(result.issues.map((issue) => issue.field)).toContain("character.character-elias.wardrobeId");
+  });
+  it("namespaces every graph ID and reference per project without double-prefixing", () => {
+    const projectId = "00000000-0000-0000-0000-000000000111";
+    const plan: MoviePlan = {
+      id: "plan-1", projectId,
+      summary: { title: "Isolated", genre: "drama", style: "realistic", mood: "quiet", durationSeconds: 8, logline: "A test", synopsis: "A scoped graph." },
+      characters: [character()], locations: [location()],
+      acts: [{ id: "act-1", number: 1, title: "One", purpose: "Set-up", startSceneNumber: 1, endSceneNumber: 1 }],
+      scenes: [scene()], createdAt: new Date(0).toISOString(),
+    };
+    const scoped = scopeMoviePlanIds(plan);
+    const twice = scopeMoviePlanIds(scoped);
+    expect(scoped.characters[0].id).toBe(`${projectId}:character:character-elias`);
+    expect(scoped.scenes[0].shots[0].continuity.characterStates[scoped.characters[0].id].locationId).toBe(scoped.locations[0].id);
+    expect(scoped.scenes[0].shots[0].sceneId).toBe(scoped.scenes[0].id);
+    expect(twice).toEqual(scoped);
   });
 });

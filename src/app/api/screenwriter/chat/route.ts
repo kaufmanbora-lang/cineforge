@@ -80,6 +80,10 @@ export async function POST(request: Request) {
               const action = PrepareMovieAction.parse(JSON.parse(String(record.arguments ?? "{}")));
               if (body.projectId && action.projectId && body.projectId !== action.projectId) throw new Error("The requested project does not match the active conversation project.");
               const prepared = await prepareMovieFromScreenwriterAction(action, body.message, body.projectId);
+              if (conversationId) await query(
+                "UPDATE conversations SET project_id=COALESCE(project_id,$2) WHERE id=$1 AND (project_id IS NULL OR project_id=$2)",
+                [conversationId, prepared.projectId],
+              );
               controller.enqueue(encoder.encode(`event: action\ndata: ${JSON.stringify({ name: "create_movie_from_current_screenplay", prepared })}\n\n`));
             }
             if (record.type === "response.completed") {

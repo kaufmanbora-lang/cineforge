@@ -4,6 +4,7 @@ import { openAIClient } from "@/server/providers/openai";
 import { query, transaction } from "@/server/db";
 import { patchDialogueAudio } from "@/server/movie/ffmpeg";
 import { putObject, signedObjectUrl } from "@/server/storage";
+import { enqueueAutomaticAssemblyIfReady } from "@/server/movie/queue";
 
 const BUILT_IN_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", "verse", "marin", "cedar"] as const;
 
@@ -41,7 +42,10 @@ export async function processDialoguePatch(databaseJobId: string) {
       "SELECT bible FROM characters WHERE id=$1 AND project_id=$2",
       [segment.characterId, job.project_id],
     );
-    const voice = characters[0]?.bible.voice?.providerVoiceId ?? deterministicVoice(segment.characterId);
+    const requestedVoice = characters[0]?.bible.voice?.providerVoiceId;
+    const voice = requestedVoice && BUILT_IN_VOICES.includes(requestedVoice as (typeof BUILT_IN_VOICES)[number])
+      ? requestedVoice
+      : deterministicVoice(segment.characterId);
     const speechResponse = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: voice as never,
@@ -84,6 +88,7 @@ export async function processDialoguePatch(databaseJobId: string) {
       [job.project_id, job.shot_id, JSON.stringify({ dialogueIds: segments.map((segment) => segment.id), version, sourceAssetId: job.payload.originalAssetId })],
     );
   });
+  await enqueueAutomaticAssemblyIfReady(job.project_id);
   return { storageKey, videoFramesPreserved: true };
 }
 

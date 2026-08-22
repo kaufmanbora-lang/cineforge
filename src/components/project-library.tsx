@@ -1,6 +1,5 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { Clapperboard, KeyRound, Plus, RefreshCw } from "lucide-react";
@@ -9,8 +8,6 @@ import type { ProjectRecord } from "@/domain/movie";
 import { Button, StatusDot } from "./ui";
 
 type LibraryFilter = "All" | "Drafts" | "Rendering" | "Completed" | "Paused" | "Failed";
-
-const fallbackPosters = ["/assets/glass-horizon-street.png", "/assets/glass-horizon-interrogation.png", "/assets/glass-horizon-rooftop.png"];
 
 export function ProjectLibrary() {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
@@ -58,13 +55,13 @@ export function ProjectLibrary() {
     {googleConfigured === false ? <div className="secure-note" style={{ margin: "4px 0 14px" }}><KeyRound size={15} />First-run setup: connect a Google Gemini API key before generating video.<Link className="button button-teal" style={{ marginLeft: "auto" }} href="/settings">Open Settings → API</Link></div> : null}
     <div className="filter-tabs">
       {(["All","Drafts","Rendering","Completed","Paused","Failed"] as LibraryFilter[]).map((item) => <button className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)} type="button">{item}</button>)}
-      {offline ? <span style={{ marginLeft: "auto", paddingBottom: 11, color: "var(--muted)", fontSize: 9 }}>Infrastructure offline · no placeholder projects are shown</span> : null}
+      {offline ? <span style={{ marginLeft: "auto", paddingBottom: 11, color: "var(--muted)", fontSize: 9 }}>Infrastructure offline · project library unavailable</span> : null}
     </div>
     <div className="project-grid">
       <Link className="new-project-card" href="/create"><div><span><Plus size={18} /></span><strong>Create a new film</strong></div></Link>
-      {visible.map((project, index) => <article className="project-card" key={project.id}>
-        <Link className="project-poster" href={project.id.includes("-") && project.id.length > 25 ? `/editor?project=${project.id}` : "/create"}>
-          <Image alt={`${project.title} poster`} fill sizes="(max-width: 720px) 90vw, 25vw" src={project.posterUrl || fallbackPosters[index % fallbackPosters.length]} />
+      {visible.map((project) => <article className="project-card" key={project.id}>
+        <Link className="project-poster project-placeholder" href={`/editor?project=${project.id}`} onClick={() => localStorage.setItem("cineforge.projectId", project.id)}>
+          <Clapperboard size={30}/><span className="placeholder-label">{project.completedShots ? `${project.completedShots} shots checkpointed` : "No generated poster yet"}</span>
           <span className="project-status"><StatusDot tone={project.status === "completed" ? "green" : project.status === "paused" ? "amber" : project.status === "failed" ? "red" : "teal"} />{project.status}</span>
           <span className="project-duration">{formatDuration(project.durationSeconds)}</span>
         </Link>

@@ -3,18 +3,14 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  Bell,
-  ChevronDown,
   Clapperboard,
   CloudCog,
   FolderOpen,
-  HelpCircle,
   MapPin,
   Menu,
   MessageSquareText,
   Settings,
   Sparkles,
-  SquareUser,
   Users,
 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
@@ -33,7 +29,7 @@ const navItems = [
 
 export function AppShell({
   children,
-  projectTitle = "Glass Horizon",
+  projectTitle = "CineForge Studio",
   role = "Screenwriter / AI Director",
   compactTop = false,
 }: {
@@ -74,19 +70,15 @@ export function AppShell({
 
       <div className="app-column">
         <header className={clsx("top-bar", compactTop && "compact")}> 
-          <button className="project-switcher" type="button">
+          <Link className="project-switcher" href="/projects">
             <FolderOpen size={15} />
             <strong>{projectTitle}</strong>
-            <ChevronDown size={14} />
-          </button>
+          </Link>
           <div className="top-spacer" />
-          <div className="autosave"><span className="status-dot green" />Autosave enabled</div>
+          <div className="autosave"><span className="status-dot green" />Persistent project state</div>
           <div className="provider-status"><span className={`status-dot ${providers.google === undefined ? "amber" : providers.google ? "green" : "red"}`} />Google {providers.google === undefined ? "checking" : providers.google ? "configured" : "not configured"}</div>
           <div className="provider-status"><span className={`status-dot ${providers.openai === undefined ? "amber" : providers.openai ? "green" : "red"}`} />OpenAI {providers.openai === undefined ? "checking" : providers.openai ? "configured" : "not configured"}</div>
-          <button className="role-switcher" type="button">{role}<ChevronDown size={14} /></button>
-          <button className="bare-icon" type="button" aria-label="Help"><HelpCircle size={17} /></button>
-          <button className="bare-icon" type="button" aria-label="Notifications"><Bell size={17} /></button>
-          <button className="avatar" type="button" aria-label="Account"><SquareUser size={18} /></button>
+          <span className="role-switcher">{role}</span>
         </header>
         <main className="app-main">{children}</main>
       </div>
