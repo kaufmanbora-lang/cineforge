@@ -58,7 +58,11 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   const capabilities = getVideoModel(job.model_id);
   const price = capabilities.pricePerSecondUsd[job.resolution] ?? capabilities.pricePerSecondUsd["720p"] ?? 0;
   const projectedCost = job.payload.shot.durationSeconds * price;
-  if (!await reserveBudget(job.id, job.project_id, projectedCost)) {
+  const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/${job.payload.specHash}.mp4`;
+  // Check the durable provider checkpoint before reserving more budget. A
+  // worker/database restart must never charge or reserve the same video twice.
+  const staged = await getObjectIfExists(storageKey);
+  if (!staged && !await reserveBudget(job.id, job.project_id, projectedCost)) {
     await pauseProjectJobs(job.project_id, { code: "BUDGET_REACHED", message: "Maximum generation budget reached." });
     throw new Error("Maximum generation budget reached; project paused.");
   }
@@ -66,8 +70,6 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   try {
     const prompt = job.payload.shot.generationPrompt;
     if (!prompt) throw new Error("Shot has no generation prompt.");
-    const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/${job.payload.specHash}.mp4`;
-    const staged = await getObjectIfExists(storageKey);
     let operation;
     if (staged) {
       operation = {
@@ -110,7 +112,10 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       throw error;
     }
     providerCompleted = true;
-    const cost = projectedCost;
+    // A staged object either already had its reservation settled, or still has
+    // the exact interrupted reservation recorded on the job. Account only that
+    // outstanding amount; never add projected cost a second time.
+    const cost = generationAccountingCost(projectedCost, Number(job.reserved_cost_usd), Boolean(staged));
     const checksum = createHash("sha256").update(operation.output.bytes).digest("hex");
     // Object storage is independent of PostgreSQL. Stage the paid provider
     // result first so a database restart can never force another video call.
@@ -173,6 +178,10 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     }
     throw error;
   }
+}
+
+export function generationAccountingCost(projectedCost: number, outstandingReservation: number, staged: boolean): number {
+  return staged ? Math.max(0, outstandingReservation) : projectedCost;
 }
 
 async function withDurableDatabaseRetry<T>(operation: () => Promise<T>): Promise<T> {
@@ -264,7 +273,7 @@ async function persistCompletedAsset(job: JobRow, storageKey: string, checksum: 
     );
     const progress = count.rows[0].total ? (count.rows[0].completed / count.rows[0].total) * 100 : 0;
     await client.query(
-      "UPDATE projects SET completed_shots=$2, total_shots=$3, progress=$4, spent_usd=spent_usd+$5,reserved_usd=GREATEST(0,reserved_usd-$5), status=CASE WHEN $2=$3 THEN 'validating'::project_status ELSE 'generating'::project_status END WHERE id=$1",
+      "UPDATE projects SET completed_shots=$2::integer, total_shots=$3::integer, progress=$4::numeric, spent_usd=spent_usd+$5::numeric,reserved_usd=GREATEST(0,reserved_usd-$5::numeric), status=CASE WHEN $2::integer=$3::integer THEN 'validating'::project_status ELSE 'generating'::project_status END WHERE id=$1",
       [job.project_id, count.rows[0].completed, count.rows[0].total, progress, cost],
     );
     const states = await client.query<{ id: string; state: string }>("SELECT id,state FROM shots WHERE project_id=$1 ORDER BY created_at", [job.project_id]);

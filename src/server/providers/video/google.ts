@@ -196,8 +196,13 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
         id?: string;
         output_video?: { data?: string; uri?: string; mime_type?: string };
         outputVideo?: { data?: string; uri?: string; mimeType?: string };
+        steps?: Array<{ content?: Array<{ type?: string; data?: string; uri?: string; mime_type?: string; mimeType?: string }> }>;
+        outputs?: Array<{ content?: Array<{ type?: string; data?: string; uri?: string; mime_type?: string; mimeType?: string }> }>;
       };
-      const video = raw.output_video ?? raw.outputVideo;
+      // Interactions API currently returns generated media as a video content
+      // part inside `steps`. Keep the named fields and `outputs` fallback for
+      // SDK/API revisions, but parse the real response shape used in production.
+      const video = raw.output_video ?? raw.outputVideo ?? extractOmniVideo(raw);
       if (!video) throw new Error("Gemini Omni returned no video output.");
       const bytes = video.data ? Buffer.from(video.data, "base64") : await downloadGoogleFile(video.uri, apiKey);
       const videoRecord = video as { data?: string; uri?: string; mime_type?: string; mimeType?: string };
@@ -217,6 +222,14 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
   async poll(operation: ProviderOperation): Promise<ProviderOperation> {
     return operation;
   }
+}
+
+export function extractOmniVideo(raw: {
+  steps?: Array<{ content?: Array<{ type?: string; data?: string; uri?: string; mime_type?: string; mimeType?: string }> }>;
+  outputs?: Array<{ content?: Array<{ type?: string; data?: string; uri?: string; mime_type?: string; mimeType?: string }> }>;
+}): { data?: string; uri?: string; mime_type?: string; mimeType?: string } | undefined {
+  const content = [...(raw.steps ?? []), ...(raw.outputs ?? [])].flatMap((item) => item.content ?? []);
+  return content.find((part) => part.type === "video" && Boolean(part.data || part.uri));
 }
 
 export function googleVideoAdapter(modelId: string): VideoModelAdapter {
@@ -282,7 +295,7 @@ export function normalizeGoogleProviderError(error: unknown): { code: string; me
   if (status === 401 || /api[_ -]?key.*(invalid|expired)|unauthenticated|authentication/.test(probe)) {
     return { code: "GOOGLE_AUTHENTICATION", status, retryable: false, message: "Google отклонил API-ключ. Создайте новый ключ Gemini API и замените его в разделе «Настройки → API»." };
   }
-  if (/billing|prepay|prepaid|payment|credit balance|no credits|failed_precondition/.test(probe)) {
+  if (/billing|prepay|prepaid|payment|credit balance|no credits/.test(probe)) {
     return { code: "GOOGLE_BILLING_NOT_READY", status, retryable: false, message: "Оплата Gemini API ещё не активна для проекта этого ключа. Проверьте положительный баланс Prepay и привязку billing именно к проекту ключа в Google AI Studio." };
   }
   if (status === 403 || /permission_denied|access restricted|permission/.test(probe)) {
