@@ -65,6 +65,12 @@ describe("Google Omni response parsing", () => {
     ] } } })).toEqual({ uri: "https://generativelanguage.googleapis.com/v1beta/files/movie" });
   });
 
+  it("normalizes raw MLDev inline video fields before persistence", () => {
+    expect(extractVeoVideo({ response: { generateVideoResponse: { generatedSamples: [
+      { video: { encodedVideo: "AAAA", encoding: "video/mp4" } },
+    ] } } })).toMatchObject({ videoBytes: "AAAA", mimeType: "video/mp4" });
+  });
+
   it("streams a large inline Veo response to a temporary video file", async () => {
     const expected = Buffer.from("test-video-payload");
     const payload = JSON.stringify({

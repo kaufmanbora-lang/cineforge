@@ -181,7 +181,10 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
 interface VeoVideoOutput {
   uri?: string;
   videoBytes?: string;
+  encodedVideo?: string;
+  bytesBase64Encoded?: string;
   mimeType?: string;
+  encoding?: string;
   localFilePath?: string;
   byteSize?: number;
   checksum?: string;
@@ -292,7 +295,15 @@ export function extractVeoVideo(raw: {
     generateVideoResponse?: { generatedSamples?: Array<{ video?: VeoVideoOutput }> };
   };
 }) {
-  return raw.response?.generatedVideos?.[0]?.video ?? raw.response?.generateVideoResponse?.generatedSamples?.[0]?.video;
+  const video = raw.response?.generatedVideos?.[0]?.video ?? raw.response?.generateVideoResponse?.generatedSamples?.[0]?.video;
+  if (!video) return undefined;
+  // Small REST responses are parsed as raw JSON before the SDK mapping layer,
+  // where MLDev names the fields `encodedVideo` and `encoding`.
+  return {
+    ...video,
+    videoBytes: video.videoBytes ?? video.encodedVideo ?? video.bytesBase64Encoded,
+    mimeType: video.mimeType ?? video.encoding,
+  };
 }
 
 export function googleVeoConfig(
