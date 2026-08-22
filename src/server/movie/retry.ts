@@ -15,7 +15,7 @@ export function classifyFailure(error: unknown): FailureClass {
   if (status === 429 && /quota|resource_exhausted|квот/.test(probe)) return "quota";
   if (status === 429) return "rate-limit";
   if (status === 408 || /timeout/.test(message)) return "timeout";
-  if (/moderation|safety|blocked/.test(message)) return "moderation";
+  if (/moderation|safety|blocked|безопасност/.test(probe)) return "moderation";
   if (/corrupt|invalid media|ffprobe/.test(message)) return "corrupt";
   if (/upload|s3/.test(message)) return "upload";
   if (/network|econnreset|econnrefused|connection refused|fetch failed/.test(message)) return "network";

@@ -29,6 +29,7 @@ describe("API failure policy", () => {
     expect(classifyFailure(Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:5432"), { code: "ECONNREFUSED" }))).toBe("network");
   });
   it("does not automatically retry moderation rejection", () => {
+    expect(classifyFailure(Object.assign(new Error("Google отклонил кадр по правилам безопасности"), { code: "GOOGLE_MODERATION" }))).toBe("moderation");
     expect(retryDecision({ failure: "moderation", attempt: 1, maxAttempts: 3 }).retry).toBe(false);
   });
   it("recognizes temporary PostgreSQL connection refusal without retrying arbitrary database errors", () => {
