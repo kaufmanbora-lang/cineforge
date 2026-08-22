@@ -118,6 +118,27 @@ export async function reconcileQueuedJobs(): Promise<number> {
   return rows.length;
 }
 
+export async function recoverStaleJobs(): Promise<number> {
+  // Google documents an upper bound of minutes for ordinary video requests.
+  // A job left in an active state for twelve minutes without an update is an
+  // orphan (for example, the database restarted while BullMQ was handling it).
+  // The atomic claim in processShot prevents duplicate paid calls.
+  const rows = await query<{ id: string; type: string; idempotency_key: string; priority: number }>(
+    `UPDATE jobs j SET state='queued',available_at=now(),started_at=NULL,
+       last_error=jsonb_build_object('code','STALE_JOB_RECOVERY','message','Recovered an orphaned generation job'),updated_at=now()
+     FROM projects p
+     WHERE j.project_id=p.id AND j.state IN ('generating','validating','retrying')
+       AND j.updated_at < now() - interval '12 minutes'
+       AND p.status IN ('queued','generating','validating','assembling')
+     RETURNING j.id,j.type,j.idempotency_key,j.priority`,
+  );
+  for (const row of rows) {
+    const bullId = createHash("sha256").update(`${row.idempotency_key}:stale:${Date.now()}`).digest("hex");
+    await movieQueue().add(row.type, { databaseJobId: row.id }, { jobId: bullId, priority: Math.max(1, 20_000 - row.priority) });
+  }
+  return rows.length;
+}
+
 export async function requeueDatabaseJob(input: { databaseJobId: string; attempt: number; delayMs: number; type?: string }): Promise<void> {
   const retryIdentity = `${input.databaseJobId}:attempt:${input.attempt}`;
   const bullId = createHash("sha256").update(retryIdentity).digest("hex");

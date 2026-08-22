@@ -35,7 +35,7 @@ interface JobRow {
 export async function processShot(databaseJobId: string): Promise<{ cached: boolean; storageKey: string; retrying?: boolean }> {
   const rows = await query<JobRow>(
     `WITH claimed AS (
-       UPDATE jobs SET state='generating',started_at=COALESCE(started_at,now()),attempt=attempt+1,updated_at=now()
+       UPDATE jobs SET state='generating',started_at=now(),attempt=attempt+1,updated_at=now()
        WHERE id=$1 AND state IN ('queued','retrying') AND available_at<=now()
        RETURNING *
      )
@@ -105,18 +105,18 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       ? null
       : await runShotQc(job, operation.output.bytes, operation.output.mimeType, operation.operationId);
     const engineSettings = await movieEngineSettings(job.project_id);
-    if (qc && qc.overall < engineSettings.qcRetryThreshold && job.attempt + 1 < job.max_attempts) {
+    if (qc && qc.overall < engineSettings.qcRetryThreshold && job.attempt < job.max_attempts) {
       const retryPrompt = `${prompt.prompt}\nQC CORRECTION FOR THIS SHOT ONLY: ${qc.retryInstruction ?? qc.issues.join("; ")}. Preserve all unaffected details and locked values.`;
       const nextPayload = {
         ...job.payload,
         shot: { ...job.payload.shot, generationPrompt: { ...prompt, prompt: retryPrompt } },
       };
       nextPayload.specHash = contentHash({ shot: nextPayload.shot, qcCorrection: qc.retryInstruction ?? qc.issues });
-      const rejectedKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/qc-rejected-${job.attempt + 1}-${checksum.slice(0, 12)}.mp4`;
+      const rejectedKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/qc-rejected-${job.attempt}-${checksum.slice(0, 12)}.mp4`;
       await putObject(rejectedKey, operation.output.bytes, operation.output.mimeType);
       const delayMs = Math.min(60_000, 2_000 * 2 ** Math.max(0, job.attempt));
       await persistQcRetry(job, { storageKey: rejectedKey, checksum, byteSize: operation.output.bytes.byteLength, cost, qc, nextPayload, delayMs });
-      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt + 1, delayMs });
+      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs });
       return { cached: false, storageKey: rejectedKey, retrying: true };
     }
     const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/${job.payload.specHash}.mp4`;
@@ -142,7 +142,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   } catch (error) {
     await settleFailedReservation(job.id, job.project_id, providerCompleted);
     const failure = classifyFailure(error);
-    const decision = retryDecision({ failure, attempt: job.attempt + 1, maxAttempts: job.max_attempts });
+    const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
     if (decision.pauseProject) await pauseProjectJobs(job.project_id, { code: failure, message: error instanceof Error ? error.message : String(error) });
     await query(
       "UPDATE jobs SET state=$2, last_error=$3, available_at=now()+($4::text || ' milliseconds')::interval WHERE id=$1",
@@ -150,7 +150,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     );
     if (!decision.pauseProject && !decision.retry) await query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify({ failure, message: error instanceof Error ? error.message : String(error), shotId: job.shot_id })]);
     if (decision.retry) {
-      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt + 1, delayMs: decision.delayMs });
+      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: decision.delayMs });
     }
     throw error;
   }
@@ -223,7 +223,7 @@ async function persistCompletedAsset(job: JobRow, storageKey: string, checksum: 
     );
     const asset = await client.query<{ id: string }>("SELECT id FROM generation_assets WHERE storage_key=$1", [storageKey]);
     await client.query("UPDATE timeline_clips SET asset_id=$2 WHERE shot_id=$1 AND track='video' AND enabled=true", [job.shot_id, asset.rows[0]?.id ?? null]);
-    await client.query("UPDATE shots SET state='completed', current_version=$2, retry_count=$3, last_error=NULL WHERE id=$1", [job.shot_id, version, job.attempt + 1]);
+    await client.query("UPDATE shots SET state='completed', current_version=$2, retry_count=$3, last_error=NULL WHERE id=$1", [job.shot_id, version, job.attempt]);
     await client.query("UPDATE jobs SET state='completed', completed_at=now(), result=$2,reserved_cost_usd=0 WHERE id=$1", [job.id, JSON.stringify({ storageKey, version })]);
     const count = await client.query<{ completed: number; total: number }>(
       "SELECT count(*) FILTER (WHERE state='completed')::int completed, count(*)::int total FROM shots WHERE project_id=$1",
@@ -303,18 +303,18 @@ async function persistQcRetry(job: JobRow, input: {
     await client.query(
       `INSERT INTO generation_assets (project_id,scene_id,shot_id,kind,storage_key,mime_type,byte_size,duration_seconds,checksum,metadata)
        VALUES ($1,$2,$3,'qc-rejected-video',$4,'video/mp4',$5,$6,$7,$8)`,
-      [job.project_id, job.scene_id, job.shot_id, input.storageKey, input.byteSize, job.payload.shot.durationSeconds, input.checksum, JSON.stringify({ qc: input.qc, retryAttempt: job.attempt + 1 })],
+      [job.project_id, job.scene_id, job.shot_id, input.storageKey, input.byteSize, job.payload.shot.durationSeconds, input.checksum, JSON.stringify({ qc: input.qc, retryAttempt: job.attempt })],
     );
     await client.query(
       "UPDATE jobs SET state='retrying',payload=$2,last_error=$3,available_at=now()+($4::text || ' milliseconds')::interval,reserved_cost_usd=0 WHERE id=$1",
       [job.id, JSON.stringify(input.nextPayload), JSON.stringify({ code: "QC_RETRY", report: input.qc }), input.delayMs],
     );
-    await client.query("UPDATE shots SET state='retrying',retry_count=$2,last_error=$3 WHERE id=$1", [job.shot_id, job.attempt + 1, JSON.stringify({ qc: input.qc })]);
+    await client.query("UPDATE shots SET state='retrying',retry_count=$2,last_error=$3 WHERE id=$1", [job.shot_id, job.attempt, JSON.stringify({ qc: input.qc })]);
     await client.query("UPDATE projects SET spent_usd=spent_usd+$2,reserved_usd=GREATEST(0,reserved_usd-$2),status='generating' WHERE id=$1", [job.project_id, input.cost]);
     await client.query(
       `INSERT INTO checkpoints (project_id,event_type,failed_shot_ids,pending_shot_ids,current_job_id,snapshot)
        VALUES ($1,'shot-qc-retry','{}'::text[],ARRAY[$2]::text[],$3,$4)`,
-      [job.project_id, job.shot_id, job.id, JSON.stringify({ shotId: job.shot_id, qc: input.qc, retryAttempt: job.attempt + 1, rejectedStorageKey: input.storageKey })],
+      [job.project_id, job.shot_id, job.id, JSON.stringify({ shotId: job.shot_id, qc: input.qc, retryAttempt: job.attempt, rejectedStorageKey: input.storageKey })],
     );
   });
 }

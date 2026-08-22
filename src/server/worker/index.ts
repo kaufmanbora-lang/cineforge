@@ -1,5 +1,5 @@
 import { Worker } from "bullmq";
-import { MOVIE_QUEUE, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverInterruptedJobs, redisConnection, requeueDatabaseJob } from "@/server/movie/queue";
+import { MOVIE_QUEUE, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob } from "@/server/movie/queue";
 import { processShot } from "./process-shot";
 import { processDialoguePatch } from "./process-dialogue";
 import { processAssembly } from "./process-assembly";
@@ -37,7 +37,7 @@ const worker = new Worker(
   { connection: redisConnection(), concurrency: workerConcurrency },
 );
 const reconciliationTimer = setInterval(() => {
-  void reconcileQueuedJobs().catch((error) => process.stderr.write(`Queue reconciliation failed: ${error instanceof Error ? error.message : String(error)}\n`));
+  void Promise.all([reconcileQueuedJobs(), recoverStaleJobs()]).catch((error) => process.stderr.write(`Queue reconciliation failed: ${error instanceof Error ? error.message : String(error)}\n`));
 }, 30_000);
 reconciliationTimer.unref();
 
