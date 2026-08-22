@@ -12,9 +12,10 @@ export function db(): Pool {
       // The Render starter database allows 100 connections but has only 256 MB
       // of memory.  A web instance and a worker with 20 clients each (doubled
       // again during zero-downtime deploys) can destabilize that small instance.
-      // Five clients per process are ample because generation is network-bound.
-      max: 5,
-      idleTimeoutMillis: 30_000,
+      // Two clients per process are ample because generation is network-bound,
+      // and keep blue/green deploy overlap below the memory limit as well.
+      max: 2,
+      idleTimeoutMillis: 5_000,
       connectionTimeoutMillis: 5_000,
       maxLifetimeSeconds: 300,
     });
