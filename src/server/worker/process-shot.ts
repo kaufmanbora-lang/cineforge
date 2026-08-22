@@ -14,6 +14,8 @@ import { extractFinalFrame, extractRepresentativeFrame } from "@/server/movie/ff
 import { evaluateShot, type ShotQcReport } from "@/server/providers/openai";
 import type { ReferenceImage } from "@/server/providers/video/types";
 
+type PersistedProviderOperation = ProviderOperation & { specHash?: string; startedAt?: string };
+
 interface JobRow {
   id: string;
   project_id: string;
@@ -30,7 +32,7 @@ interface JobRow {
   spent_usd: string;
   reserved_usd: string;
   reserved_cost_usd: string;
-  shot_last_operation: (ProviderOperation & { specHash?: string }) | null;
+  shot_last_operation: PersistedProviderOperation | null;
 }
 
 export async function processShot(databaseJobId: string): Promise<{ cached: boolean; storageKey: string; retrying?: boolean }> {
@@ -103,11 +105,16 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       const adapter = googleVideoAdapter(job.model_id);
       const resumable = resumableProviderOperation(job.shot_last_operation, job.payload.specHash);
       operation = resumable ?? await adapter.start(request, apiKey);
-      await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify({ ...operation, specHash: job.payload.specHash })]);
+      const providerStartedAt = resumable?.startedAt ?? new Date().toISOString();
+      await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify({ ...operation, specHash: job.payload.specHash, startedAt: providerStartedAt })]);
       while (operation.state === "pending") {
+        if (Date.now() - Date.parse(providerStartedAt) >= 30 * 60_000) {
+          throw Object.assign(new Error("Google video operation did not complete within 30 minutes."), { status: 408, code: "GOOGLE_TIMEOUT" });
+        }
         await new Promise((resolve) => setTimeout(resolve, 10_000));
+        await query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state='generating'", [job.id]).catch(() => undefined);
         operation = await adapter.poll(operation, apiKey);
-        await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify({ ...operation, specHash: job.payload.specHash })]);
+        await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify({ ...operation, specHash: job.payload.specHash, startedAt: providerStartedAt })]);
       }
     }
     if (operation.state === "failed" || !operation.output) {
@@ -190,9 +197,9 @@ export function providerDurationSeconds(modelId: string, resolution: Resolution,
 }
 
 export function resumableProviderOperation(
-  saved: (ProviderOperation & { specHash?: string }) | null,
+  saved: PersistedProviderOperation | null,
   specHash: string,
-): ProviderOperation | null {
+): PersistedProviderOperation | null {
   if (!saved || !/^(?:models\/[^/]+\/)?operations\//.test(saved.operationId)) return null;
   const sdkPollingFailure = saved.error?.message.includes("_fromAPIResponse") ?? false;
   if (saved.specHash !== specHash && !(!saved.specHash && sdkPollingFailure)) return null;
