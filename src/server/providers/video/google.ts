@@ -206,13 +206,19 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
   let inlineFinished = false;
   let base64Carry = "";
   let byteSize = 0;
+  const responseFields = new Set<string>();
+  const stringPrefixes = new Map<string, string>();
   const hash = createHash("sha256");
   const localFilePath = join(tmpdir(), `cineforge-veo-${randomUUID()}.mp4`);
   let output: ReturnType<typeof createWriteStream> | undefined;
 
   const inspectJson = (value: string) => {
     done ||= /"done"\s*:\s*true/.test(value);
-    const uriMatch = value.match(/"uri"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    for (const match of value.matchAll(/"([A-Za-z@][A-Za-z0-9_@.-]{0,99})"\s*:/g)) responseFields.add(match[1]);
+    for (const match of value.matchAll(/"([A-Za-z@][A-Za-z0-9_@.-]{0,99})"\s*:\s*"([^"\\]{0,48})/g)) {
+      if (!stringPrefixes.has(match[1])) stringPrefixes.set(match[1], match[2]);
+    }
+    const uriMatch = value.match(/"(?:uri|videoUri|video_uri|downloadUri|download_uri)"\s*:\s*"((?:\\.|[^"\\])*)"/);
     const mimeMatch = value.match(/"(?:mimeType|mime_type|encoding)"\s*:\s*"((?:\\.|[^"\\])*)"/);
     if (uriMatch) uri = JSON.parse(`"${uriMatch[1]}"`) as string;
     if (mimeMatch) mimeType = JSON.parse(`"${mimeMatch[1]}"`) as string;
@@ -257,10 +263,11 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
         // Gemini Developer API uses `encodedVideo`; the SDK maps that field to
         // `videoBytes`. Vertex responses use `bytesBase64Encoded`.
         const inlineMatch = /"(?:encodedVideo|videoBytes|bytesBase64Encoded)"\s*:\s*"/.exec(window);
-        const genericInlineMatch = inlineMatch ?? /"[A-Za-z][A-Za-z0-9_]{0,79}"\s*:\s*"(?=[A-Za-z0-9+/]{128})/.exec(window);
+        const genericInlineMatch = inlineMatch ?? /"[A-Za-z][A-Za-z0-9_]{0,79}"\s*:\s*"(?=(?:data:video(?:\\?\/)[^,]{0,80},)?[A-Za-z0-9+/_-]{128})/.exec(window);
         if (genericInlineMatch) {
           inspectJson(window.slice(0, genericInlineMatch.index));
           window = window.slice(genericInlineMatch.index + genericInlineMatch[0].length);
+          window = window.replace(/^data:video(?:\\?\/)[^,]{0,80},/, "");
           readingInlineVideo = true;
           output ??= createWriteStream(localFilePath, { flags: "wx" });
           continue;
@@ -274,7 +281,10 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
     if (readingInlineVideo) throw new Error("Google returned an incomplete inline video payload.");
     if (!done) return { done: false };
     if (uri) return { done: true, response: { generateVideoResponse: { generatedSamples: [{ video: { uri, mimeType } }] } } };
-    if (!inlineFinished || !output || byteSize <= 0) throw new Error("Google completed the operation without downloadable video media.");
+    if (!inlineFinished || !output || byteSize <= 0) {
+      const prefixes = [...stringPrefixes].slice(0, 16).map(([key, value]) => `${key}=${value.slice(0, 24)}`).join(", ");
+      throw new Error(`Google completed the operation without downloadable video media. JSON fields: ${[...responseFields].slice(0, 48).join(", ") || "none"}. String prefixes: ${prefixes || "none"}.`);
+    }
     output.end();
     await once(output, "finish");
     return {

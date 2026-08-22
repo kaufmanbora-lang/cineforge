@@ -98,6 +98,22 @@ describe("Google Omni response parsing", () => {
     await rm(video.localFilePath!, { force: true });
   });
 
+  it("streams URL-safe inline video wrapped in a data URL", async () => {
+    const expected = Buffer.alloc(256, 251);
+    const encoded = expected.toString("base64url");
+    const payload = JSON.stringify({ done: true, response: { generatedVideos: [{ video: {
+      futureVideoPayload: `data:video/mp4;base64,${encoded}`,
+      mimeType: "video/mp4",
+    } }] } });
+    const response = new Response(payload, { headers: { "content-length": String(9 * 1024 * 1024) } });
+    const parsed = await readVeoOperationResponse(response) as {
+      response: { generateVideoResponse: { generatedSamples: Array<{ video: { localFilePath: string } }> } };
+    };
+    const filePath = parsed.response.generateVideoResponse.generatedSamples[0].video.localFilePath;
+    expect(await readFile(filePath)).toEqual(expected);
+    await rm(filePath, { force: true });
+  });
+
   it("resumes a persisted SDK polling failure without starting a second paid generation", () => {
     const saved = {
       provider: "google" as const,
