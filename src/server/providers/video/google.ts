@@ -184,7 +184,7 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
           aspect_ratio: request.aspectRatio,
           duration: `${request.durationSeconds}s`,
           resolution: request.resolution === "preview" ? "720p" : request.resolution,
-          delivery: "uri",
+          ...(request.fastMode ? {} : { delivery: "uri" }),
         },
         generation_config: {
           video_config: {
