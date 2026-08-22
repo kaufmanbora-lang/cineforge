@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Aperture, Check, Clapperboard, Expand, Eye, Film, Gauge,
   ImageIcon, Lightbulb, ListVideo, Lock, MessageSquareText, Music2, Play,
-  Sparkles, Square, Subtitles, Volume2, Waves, X, Zap, ZoomIn, ZoomOut,
+  Mic, Sparkles, Square, Subtitles, Volume2, Waves, X, Zap, ZoomIn, ZoomOut,
 } from "lucide-react";
 import { estimateGeneration, formatDuration } from "@/domain/estimation";
 import type { MoviePlan, ProjectRecord, Scene } from "@/domain/movie";
@@ -39,7 +39,10 @@ export function StudioWorkspace() {
   const [notice, setNotice] = useState("Опишите идею фильма, чтобы начать.");
   const [accountModelIds, setAccountModelIds] = useState<Set<string> | null>(null);
   const [timelineZoom, setTimelineZoom] = useState(100);
+  const [voiceState, setVoiceState] = useState<"recording" | "transcribing" | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const microphoneStreamRef = useRef<MediaStream | null>(null);
 
   const model = GOOGLE_VIDEO_MODELS[modelId];
   const estimate = useMemo(() => estimateGeneration({ durationSeconds: duration, modelId, resolution }), [duration, modelId, resolution]);
@@ -66,9 +69,15 @@ export function StudioWorkspace() {
       setDraft(payload.project.renderTier !== "final");
       setSelectedSceneId((current) => current && payload.plan?.scenes.some((scene: Scene) => scene.id === current) ? current : payload.plan?.scenes?.[0]?.id ?? "");
       if (previewResponse.ok) setPreview(await previewResponse.json());
-      if (!quiet) setNotice(payload.project.lastError?.message
-        ? errorMessageRu(payload.project.lastError.message, "Проект остановлен с ошибкой. Можно безопасно повторить действие.")
-        : payload.plan ? `Из памяти проекта загружено сцен: ${payload.plan.scenes.length}.` : "У проекта ещё нет сценария. Можно повторить планирование без создания копии.");
+      if (payload.project.lastError?.message) {
+        setNotice(errorMessageRu(payload.project.lastError.message, "Проект остановлен с ошибкой. Можно безопасно повторить действие."));
+      } else if (payload.project.status === "planning") {
+        setNotice("Проект сохранён. ИИ-сценарист создаёт сценарий и память в фоновой очереди — окно можно закрыть.");
+      } else if (["queued","generating","validating","assembling"].includes(payload.project.status)) {
+        setNotice(`Производство работает: готово ${payload.project.completedShots} из ${payload.project.totalShots} кадров.`);
+      } else if (!quiet) {
+        setNotice(payload.plan ? `Из памяти проекта загружено сцен: ${payload.plan.scenes.length}.` : "У проекта ещё нет сценария. Можно повторить планирование без создания копии.");
+      }
     } catch (error) { if (!quiet) setNotice(errorMessageRu(error, "Не удалось загрузить проект.")); }
   }, []);
 
@@ -114,14 +123,74 @@ export function StudioWorkspace() {
     setBudgetOpen(true);
   }
 
+  async function toggleVoiceInput() {
+    if (voiceState === "recording" && recorderRef.current) {
+      setNotice("Распознаю запись и добавляю текст…");
+      setVoiceState("transcribing");
+      recorderRef.current.stop();
+      return;
+    }
+    if (voiceState || plan) return;
+    try {
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+        throw new Error("На этом устройстве запись с микрофона не поддерживается.");
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
+      microphoneStreamRef.current = stream;
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+      const recorder = new MediaRecorder(stream, { mimeType });
+      const chunks: BlobPart[] = [];
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+      recorder.onstop = async () => {
+        microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
+        microphoneStreamRef.current = null;
+        try {
+          const audio = new Blob(chunks, { type: mimeType });
+          if (audio.size < 500) throw new Error("Запись получилась пустой. Нажмите микрофон и произнесите описание фильма.");
+          const form = new FormData();
+          form.append("audio", audio, "movie-description.webm");
+          const response = await fetch("/api/screenwriter/chat?transcribe=1", {
+            method: "POST",
+            body: form,
+            signal: AbortSignal.timeout(90_000),
+          });
+          const payload = await response.json();
+          if (!response.ok) throw new Error(errorMessageRu(payload.error, "Не удалось распознать голос."));
+          const transcript = String(payload.text ?? "").trim();
+          if (!transcript) throw new Error("Речь не распознана. Попробуйте говорить ближе к микрофону.");
+          setPrompt((current) => `${current.trim()}${current.trim() ? " " : ""}${transcript}`);
+          setNotice("Голос распознан и добавлен в описание фильма.");
+        } catch (error) {
+          setNotice(errorMessageRu(error, "Не удалось распознать голос."));
+        } finally {
+          recorderRef.current = null;
+          setVoiceState(null);
+        }
+      };
+      recorder.start(250);
+      setVoiceState("recording");
+      setNotice("Запись идёт. Говорите, затем ещё раз нажмите красный микрофон.");
+    } catch (error) {
+      microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
+      microphoneStreamRef.current = null;
+      recorderRef.current = null;
+      setVoiceState(null);
+      setNotice(errorMessageRu(error, "Не удалось включить микрофон. Разрешите доступ к нему и повторите."));
+    }
+  }
+
   async function startFullProduction() {
     if (prompt.trim().length < 10) { setNotice("Описание фильма должно содержать не менее 10 символов."); return; }
     if (accountModelIds && !accountModelIds.has(modelId)) { setNotice("Выбранная видеомодель Google недоступна этому API-ключу."); return; }
-    setBusy("generating"); setNotice("Создание сценария, памяти проекта и очереди генерации…");
+    setBudgetOpen(false); setBusy("generating"); setNotice("Сохраняю проект и ставлю полный цикл в фоновую очередь…");
     let activeProjectId = projectId && detail ? projectId : "";
     try {
       if (!activeProjectId) {
-        const created = await fetch("/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: "Фильм без названия", prompt, durationSeconds: duration, modelId, resolution, aspectRatio, mode, renderTier: draft ? "draft" : "final", maximumBudgetUsd: budget }) });
+        const created = await fetch("/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: "Фильм без названия", prompt, durationSeconds: duration, modelId, resolution, aspectRatio, mode, renderTier: draft ? "draft" : "final", maximumBudgetUsd: budget }), signal: AbortSignal.timeout(30_000) });
         const createdPayload = await created.json(); if (!created.ok) throw new Error(errorMessageRu(createdPayload.error, "Не удалось создать проект."));
         activeProjectId = createdPayload.projectId as string; setProjectId(activeProjectId); localStorage.setItem("cineforge.projectId", activeProjectId);
       }
@@ -129,10 +198,12 @@ export function StudioWorkspace() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ startGeneration: true, confirmed: true, maximumBudgetUsd: budget }),
+        signal: AbortSignal.timeout(30_000),
       });
       const payload = await response.json(); if (!response.ok) throw new Error(errorMessageRu(payload.error, "Не удалось запустить полный цикл создания фильма."));
-      setBudgetOpen(false);
-      setNotice(`Производство запущено: ${payload.shots} кадров. Быстрый черновик появится в предпросмотре автоматически.`);
+      setNotice(payload.accepted
+        ? `Проект сохранён. В фоне создаётся сценарий; затем автоматически запустятся ${payload.shots} кадров.`
+        : `Производство запущено: ${payload.shots} кадров. Быстрый черновик появится в предпросмотре автоматически.`);
       await loadProject(activeProjectId, true);
     } catch (error) { if (activeProjectId) await loadProject(activeProjectId, true); setNotice(errorMessageRu(error, "Запуск завершился ошибкой. Проект сохранён; повторная попытка продолжит его без копии.")); }
     finally { setBusy(null); }
@@ -144,14 +215,14 @@ export function StudioWorkspace() {
 
   const tracks = buildTracks(scenes);
   const costOverBudget = estimate.estimatedTotalUsd > budget;
-  const productionActive = Boolean(detail && ["queued","generating","validating","assembling"].includes(detail.project.status));
+  const productionActive = Boolean(detail && ["planning","queued","generating","validating","assembling"].includes(detail.project.status));
   const productionComplete = detail?.project.status === "completed";
 
   return <div className="studio-grid">
     <section className="brief-panel" aria-label="Описание фильма">
       <div className="section-title"><h1>{plan ? detail?.project.title : "Опишите ваш фильм"}</h1>{plan ? <Button onClick={startNewProject} variant="ghost">Новый проект</Button> : null}</div>
       {plan ? <div className="secure-note"><StatusDot tone="green"/>Структурированный план фильма сохранён. Точечно изменить сценарий можно через ИИ-сценариста.</div> : <Segmented value={mode} onChange={setMode} options={[{ value: "quick", label: "Быстро" }, { value: "advanced", label: "Расширенно" }]}/>}
-      <div className="prompt-box"><textarea aria-label="Описание фильма" disabled={Boolean(plan)} maxLength={20_000} onChange={(event) => setPrompt(event.target.value)} placeholder="Опишите историю, персонажей, место действия и желаемое настроение…" value={prompt}/><span>{prompt.length} / 20 000</span></div>
+      <div className="prompt-box"><textarea aria-label="Описание фильма" disabled={Boolean(plan)} maxLength={20_000} onChange={(event) => setPrompt(event.target.value)} placeholder="Опишите историю, персонажей, место действия и желаемое настроение…" value={prompt}/><button aria-label={voiceState === "recording" ? "Остановить запись голоса" : "Продиктовать описание фильма"} className={`voice-input ${voiceState ?? ""}`} disabled={Boolean(plan) || voiceState === "transcribing"} onClick={() => void toggleVoiceInput()} title={voiceState === "recording" ? "Остановить и распознать" : "Надиктовать описание"} type="button"><Mic size={16}/></button><span>{voiceState === "recording" ? "Идёт запись…" : voiceState === "transcribing" ? "Распознаю…" : `${prompt.length} / 20 000`}</span></div>
       <div className="control-stack">
         <label><span><Aperture size={15}/>Продолжительность</span><select disabled={Boolean(plan)} onChange={(event) => { if (event.target.value === "custom") setCustomDuration(true); else { setCustomDuration(false); setDuration(Number(event.target.value)); } }} value={customDuration ? "custom" : duration}>{[10,30,60,180,300,600,900,1200,1800,2700,3600].map((seconds) => <option key={seconds} value={seconds}>{formatDuration(seconds)}</option>)}<option value="custom">Своя продолжительность…</option></select></label>
         {customDuration ? <label><span>Секунды</span><input aria-label="Продолжительность в секундах" max="3600" min="1" onChange={(event) => setDuration(Math.max(1, Math.min(3600, Number(event.target.value) || 1)))} type="number" value={duration}/></label> : null}
@@ -160,7 +231,8 @@ export function StudioWorkspace() {
         <label className="toggle-row"><span><Zap size={15}/>Быстрый черновик</span><button aria-pressed={draft} className={draft ? "toggle on" : "toggle"} disabled={Boolean(plan)} onClick={() => setDraft((value) => !value)} type="button"><i/></button></label>
       </div>
       <div className="estimate-lines"><div><span>Примерно кадров</span><strong>{estimate.shots}</strong></div><div><span>Генерация видео</span><strong>${estimate.videoUsd.toFixed(2)}</strong></div><div><span>Звук</span><strong>${estimate.audioUsd.toFixed(2)}</strong></div><div><span>Резерв на повторы</span><strong>${estimate.retriesReserveUsd.toFixed(2)}</strong></div><div className="budget-line"><span>Максимальный бюджет</span><label>$<input aria-label="Максимальный бюджет генерации" min="0" onChange={(event) => setBudget(Math.max(0, Number(event.target.value) || 0))} type="number" value={budget}/></label></div></div>
-      <Button className="plan-button" disabled={prompt.trim().length < 10 || busy !== null || productionActive || productionComplete} loading={busy !== null} onClick={openProductionConfirmation} variant="primary">{productionComplete ? "Фильм готов" : productionActive ? "Производство запущено" : plan ? "Продолжить и создать фильм" : "Создать фильм"}<Clapperboard size={16}/></Button>
+      <Button className="plan-button" disabled={prompt.trim().length < 10 || busy !== null || productionActive || productionComplete} loading={busy !== null} onClick={openProductionConfirmation} variant="primary">{productionComplete ? "Фильм готов" : detail?.project.status === "planning" ? "Сценарий создаётся в фоне" : productionActive ? "Производство запущено" : detail?.project.status === "paused" ? "Продолжить с остановленного кадра" : detail?.project.status === "failed" ? "Повторить без потери готовых кадров" : plan ? "Продолжить и создать фильм" : "Создать фильм"}<Clapperboard size={16}/></Button>
+      <div className={`production-notice ${detail?.project.status === "paused" || detail?.project.status === "failed" ? "warning" : productionActive ? "active" : ""}`} role="status"><StatusDot tone={detail?.project.status === "failed" ? "red" : detail?.project.status === "paused" ? "amber" : productionActive ? "teal" : "green"}/><span>{notice}</span></div>
       <p className="approx-note">Одно подтверждение запускает весь цикл. Быстрый черновик использует ускоренную модель и публикует кадры сразу после ответа Google.</p>
     </section>
 

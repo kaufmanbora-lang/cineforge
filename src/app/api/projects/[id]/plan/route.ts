@@ -8,7 +8,7 @@ import { adaptMoviePlanPrompts } from "@/server/providers/video/prompt-adapters"
 import { estimateGeneration } from "@/domain/estimation";
 import type { Resolution } from "@/domain/video-models";
 import { planGenerationJobs } from "@/server/movie/job-planner";
-import { enqueueJobs, resumeProjectJobs } from "@/server/movie/queue";
+import { enqueueJobs, enqueueProjectPlanningJob, resumeProjectJobs } from "@/server/movie/queue";
 
 export const runtime = "nodejs";
 export const maxDuration = 800;
@@ -41,6 +41,24 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
 
     let plan = await latestMoviePlan(id);
+    if (!plan && body.startGeneration) {
+      stage = "queueing-plan";
+      await query(
+        "UPDATE projects SET status='planning',maximum_budget_usd=$2,estimated_cost_usd=$3,last_error=NULL,updated_at=now() WHERE id=$1",
+        [id, maximumBudget, estimate.estimatedTotalUsd],
+      );
+      const planningJobId = await enqueueProjectPlanningJob({ projectId: id, maximumBudgetUsd: maximumBudget });
+      return NextResponse.json({
+        accepted: true,
+        status: "planning",
+        planningJobId,
+        scenes: 0,
+        shots: estimate.shots,
+        queued: 0,
+        estimate,
+        projectId: id,
+      }, { status: 202 });
+    }
     if (!plan) {
       await query("UPDATE projects SET status='planning',last_error=NULL,updated_at=now() WHERE id=$1", [id]);
       const rawPlan = await generateStructuredMoviePlan({ projectId: id, idea: rows[0].prompt, durationSeconds: rows[0].duration_seconds });

@@ -3,7 +3,7 @@ import { apiError } from "@/server/http";
 import { query } from "@/server/db";
 import { env } from "@/server/env";
 import { buildProjectContext } from "@/server/movie/context-builder";
-import { createScreenwriterStream, generateStructuredMoviePlan } from "@/server/providers/openai";
+import { createScreenwriterStream, generateStructuredMoviePlan, transcribeMovieDescription } from "@/server/providers/openai";
 import { assertRateLimit } from "@/server/rate-limit";
 import { adaptMoviePlanPrompts } from "@/server/providers/video/prompt-adapters";
 import { latestMoviePlan, persistMoviePlan } from "@/server/movie/repository";
@@ -33,6 +33,16 @@ const PrepareMovieAction = z.object({
 
 export async function POST(request: Request) {
   try {
+    if (new URL(request.url).searchParams.get("transcribe") === "1") {
+      assertRateLimit(request, "voice transcription", 20, 60_000);
+      const form = await request.formData();
+      const audio = form.get("audio");
+      if (!(audio instanceof File) || !audio.size) return Response.json({ error: "Запись с микрофона не получена." }, { status: 400 });
+      if (audio.size > 20_000_000) return Response.json({ error: "Запись слишком большая. Максимальный размер — 20 МБ." }, { status: 413 });
+      if (!/^(audio|video)\//.test(audio.type)) return Response.json({ error: "Неподдерживаемый формат записи." }, { status: 415 });
+      const text = await transcribeMovieDescription(audio);
+      return Response.json({ text });
+    }
     assertRateLimit(request, "screenwriter", 30, 60_000);
     const body = Body.parse(await request.json());
     let conversationId = body.conversationId;

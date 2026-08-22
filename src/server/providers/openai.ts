@@ -40,6 +40,18 @@ export async function testOpenAIConnection(): Promise<{ connected: true; model: 
   return { connected: true, model: env().OPENAI_SCREENWRITER_MODEL };
 }
 
+export async function transcribeMovieDescription(file: File): Promise<string> {
+  const client = await openAIClient();
+  const result = await client.audio.transcriptions.create({
+    file,
+    model: "gpt-4o-transcribe",
+    language: "ru",
+    response_format: "json",
+    prompt: "Точное описание идеи фильма на русском языке. Сохраняй имена, жанры, длительность, реплики и кинематографические термины.",
+  });
+  return result.text.trim();
+}
+
 export interface ProjectContextBundle {
   projectId?: string;
   durationSeconds: number;

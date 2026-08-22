@@ -340,7 +340,18 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     app.setName(APP_NAME);
     app.setAppUserModelId("com.cineforge.studio");
-    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+      const trustedWindow = Boolean(mainWindow && !mainWindow.isDestroyed() && webContents === mainWindow.webContents);
+      const trustedOrigin = Boolean(localOrigin && String(details.requestingUrl ?? "").startsWith(localOrigin));
+      const audioOnly = !details.mediaTypes?.length || (details.mediaTypes.includes("audio") && !details.mediaTypes.includes("video"));
+      callback(Boolean(trustedWindow && trustedOrigin && permission === "media" && audioOnly));
+    });
+    session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) => {
+      const trustedWindow = Boolean(mainWindow && !mainWindow.isDestroyed() && webContents === mainWindow.webContents);
+      const trustedOrigin = Boolean(localOrigin && String(requestingOrigin ?? "").startsWith(localOrigin));
+      const audioOnly = !details.mediaType || details.mediaType === "audio";
+      return Boolean(trustedWindow && trustedOrigin && permission === "media" && audioOnly);
+    });
     session.defaultSession.on("will-download", (_event, item, webContents) => {
       item.pause();
       const parent = BrowserWindow.fromWebContents(webContents) ?? mainWindow;

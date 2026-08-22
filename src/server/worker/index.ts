@@ -8,6 +8,11 @@ import { query } from "@/server/db";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
 import { latestMoviePlan } from "@/server/movie/repository";
 import { planGenerationJobs } from "@/server/movie/job-planner";
+import { generateStructuredMoviePlan } from "@/server/providers/openai";
+import { adaptMoviePlanPrompts } from "@/server/providers/video/prompt-adapters";
+import { persistMoviePlan } from "@/server/movie/repository";
+import { estimateGeneration } from "@/domain/estimation";
+import type { Resolution } from "@/domain/video-models";
 
 await recoverInterruptedJobs();
 await recoverActiveProjects();
@@ -19,8 +24,9 @@ const worker = new Worker(
   MOVIE_QUEUE,
   async (job) => {
     const databaseJobId = String(job.data.databaseJobId);
-    if (job.name === "dialogue-patch" || job.name === "assemble-movie") {
+    if (job.name === "plan-project" || job.name === "dialogue-patch" || job.name === "assemble-movie") {
       try {
+        if (job.name === "plan-project") return await processProjectPlan(databaseJobId);
         return job.name === "dialogue-patch" ? await processDialoguePatch(databaseJobId) : await processAssembly(databaseJobId);
       } catch (error) {
         await handleBackgroundFailure(databaseJobId, job.name, error);
@@ -49,6 +55,56 @@ async function recoverActiveProjects() {
     const plan = await latestMoviePlan(project.id);
     if (!plan) continue;
     await enqueueJobs(planGenerationJobs(project.id, plan.scenes, { fastDraft: project.render_tier === "draft" }));
+  }
+}
+
+async function processProjectPlan(databaseJobId: string) {
+  const rows = await query<{
+    id: string; project_id: string; payload: { maximumBudgetUsd?: number };
+    prompt: string; duration_seconds: number; model_id: string; resolution: Resolution;
+    render_tier: "draft" | "final"; maximum_budget_usd: string;
+  }>(
+    `WITH claimed AS (
+       UPDATE jobs SET state='generating',started_at=now(),attempt=attempt+1,updated_at=now()
+       WHERE id=$1 AND type='plan-project' AND state IN ('queued','retrying') AND available_at<=now()
+       RETURNING *
+     )
+     SELECT claimed.*,p.prompt,p.duration_seconds,p.model_id,p.resolution,p.render_tier,p.maximum_budget_usd
+     FROM claimed JOIN projects p ON p.id=claimed.project_id`,
+    [databaseJobId],
+  );
+  const job = rows[0];
+  if (!job) return { planned: false, queued: 0 };
+  const heartbeat = setInterval(() => {
+    void query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state='generating'", [job.id]).catch(() => undefined);
+  }, 30_000);
+  heartbeat.unref();
+  try {
+    const maximumBudget = Number(job.payload.maximumBudgetUsd ?? job.maximum_budget_usd);
+    const estimate = estimateGeneration({ durationSeconds: job.duration_seconds, modelId: job.model_id, resolution: job.resolution });
+    if (estimate.estimatedTotalUsd > maximumBudget) {
+      throw Object.assign(new Error("Расчётная стоимость генерации превышает максимальный бюджет проекта."), { status: 409, code: "BUDGET_REACHED" });
+    }
+    await query("UPDATE projects SET status='planning',last_error=NULL,updated_at=now() WHERE id=$1", [job.project_id]);
+    let plan = await latestMoviePlan(job.project_id);
+    if (!plan) {
+      const rawPlan = await generateStructuredMoviePlan({ projectId: job.project_id, idea: job.prompt, durationSeconds: job.duration_seconds });
+      await persistMoviePlan(adaptMoviePlanPrompts(rawPlan, job.model_id));
+      plan = await latestMoviePlan(job.project_id);
+      if (!plan) throw new Error("Сохранённый план фильма не найден после записи.");
+    }
+    await query(
+      "UPDATE projects SET title=$2,status='queued',maximum_budget_usd=$3,estimated_cost_usd=$4,last_error=NULL,updated_at=now() WHERE id=$1",
+      [job.project_id, plan.summary.title, maximumBudget, estimate.estimatedTotalUsd],
+    );
+    const queued = await enqueueJobs(planGenerationJobs(job.project_id, plan.scenes, { fastDraft: job.render_tier === "draft" }));
+    await query("UPDATE jobs SET state='completed',result=$2,completed_at=now(),last_error=NULL WHERE id=$1", [
+      job.id,
+      JSON.stringify({ scenes: plan.scenes.length, shots: plan.scenes.reduce((sum, scene) => sum + scene.shots.length, 0), queued }),
+    ]);
+    return { planned: true, queued };
+  } finally {
+    clearInterval(heartbeat);
   }
 }
 

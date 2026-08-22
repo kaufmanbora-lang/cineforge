@@ -32,6 +32,31 @@ export function movieQueue(): Queue {
   return queue;
 }
 
+export async function enqueueProjectPlanningJob(input: { projectId: string; maximumBudgetUsd: number }): Promise<string> {
+  const idempotencyKey = `plan-project:${input.projectId}`;
+  const rows = await query<{ id: string; state: string; attempt: number }>(
+    `INSERT INTO jobs (project_id,type,state,idempotency_key,priority,payload,max_attempts)
+     VALUES ($1,'plan-project','queued',$2,20000,$3,3)
+     ON CONFLICT (idempotency_key) DO UPDATE SET
+       payload=EXCLUDED.payload,
+       state=CASE WHEN jobs.state IN ('failed','paused','cancelled') THEN 'queued'::job_state ELSE jobs.state END,
+       attempt=CASE WHEN jobs.state IN ('failed','paused','cancelled') THEN 0 ELSE jobs.attempt END,
+       last_error=CASE WHEN jobs.state IN ('failed','paused','cancelled') THEN NULL ELSE jobs.last_error END,
+       available_at=now()
+     RETURNING id,state,attempt`,
+    [input.projectId, idempotencyKey, JSON.stringify({ maximumBudgetUsd: input.maximumBudgetUsd })],
+  );
+  const row = rows[0];
+  if (row.state === "queued") {
+    const runIdentity = `${idempotencyKey}:attempt:${row.attempt}`;
+    await movieQueue().add("plan-project", { databaseJobId: row.id }, {
+      jobId: createHash("sha256").update(runIdentity).digest("hex"),
+      priority: 1,
+    });
+  }
+  return row.id;
+}
+
 export async function enqueueJobs(jobs: PlannedJob[]): Promise<number> {
   let added = 0;
   const settingRows = await query<{ settings: { automaticRetries?: number } }>("SELECT settings FROM workspace_settings WHERE workspace_id=$1", [env().DEFAULT_WORKSPACE_ID]).catch(() => []);
@@ -108,7 +133,7 @@ export async function reconcileQueuedJobs(): Promise<number> {
     `SELECT j.id,j.type,j.idempotency_key,j.priority FROM jobs j
      JOIN projects p ON p.id=j.project_id
      WHERE j.state='queued' AND j.available_at<=now()
-       AND p.status IN ('queued','generating','validating','assembling')`,
+       AND p.status IN ('planning','queued','generating','validating','assembling')`,
   );
   const bucket = Math.floor(Date.now() / 30_000);
   for (const row of rows) {
@@ -129,7 +154,7 @@ export async function recoverStaleJobs(): Promise<number> {
      FROM projects p
      WHERE j.project_id=p.id AND j.state IN ('generating','validating','retrying')
        AND j.updated_at < now() - interval '12 minutes'
-       AND p.status IN ('queued','generating','validating','assembling')
+       AND p.status IN ('planning','queued','generating','validating','assembling')
      RETURNING j.id,j.type,j.idempotency_key,j.priority`,
   );
   for (const row of rows) {
