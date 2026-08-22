@@ -21,8 +21,6 @@ interface JobRow {
   shot_id: string;
   attempt: number;
   max_attempts: number;
-  state: string;
-  available_at: string;
   payload: { shot: { durationSeconds: number; generationPrompt?: { prompt: string; negativeDirectives: string[]; seed: number | null }; continuity: { requiredReferences: string[] }; audioContext?: { dialogue: Array<{ id: string; characterId: string; text: string; delivery: string; startSeconds: number; durationSeconds: number }> } }; specHash: string };
   model_id: string;
   resolution: Resolution;
@@ -36,18 +34,20 @@ interface JobRow {
 
 export async function processShot(databaseJobId: string): Promise<{ cached: boolean; storageKey: string; retrying?: boolean }> {
   const rows = await query<JobRow>(
-    `SELECT j.*, p.model_id, p.resolution, p.aspect_ratio, p.render_tier, p.maximum_budget_usd, p.spent_usd, p.reserved_usd
-     FROM jobs j JOIN projects p ON p.id=j.project_id WHERE j.id=$1`,
+    `WITH claimed AS (
+       UPDATE jobs SET state='generating',started_at=COALESCE(started_at,now()),attempt=attempt+1,updated_at=now()
+       WHERE id=$1 AND state IN ('queued','retrying') AND available_at<=now()
+       RETURNING *
+     )
+     SELECT claimed.*,p.model_id,p.resolution,p.aspect_ratio,p.render_tier,p.maximum_budget_usd,p.spent_usd,p.reserved_usd
+     FROM claimed JOIN projects p ON p.id=claimed.project_id`,
     [databaseJobId],
   );
   const job = rows[0];
-  if (!job) throw new Error("Generation job not found.");
-  if (["completed", "paused", "failed", "cancelled", "planned", "generating", "validating"].includes(job.state)) {
-    return { cached: false, storageKey: "", retrying: ["planned", "generating", "validating"].includes(job.state) };
-  }
-  if (job.state === "retrying" && new Date(job.available_at).getTime() > Date.now()) {
-    return { cached: false, storageKey: "", retrying: true };
-  }
+  // Another worker/reconciler may already own this database job. Treat that as
+  // an idempotent no-op; only the atomic claimant may call the paid provider.
+  if (!job) return { cached: false, storageKey: "", retrying: true };
+  await query("UPDATE projects SET status='generating',updated_at=now() WHERE id=$1 AND status NOT IN ('completed','cancelled')", [job.project_id]);
   const cached = await findCachedShot(job.project_id, job.shot_id, job.payload.specHash);
   if (cached) {
     await markCompleted(job, cached.storageKey, 0, true);
@@ -66,8 +66,6 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   try {
     const apiKey = await getProviderKey("google");
     if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
-    await query("UPDATE jobs SET state='generating', started_at=COALESCE(started_at,now()), attempt=attempt+1 WHERE id=$1", [job.id]);
-    await query("UPDATE projects SET status='generating',updated_at=now() WHERE id=$1 AND status NOT IN ('completed','cancelled')", [job.project_id]);
     const prompt = job.payload.shot.generationPrompt;
     if (!prompt) throw new Error("Shot has no generation prompt.");
     const request: VideoGenerationRequest = {

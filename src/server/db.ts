@@ -7,12 +7,16 @@ declare global {
 
 export function db(): Pool {
   if (!globalThis.__cineforgePool) {
-    globalThis.__cineforgePool = new Pool({
+    const pool = new Pool({
       connectionString: env().DATABASE_URL,
       max: env().NODE_ENV === "production" ? 20 : 5,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 5_000,
     });
+    // pg emits idle-client failures on the Pool itself. Without a listener Node
+    // treats them as uncaught events and terminates the background worker.
+    pool.on("error", (error) => process.stderr.write(`PostgreSQL pool connection lost: ${error.message}\n`));
+    globalThis.__cineforgePool = pool;
   }
   return globalThis.__cineforgePool;
 }
