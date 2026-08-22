@@ -81,7 +81,7 @@ export function StudioWorkspace() {
       const existingId = queryId ?? prepared?.projectId ?? null;
       if (prepared && GOOGLE_VIDEO_MODELS[prepared.modelId]) {
         setDuration(prepared.durationSeconds); setModelId(prepared.modelId); setResolution(normalizeResolution(prepared.modelId, prepared.resolution)); setBudgetOpen(Boolean(existingId));
-        setNotice(`AI-сценарист подготовил кадров: ${prepared.shots}.`);
+        setNotice(`ИИ-сценарист подготовил кадров: ${prepared.shots}.`);
       }
       if (existingId) await loadProject(existingId);
       try {
