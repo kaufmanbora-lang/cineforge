@@ -3,7 +3,7 @@ import { isRetryableDatabaseConnectionError, query, transaction } from "@/server
 import { getProviderKey } from "@/server/provider-secrets";
 import { googleVideoAdapter } from "@/server/providers/video/google";
 import type { ProviderOperation, VideoGenerationRequest } from "@/server/providers/video/types";
-import { getObjectIfExists, putObject, signedObjectUrl } from "@/server/storage";
+import { getObjectIfExists, putObject, putRemoteObject, signedObjectUrl } from "@/server/storage";
 import { findCachedShot } from "@/server/movie/repository";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
 import { enqueueAutomaticAssemblyIfReady, enqueueDialoguePatch, enqueueReadyProjectJobs, pauseProjectJobs, requeueDatabaseJob } from "@/server/movie/queue";
@@ -81,6 +81,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     const prompt = job.payload.shot.generationPrompt;
     if (!prompt) throw new Error("Shot has no generation prompt.");
     let operation: ProviderOperation;
+    let providerApiKey: string | undefined;
     if (staged) {
       operation = {
         provider: "google" as const,
@@ -93,6 +94,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     } else {
       const apiKey = await getProviderKey("google");
       if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
+      providerApiKey = apiKey;
       const request: VideoGenerationRequest = {
         projectId: job.project_id,
         sceneId: job.scene_id,
@@ -132,16 +134,27 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     // the exact interrupted reservation recorded on the job. Account only that
     // outstanding amount; never add projected cost a second time.
     const cost = generationAccountingCost(projectedCost, Number(job.reserved_cost_usd), Boolean(staged));
-    const checksum = createHash("sha256").update(operation.output.bytes).digest("hex");
+    const inMemoryBytes = operation.output.bytes;
+    const stored = inMemoryBytes
+      ? {
+          checksum: createHash("sha256").update(inMemoryBytes).digest("hex"),
+          byteSize: inMemoryBytes.byteLength,
+          contentType: operation.output.mimeType,
+        }
+      : operation.output.providerUri && providerApiKey
+        ? await putRemoteObject(storageKey, operation.output.providerUri, { "x-goog-api-key": providerApiKey })
+        : null;
+    if (!stored) throw new Error("Completed video output has neither bytes nor a downloadable URI.");
+    const checksum = stored.checksum;
     // Object storage is independent of PostgreSQL. Stage the paid provider
     // result first so a database restart can never force another video call.
-    await putObject(storageKey, operation.output.bytes, operation.output.mimeType);
+    if (inMemoryBytes) await putObject(storageKey, inMemoryBytes, operation.output.mimeType);
     await query("UPDATE jobs SET state='validating' WHERE id=$1", [job.id]).catch(() => undefined);
     // Fast Draft is the interactive path: publish the provider result immediately.
     // Expensive vision QC and consistent-voice replacement remain enabled for Final.
     const qc = job.render_tier === "draft"
       ? null
-      : await runShotQc(job, operation.output.bytes, operation.output.mimeType, operation.operationId);
+      : inMemoryBytes ? await runShotQc(job, inMemoryBytes, operation.output.mimeType, operation.operationId) : null;
     const engineSettings = await movieEngineSettings(job.project_id);
     if (qc && qc.overall < engineSettings.qcRetryThreshold && job.attempt < job.max_attempts) {
       const retryPrompt = `${prompt.prompt}\nQC CORRECTION FOR THIS SHOT ONLY: ${qc.retryInstruction ?? qc.issues.join("; ")}. Preserve all unaffected details and locked values.`;
@@ -151,16 +164,16 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       };
       nextPayload.specHash = contentHash({ shot: nextPayload.shot, qcCorrection: qc.retryInstruction ?? qc.issues });
       const rejectedKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/qc-rejected-${job.attempt}-${checksum.slice(0, 12)}.mp4`;
-      await putObject(rejectedKey, operation.output.bytes, operation.output.mimeType);
+      await putObject(rejectedKey, inMemoryBytes!, operation.output.mimeType);
       const delayMs = Math.min(60_000, 2_000 * 2 ** Math.max(0, job.attempt));
-      await persistQcRetry(job, { storageKey: rejectedKey, checksum, byteSize: operation.output.bytes.byteLength, cost, qc, nextPayload, delayMs });
+      await persistQcRetry(job, { storageKey: rejectedKey, checksum, byteSize: stored.byteSize, cost, qc, nextPayload, delayMs });
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs });
       return { cached: false, storageKey: rejectedKey, retrying: true };
     }
     const classifiedQc: (ShotQcReport & { decision: "accept" | "flag" }) | null = qc
       ? { ...qc, decision: qc.overall < engineSettings.qcFlagThreshold ? "flag" : "accept" }
       : null;
-    const assetId = await withDurableDatabaseRetry(() => persistCompletedAsset(job, storageKey, checksum, operation.output!.bytes.byteLength, operation.operationId, cost, classifiedQc));
+    const assetId = await withDurableDatabaseRetry(() => persistCompletedAsset(job, storageKey, checksum, stored.byteSize, operation.operationId, cost, classifiedQc));
     const dialogueSegments = job.payload.shot.audioContext?.dialogue ?? [];
     if (dialogueSegments.length && job.render_tier === "final") {
       const dialoguePayload = { dialogueSegments, originalAssetId: assetId, originalStorageKey: storageKey };

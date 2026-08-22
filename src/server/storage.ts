@@ -1,5 +1,7 @@
 import { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createHash } from "node:crypto";
+import { Readable, Transform } from "node:stream";
 import { env } from "./env";
 
 let client: S3Client | undefined;
@@ -55,6 +57,39 @@ export async function putObject(key: string, body: Uint8Array, contentType: stri
     ContentType: contentType,
     ServerSideEncryption: env().S3_ENDPOINT.includes("amazonaws.com") ? "AES256" : undefined,
   }));
+}
+
+export async function putRemoteObject(
+  key: string,
+  url: string,
+  headers: Record<string, string>,
+): Promise<{ byteSize: number; checksum: string; contentType: string }> {
+  await ensureBucket();
+  const response = await fetch(url, { headers, redirect: "follow" });
+  if (!response.ok || !response.body) throw new Error(`Remote media download failed with HTTP ${response.status}.`);
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (!Number.isFinite(contentLength) || contentLength <= 0) throw new Error("Remote media response did not include a valid Content-Length header.");
+  const hash = createHash("sha256");
+  let byteSize = 0;
+  const counter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      byteSize += chunk.length;
+      hash.update(chunk);
+      callback(null, chunk);
+    },
+  });
+  const body = Readable.fromWeb(response.body as never).pipe(counter);
+  const contentType = response.headers.get("content-type") ?? "video/mp4";
+  await s3().send(new PutObjectCommand({
+    Bucket: env().S3_BUCKET,
+    Key: key,
+    Body: body,
+    ContentLength: contentLength,
+    ContentType: contentType,
+    ServerSideEncryption: env().S3_ENDPOINT.includes("amazonaws.com") ? "AES256" : undefined,
+  }));
+  if (byteSize !== contentLength) throw new Error(`Remote media stream ended at ${byteSize} of ${contentLength} bytes.`);
+  return { byteSize, checksum: hash.digest("hex"), contentType };
 }
 
 export async function getObjectIfExists(key: string): Promise<{ bytes: Uint8Array; contentType: string } | null> {

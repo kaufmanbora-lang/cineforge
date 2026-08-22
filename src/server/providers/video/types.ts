@@ -31,7 +31,7 @@ export interface ProviderOperation {
   state: "pending" | "completed" | "failed";
   progress?: number;
   output?: {
-    bytes: Uint8Array;
+    bytes?: Uint8Array;
     mimeType: string;
     providerUri?: string;
     interactionId?: string;

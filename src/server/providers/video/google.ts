@@ -122,7 +122,7 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
         cache: "no-store",
       });
       if (!response.ok) throw await googleHttpError(response);
-      const raw = await response.json() as {
+      const raw = await readVeoOperationResponse(response) as {
         done?: boolean;
         error?: { code?: number; message?: string };
         response?: {
@@ -151,9 +151,8 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
         }
         throw new Error("Google completed the operation without a video output.");
       }
-      const bytes = video.videoBytes
-        ? Buffer.from(video.videoBytes, "base64")
-        : await downloadGoogleFile(video.uri, apiKey);
+      const bytes = video.videoBytes ? Buffer.from(video.videoBytes, "base64") : undefined;
+      if (!bytes && !video.uri) throw new Error("Google completed the operation without downloadable video media.");
       return {
         ...operation,
         state: "completed",
@@ -164,6 +163,36 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
       return failedOperation(operation.modelId, error, operation.operationId);
     }
   }
+}
+
+async function readVeoOperationResponse(response: Response): Promise<unknown> {
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (contentLength > 0 && contentLength <= 8 * 1024 * 1024) return response.json();
+  if (!response.body) return response.json();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let window = "";
+  let done = false;
+  let uri: string | undefined;
+  let mimeType: string | undefined;
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    window += decoder.decode(chunk.value, { stream: true });
+    done ||= /"done"\s*:\s*true/.test(window);
+    const uriMatch = window.match(/"uri"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    const mimeMatch = window.match(/"mimeType"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    if (uriMatch) uri = JSON.parse(`"${uriMatch[1]}"`) as string;
+    if (mimeMatch) mimeType = JSON.parse(`"${mimeMatch[1]}"`) as string;
+    if (done && uri) {
+      await reader.cancel();
+      return { done: true, response: { generateVideoResponse: { generatedSamples: [{ video: { uri, mimeType } }] } } };
+    }
+    if (window.length > 128 * 1024) window = window.slice(-64 * 1024);
+  }
+  window += decoder.decode();
+  if (!done) return { done: false };
+  throw new Error("Google returned a large inline video without a downloadable URI.");
 }
 
 export function extractVeoVideo(raw: {
