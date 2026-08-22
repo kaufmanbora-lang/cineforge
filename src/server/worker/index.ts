@@ -18,7 +18,9 @@ await recoverInterruptedJobs();
 await recoverActiveProjects();
 await reconcileQueuedJobs();
 const settingRows = await query<{ settings: { workerConcurrency?: number } }>("SELECT settings FROM workspace_settings WHERE workspace_id=$1", [env().DEFAULT_WORKSPACE_ID]).catch(() => []);
-const memoryConcurrency = Math.max(1, Math.floor(env().WORKER_MEMORY_MB / 512));
+// Video payloads are streamed to object storage or a temporary file, so a
+// generation slot no longer needs to reserve the worker's full 512 MB plan.
+const memoryConcurrency = Math.max(1, Math.floor(env().WORKER_MEMORY_MB / 256));
 const workerConcurrency = Math.max(1, Math.min(16, memoryConcurrency, Number(settingRows[0]?.settings.workerConcurrency ?? env().WORKER_CONCURRENCY)));
 process.stdout.write(`Worker concurrency ${workerConcurrency} for ${env().WORKER_MEMORY_MB} MB memory budget.\n`);
 

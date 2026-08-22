@@ -1,4 +1,10 @@
 import { GoogleGenAI } from "@google/genai";
+import { createHash, randomUUID } from "node:crypto";
+import { createWriteStream } from "node:fs";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { once } from "node:events";
 import { getVideoModel, GOOGLE_VIDEO_MODELS } from "@/domain/video-models";
 import type { ProviderOperation, VideoGenerationRequest, VideoModelAdapter } from "./types";
 
@@ -126,9 +132,9 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
         done?: boolean;
         error?: { code?: number; message?: string };
         response?: {
-          generatedVideos?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }>;
+          generatedVideos?: Array<{ video?: VeoVideoOutput }>;
           generateVideoResponse?: {
-            generatedSamples?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }>;
+            generatedSamples?: Array<{ video?: VeoVideoOutput }>;
             raiMediaFilteredCount?: number;
             raiMediaFilteredReasons?: string[];
           };
@@ -152,12 +158,19 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
         throw new Error("Google completed the operation without a video output.");
       }
       const bytes = video.videoBytes ? Buffer.from(video.videoBytes, "base64") : undefined;
-      if (!bytes && !video.uri) throw new Error("Google completed the operation without downloadable video media.");
+      if (!bytes && !video.uri && !video.localFilePath) throw new Error("Google completed the operation without downloadable video media.");
       return {
         ...operation,
         state: "completed",
         progress: 100,
-        output: { bytes, mimeType: video.mimeType ?? "video/mp4", providerUri: video.uri },
+        output: {
+          bytes,
+          localFilePath: video.localFilePath,
+          byteSize: video.byteSize,
+          checksum: video.checksum,
+          mimeType: video.mimeType ?? "video/mp4",
+          providerUri: video.uri,
+        },
       };
     } catch (error) {
       return failedOperation(operation.modelId, error, operation.operationId);
@@ -165,7 +178,16 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
   }
 }
 
-async function readVeoOperationResponse(response: Response): Promise<unknown> {
+interface VeoVideoOutput {
+  uri?: string;
+  videoBytes?: string;
+  mimeType?: string;
+  localFilePath?: string;
+  byteSize?: number;
+  checksum?: string;
+}
+
+export async function readVeoOperationResponse(response: Response): Promise<unknown> {
   const contentLength = Number(response.headers.get("content-length") ?? 0);
   if (contentLength > 0 && contentLength <= 8 * 1024 * 1024) return response.json();
   if (!response.body) return response.json();
@@ -175,30 +197,97 @@ async function readVeoOperationResponse(response: Response): Promise<unknown> {
   let done = false;
   let uri: string | undefined;
   let mimeType: string | undefined;
-  for (;;) {
-    const chunk = await reader.read();
-    if (chunk.done) break;
-    window += decoder.decode(chunk.value, { stream: true });
-    done ||= /"done"\s*:\s*true/.test(window);
-    const uriMatch = window.match(/"uri"\s*:\s*"((?:\\.|[^"\\])*)"/);
-    const mimeMatch = window.match(/"mimeType"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  let readingInlineVideo = false;
+  let inlineFinished = false;
+  let base64Carry = "";
+  let byteSize = 0;
+  const hash = createHash("sha256");
+  const localFilePath = join(tmpdir(), `cineforge-veo-${randomUUID()}.mp4`);
+  let output: ReturnType<typeof createWriteStream> | undefined;
+
+  const inspectJson = (value: string) => {
+    done ||= /"done"\s*:\s*true/.test(value);
+    const uriMatch = value.match(/"uri"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    const mimeMatch = value.match(/"(?:mimeType|mime_type)"\s*:\s*"((?:\\.|[^"\\])*)"/);
     if (uriMatch) uri = JSON.parse(`"${uriMatch[1]}"`) as string;
     if (mimeMatch) mimeType = JSON.parse(`"${mimeMatch[1]}"`) as string;
-    if (done && uri) {
-      await reader.cancel();
-      return { done: true, response: { generateVideoResponse: { generatedSamples: [{ video: { uri, mimeType } }] } } };
+  };
+  const writeBase64 = async (value: string, final = false) => {
+    const compact = `${base64Carry}${value}`.replace(/\s+/g, "");
+    const usableLength = final ? compact.length : compact.length - (compact.length % 4);
+    base64Carry = compact.slice(usableLength);
+    if (!usableLength) return;
+    const bytes = Buffer.from(compact.slice(0, usableLength), "base64");
+    if (!bytes.length) return;
+    output ??= createWriteStream(localFilePath, { flags: "wx" });
+    hash.update(bytes);
+    byteSize += bytes.length;
+    if (!output.write(bytes)) await once(output, "drain");
+  };
+
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      window += decoder.decode(chunk.value, { stream: true });
+      for (;;) {
+        if (readingInlineVideo) {
+          const closingQuote = window.indexOf('"');
+          if (closingQuote === -1) {
+            await writeBase64(window);
+            window = "";
+            break;
+          }
+          await writeBase64(window.slice(0, closingQuote), true);
+          window = window.slice(closingQuote + 1);
+          readingInlineVideo = false;
+          inlineFinished = true;
+          continue;
+        }
+        inspectJson(window);
+        if (done && uri) {
+          await reader.cancel();
+          return { done: true, response: { generateVideoResponse: { generatedSamples: [{ video: { uri, mimeType } }] } } };
+        }
+        const inlineMatch = /"(?:videoBytes|bytesBase64Encoded)"\s*:\s*"/.exec(window);
+        if (inlineMatch) {
+          inspectJson(window.slice(0, inlineMatch.index));
+          window = window.slice(inlineMatch.index + inlineMatch[0].length);
+          readingInlineVideo = true;
+          output ??= createWriteStream(localFilePath, { flags: "wx" });
+          continue;
+        }
+        if (window.length > 128 * 1024) window = window.slice(-64 * 1024);
+        break;
+      }
     }
-    if (window.length > 128 * 1024) window = window.slice(-64 * 1024);
+    window += decoder.decode();
+    inspectJson(window);
+    if (readingInlineVideo) throw new Error("Google returned an incomplete inline video payload.");
+    if (!done) return { done: false };
+    if (uri) return { done: true, response: { generateVideoResponse: { generatedSamples: [{ video: { uri, mimeType } }] } } };
+    if (!inlineFinished || !output || byteSize <= 0) throw new Error("Google completed the operation without downloadable video media.");
+    output.end();
+    await once(output, "finish");
+    return {
+      done: true,
+      response: {
+        generateVideoResponse: {
+          generatedSamples: [{ video: { localFilePath, byteSize, checksum: hash.digest("hex"), mimeType: mimeType ?? "video/mp4" } }],
+        },
+      },
+    };
+  } catch (error) {
+    output?.destroy();
+    await rm(localFilePath, { force: true }).catch(() => undefined);
+    throw error;
   }
-  window += decoder.decode();
-  if (!done) return { done: false };
-  throw new Error("Google returned a large inline video without a downloadable URI.");
 }
 
 export function extractVeoVideo(raw: {
   response?: {
-    generatedVideos?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }>;
-    generateVideoResponse?: { generatedSamples?: Array<{ video?: { uri?: string; videoBytes?: string; mimeType?: string } }> };
+    generatedVideos?: Array<{ video?: VeoVideoOutput }>;
+    generateVideoResponse?: { generatedSamples?: Array<{ video?: VeoVideoOutput }> };
   };
 }) {
   return raw.response?.generatedVideos?.[0]?.video ?? raw.response?.generateVideoResponse?.generatedSamples?.[0]?.video;
@@ -239,18 +328,15 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
         model: request.modelId,
         input: request.references.length || request.editInstruction ? input : request.prompt,
         previous_interaction_id: request.previousInteractionId,
-        background: false,
-        stream: false,
-        store: request.fastMode ? false : true,
         response_format: {
           type: "video",
           aspect_ratio: request.aspectRatio,
-          duration: `${request.durationSeconds}s`,
-          resolution: request.resolution === "preview" ? "720p" : request.resolution,
-          ...(request.fastMode ? {} : { delivery: "uri" }),
+          // Official URI delivery prevents a large base64 MP4 from occupying
+          // the worker heap and is supported for every Omni video response.
+          delivery: "uri",
         },
-        generation_config: {
-          video_config: {
+        generationConfig: {
+          videoConfig: {
             task: request.editInstruction ? "edit" : request.references.length ? "reference_to_video" : "text_to_video",
           },
         },
@@ -267,7 +353,9 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
       // SDK/API revisions, but parse the real response shape used in production.
       const video = raw.output_video ?? raw.outputVideo ?? extractOmniVideo(raw);
       if (!video) throw new Error("Gemini Omni returned no video output.");
-      const bytes = video.data ? Buffer.from(video.data, "base64") : await downloadGoogleFile(video.uri, apiKey);
+      if (video.uri) await waitForGoogleFileActive(video.uri, apiKey);
+      const bytes = video.data ? Buffer.from(video.data, "base64") : undefined;
+      if (!bytes && !video.uri) throw new Error("Gemini Omni returned no downloadable video media.");
       const videoRecord = video as { data?: string; uri?: string; mime_type?: string; mimeType?: string };
       return {
         provider: "google",
@@ -303,21 +391,24 @@ function imageValue(reference: { data: string; mimeType: string }) {
   return { imageBytes: reference.data, mimeType: reference.mimeType };
 }
 
-async function downloadGoogleFile(uri: string | undefined, apiKey: string): Promise<Uint8Array> {
-  if (!uri) throw new Error("Google did not provide inline video bytes or a download URI.");
+async function waitForGoogleFileActive(uri: string, apiKey: string): Promise<void> {
+  const fileName = googleFileName(uri);
+  if (!fileName) return;
   for (let attempt = 0; attempt < 72; attempt += 1) {
-    const response = await fetch(uri, { headers: { "x-goog-api-key": apiKey }, redirect: "follow" });
-    if (response.ok) return new Uint8Array(await response.arrayBuffer());
-    if (![400, 404, 409, 425].includes(response.status)) throw await googleHttpError(response);
-    const fileName = googleFileName(uri);
-    if (!fileName) throw await googleHttpError(response);
     const metadata = await fetch(`https://generativelanguage.googleapis.com/v1beta/${fileName}`, {
       headers: { "x-goog-api-key": apiKey },
       cache: "no-store",
     });
-    if (!metadata.ok) throw await googleHttpError(metadata);
+    if (!metadata.ok) {
+      if ([400, 404, 409, 425].includes(metadata.status)) {
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        continue;
+      }
+      throw await googleHttpError(metadata);
+    }
     const payload = await metadata.json() as { state?: string | { name?: string }; error?: { message?: string } };
     const state = typeof payload.state === "string" ? payload.state : payload.state?.name;
+    if (state === "ACTIVE" || !state) return;
     if (state === "FAILED") throw new Error(payload.error?.message ?? "Google could not process the generated video file.");
     await new Promise((resolve) => setTimeout(resolve, 5_000));
   }

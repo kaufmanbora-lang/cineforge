@@ -32,6 +32,9 @@ export interface ProviderOperation {
   progress?: number;
   output?: {
     bytes?: Uint8Array;
+    localFilePath?: string;
+    byteSize?: number;
+    checksum?: string;
     mimeType: string;
     providerUri?: string;
     interactionId?: string;

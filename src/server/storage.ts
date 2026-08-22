@@ -1,6 +1,8 @@
 import { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { Readable, Transform } from "node:stream";
 import { env } from "./env";
 
@@ -89,6 +91,36 @@ export async function putRemoteObject(
     ServerSideEncryption: env().S3_ENDPOINT.includes("amazonaws.com") ? "AES256" : undefined,
   }));
   if (byteSize !== contentLength) throw new Error(`Remote media stream ended at ${byteSize} of ${contentLength} bytes.`);
+  return { byteSize, checksum: hash.digest("hex"), contentType };
+}
+
+export async function putFileObject(
+  key: string,
+  filePath: string,
+  contentType: string,
+): Promise<{ byteSize: number; checksum: string; contentType: string }> {
+  await ensureBucket();
+  const file = await stat(filePath);
+  if (!file.isFile() || file.size <= 0) throw new Error("Generated video file is empty.");
+  const hash = createHash("sha256");
+  let byteSize = 0;
+  const counter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      byteSize += chunk.length;
+      hash.update(chunk);
+      callback(null, chunk);
+    },
+  });
+  const body = createReadStream(filePath).pipe(counter);
+  await s3().send(new PutObjectCommand({
+    Bucket: env().S3_BUCKET,
+    Key: key,
+    Body: body,
+    ContentLength: file.size,
+    ContentType: contentType,
+    ServerSideEncryption: env().S3_ENDPOINT.includes("amazonaws.com") ? "AES256" : undefined,
+  }));
+  if (byteSize !== file.size) throw new Error(`Generated video stream ended at ${byteSize} of ${file.size} bytes.`);
   return { byteSize, checksum: hash.digest("hex"), contentType };
 }
 

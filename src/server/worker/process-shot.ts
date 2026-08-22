@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { isRetryableDatabaseConnectionError, query, transaction } from "@/server/db";
 import { getProviderKey } from "@/server/provider-secrets";
 import { googleVideoAdapter } from "@/server/providers/video/google";
 import type { ProviderOperation, VideoGenerationRequest } from "@/server/providers/video/types";
-import { getObjectIfExists, putObject, putRemoteObject, signedObjectUrl } from "@/server/storage";
+import { getObjectIfExists, putFileObject, putObject, putRemoteObject, signedObjectUrl } from "@/server/storage";
 import { findCachedShot } from "@/server/movie/repository";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
 import { enqueueAutomaticAssemblyIfReady, enqueueDialoguePatch, enqueueReadyProjectJobs, pauseProjectJobs, requeueDatabaseJob } from "@/server/movie/queue";
@@ -113,7 +115,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       const resumable = resumableProviderOperation(job.shot_last_operation, job.payload.specHash);
       operation = resumable ?? await adapter.start(request, apiKey);
       const providerStartedAt = resumable?.startedAt ?? new Date().toISOString();
-      await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify({ ...operation, specHash: job.payload.specHash, startedAt: providerStartedAt })]);
+      await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify(durableProviderOperation(operation, job.payload.specHash, providerStartedAt))]);
       while (operation.state === "pending") {
         if (Date.now() - Date.parse(providerStartedAt) >= 30 * 60_000) {
           throw Object.assign(new Error("Google video operation did not complete within 30 minutes."), { status: 408, code: "GOOGLE_TIMEOUT" });
@@ -121,7 +123,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         await new Promise((resolve) => setTimeout(resolve, 10_000));
         await query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state='generating'", [job.id]).catch(() => undefined);
         operation = await adapter.poll(operation, apiKey);
-        await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify({ ...operation, specHash: job.payload.specHash, startedAt: providerStartedAt })]);
+        await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify(durableProviderOperation(operation, job.payload.specHash, providerStartedAt))]);
       }
     }
     if (operation.state === "failed" || !operation.output) {
@@ -135,20 +137,24 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     // outstanding amount; never add projected cost a second time.
     const cost = generationAccountingCost(projectedCost, Number(job.reserved_cost_usd), Boolean(staged));
     const inMemoryBytes = operation.output.bytes;
+    const localFilePath = operation.output.localFilePath;
     const stored = inMemoryBytes
       ? {
           checksum: createHash("sha256").update(inMemoryBytes).digest("hex"),
           byteSize: inMemoryBytes.byteLength,
           contentType: operation.output.mimeType,
         }
-      : operation.output.providerUri && providerApiKey
-        ? await putRemoteObject(storageKey, operation.output.providerUri, { "x-goog-api-key": providerApiKey })
-        : null;
+      : localFilePath
+        ? await putFileObject(storageKey, localFilePath, operation.output.mimeType)
+        : operation.output.providerUri && providerApiKey
+          ? await putRemoteObject(storageKey, operation.output.providerUri, { "x-goog-api-key": providerApiKey })
+          : null;
     if (!stored) throw new Error("Completed video output has neither bytes nor a downloadable URI.");
     const checksum = stored.checksum;
     // Object storage is independent of PostgreSQL. Stage the paid provider
     // result first so a database restart can never force another video call.
     if (inMemoryBytes) await putObject(storageKey, inMemoryBytes, operation.output.mimeType);
+    if (localFilePath) await rm(localFilePath, { force: true }).catch(() => undefined);
     await query("UPDATE jobs SET state='validating' WHERE id=$1", [job.id]).catch(() => undefined);
     // Fast Draft is the interactive path: publish the provider result immediately.
     // Expensive vision QC and consistent-voice replacement remain enabled for Final.
@@ -221,11 +227,28 @@ export function resumableProviderOperation(
   saved: PersistedProviderOperation | null,
   specHash: string,
 ): PersistedProviderOperation | null {
-  if (!saved || (!saved.operationId.startsWith("operations/") && !saved.operationId.includes("/operations/"))) return null;
+  if (!saved) return null;
   const sdkPollingFailure = saved.error?.message.includes("_fromAPIResponse") ?? false;
   if (saved.specHash !== specHash && !(!saved.specHash && sdkPollingFailure)) return null;
+  if (saved.state === "completed" && saved.output) {
+    const localFileExists = Boolean(saved.output.localFilePath && existsSync(saved.output.localFilePath));
+    if (saved.output.providerUri || localFileExists) return saved;
+  }
+  if (!saved.operationId.startsWith("operations/") && !saved.operationId.includes("/operations/")) return null;
   if (saved.state !== "pending" && !sdkPollingFailure) return null;
   return { ...saved, state: "pending", error: undefined };
+}
+
+export function durableProviderOperation(operation: ProviderOperation, specHash: string, startedAt: string): PersistedProviderOperation {
+  const output = operation.output ? {
+    mimeType: operation.output.mimeType,
+    providerUri: operation.output.providerUri,
+    interactionId: operation.output.interactionId,
+    localFilePath: operation.output.localFilePath,
+    byteSize: operation.output.byteSize,
+    checksum: operation.output.checksum,
+  } : undefined;
+  return { ...operation, output, specHash, startedAt };
 }
 
 export function generationAccountingCost(projectedCost: number, outstandingReservation: number, staged: boolean): number {

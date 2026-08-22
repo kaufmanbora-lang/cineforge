@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { extractOmniVideo, extractVeoVideo, googleVeoConfig, normalizeGoogleProviderError } from "@/server/providers/video/google";
-import { generationAccountingCost, providerDurationSeconds, resumableProviderOperation } from "@/server/worker/process-shot";
+import { readFile, rm } from "node:fs/promises";
+import { extractOmniVideo, extractVeoVideo, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
+import { durableProviderOperation, generationAccountingCost, providerDurationSeconds, resumableProviderOperation } from "@/server/worker/process-shot";
 import { shot } from "./fixtures";
 
 describe("Google Omni response parsing", () => {
@@ -64,6 +65,26 @@ describe("Google Omni response parsing", () => {
     ] } } })).toEqual({ uri: "https://generativelanguage.googleapis.com/v1beta/files/movie" });
   });
 
+  it("streams a large inline Veo response to a temporary video file", async () => {
+    const expected = Buffer.from("test-video-payload");
+    const payload = JSON.stringify({
+      done: true,
+      response: { generateVideoResponse: { generatedSamples: [{ video: { mimeType: "video/mp4", videoBytes: expected.toString("base64") } }] } },
+    });
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        for (let offset = 0; offset < payload.length; offset += 7) controller.enqueue(new TextEncoder().encode(payload.slice(offset, offset + 7)));
+        controller.close();
+      },
+    }));
+    const raw = await readVeoOperationResponse(response) as Parameters<typeof extractVeoVideo>[0];
+    const video = extractVeoVideo(raw)!;
+    expect(video.localFilePath).toBeTruthy();
+    expect(Buffer.from(await readFile(video.localFilePath!))).toEqual(expected);
+    expect(video.byteSize).toBe(expected.length);
+    await rm(video.localFilePath!, { force: true });
+  });
+
   it("resumes a persisted SDK polling failure without starting a second paid generation", () => {
     const saved = {
       provider: "google" as const,
@@ -75,6 +96,29 @@ describe("Google Omni response parsing", () => {
     expect(resumableProviderOperation(saved, "same-shot-spec")).toMatchObject({ operationId: saved.operationId, state: "pending" });
     expect(resumableProviderOperation({ ...saved, operationId: "projects/p/locations/us/models/veo/operations/abc" }, "same-shot-spec"))
       .toMatchObject({ state: "pending" });
+  });
+
+  it("resumes a completed URI result without making a second paid request", () => {
+    const saved = {
+      provider: "google" as const,
+      modelId: "gemini-omni-flash-preview",
+      operationId: "v1_interaction",
+      state: "completed" as const,
+      output: { mimeType: "video/mp4", providerUri: "https://generativelanguage.googleapis.com/v1beta/files/movie" },
+      specHash: "same-shot-spec",
+    };
+    expect(resumableProviderOperation(saved, "same-shot-spec")).toEqual(saved);
+  });
+
+  it("never persists inline video bytes in the database checkpoint", () => {
+    const persisted = durableProviderOperation({
+      provider: "google",
+      modelId: "veo-3.1-fast-generate-preview",
+      operationId: "operations/123",
+      state: "completed",
+      output: { bytes: new Uint8Array([1, 2, 3]), mimeType: "video/mp4" },
+    }, "hash", new Date(0).toISOString());
+    expect(persisted.output?.bytes).toBeUndefined();
   });
 
   it("does not label every failed precondition as a billing failure", () => {
