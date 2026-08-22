@@ -156,6 +156,9 @@ export function googleVeoConfig(
   lastFrame?: VideoGenerationRequest["references"][number],
   subjectReferences: VideoGenerationRequest["references"] = [],
 ) {
+  const supportedReferenceImages = subjectReferences.length >= 2
+    ? subjectReferences.slice(0, 3).map((reference) => ({ image: imageValue(reference), referenceType: "asset" }))
+    : undefined;
   return {
     aspectRatio: request.aspectRatio,
     resolution: request.resolution === "preview" ? "720p" : request.resolution,
@@ -163,7 +166,7 @@ export function googleVeoConfig(
     negativePrompt: request.negativeDirectives.join(", "),
     numberOfVideos: 1,
     lastFrame: lastFrame ? imageValue(lastFrame) : undefined,
-    referenceImages: subjectReferences.map((reference) => ({ image: imageValue(reference), referenceType: "asset" })),
+    referenceImages: supportedReferenceImages,
   };
 }
 

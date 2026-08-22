@@ -22,6 +22,27 @@ describe("Google Omni response parsing", () => {
     })).not.toHaveProperty("seed");
   });
 
+  it("omits an unsupported single Veo reference image", () => {
+    const plannedShot = shot("shot-1");
+    const request = {
+      projectId: "project-1",
+      sceneId: plannedShot.sceneId,
+      shotId: plannedShot.id,
+      modelId: "veo-3.1-fast-generate-preview",
+      prompt: plannedShot.generationPrompt!.prompt,
+      negativeDirectives: [],
+      durationSeconds: 8,
+      resolution: "720p" as const,
+      aspectRatio: "16:9" as const,
+      seed: null,
+      references: [],
+      fastMode: true,
+    };
+    const oneReference = [{ id: "portrait", data: "AAAA", mimeType: "image/png", role: "subject" as const }];
+    expect(googleVeoConfig(request, undefined, oneReference).referenceImages).toBeUndefined();
+    expect(googleVeoConfig(request, undefined, [...oneReference, { ...oneReference[0], id: "wardrobe" }]).referenceImages).toHaveLength(2);
+  });
+
   it("extracts the production Interactions API video content part", () => {
     expect(extractOmniVideo({
       steps: [
