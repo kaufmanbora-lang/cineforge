@@ -281,7 +281,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     if (decision.pauseProject) await withDurableDatabaseRetry(() => pauseProjectJobs(job.project_id, { code: failure, message }));
     await withDurableDatabaseRetry(() => query(
       "UPDATE jobs SET state=$2, last_error=$3, available_at=now()+($4::text || ' milliseconds')::interval WHERE id=$1",
-      [job.id, decision.pauseProject ? "paused" : decision.retry ? "retrying" : "failed", JSON.stringify({ failure, message }), decision.delayMs],
+      [job.id, decision.pauseProject ? "paused" : decision.retry ? "queued" : "failed", JSON.stringify({ failure, message }), decision.delayMs],
     ));
     if (!decision.pauseProject && !decision.retry) await withDurableDatabaseRetry(() => query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify({ failure, message, shotId: job.shot_id })]));
     if (decision.retry) {
@@ -657,7 +657,7 @@ async function settleFailedReservation(jobId: string, projectId: string, provide
 async function persistModerationRetry(job: JobRow, nextPayload: JobRow["payload"], providerMessage: string, code = "GOOGLE_MODERATION_RETRY"): Promise<void> {
   await transaction(async (client) => {
     await client.query(
-      "UPDATE jobs SET state='retrying',payload=$2,last_error=$3,available_at=now()+interval '1 second',reserved_cost_usd=0 WHERE id=$1",
+      "UPDATE jobs SET state='queued',payload=$2,last_error=$3,available_at=now()+interval '1 second',reserved_cost_usd=0 WHERE id=$1",
       [job.id, JSON.stringify(nextPayload), JSON.stringify({ code, message: providerMessage })],
     );
     await client.query(
@@ -689,7 +689,7 @@ async function persistQcRetry(job: JobRow, input: {
       [job.project_id, job.scene_id, job.shot_id, input.storageKey, input.byteSize, job.payload.shot.durationSeconds, input.checksum, JSON.stringify({ qc: input.qc, retryAttempt: job.attempt })],
     );
     await client.query(
-      "UPDATE jobs SET state='retrying',payload=$2,last_error=$3,available_at=now()+($4::text || ' milliseconds')::interval,reserved_cost_usd=0 WHERE id=$1",
+      "UPDATE jobs SET state='queued',payload=$2,last_error=$3,available_at=now()+($4::text || ' milliseconds')::interval,reserved_cost_usd=0 WHERE id=$1",
       [job.id, JSON.stringify(input.nextPayload), JSON.stringify({ code: "QC_RETRY", report: input.qc }), input.delayMs],
     );
     await client.query("UPDATE shots SET state='retrying',retry_count=$2,last_error=$3 WHERE id=$1", [job.shot_id, job.attempt, JSON.stringify({ qc: input.qc })]);

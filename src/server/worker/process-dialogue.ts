@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { openAIClient } from "@/server/providers/openai";
 import { query, transaction } from "@/server/db";
 import { patchDialogueAudio } from "@/server/movie/ffmpeg";
-import { putObject, signedObjectUrl } from "@/server/storage";
+import { getObjectIfExists, putObject, signedObjectUrl } from "@/server/storage";
 import { enqueueAutomaticAssemblyIfReady } from "@/server/movie/queue";
 import type { AudioContext, MoviePlan, Shot } from "@/domain/movie";
 
@@ -27,43 +27,52 @@ interface DialogueJobRow {
 }
 
 export async function processDialoguePatch(databaseJobId: string) {
-  const rows = await query<DialogueJobRow>("SELECT * FROM jobs WHERE id=$1", [databaseJobId]);
+  const rows = await query<DialogueJobRow>(
+    `UPDATE jobs SET state='generating',started_at=COALESCE(started_at,now()),attempt=attempt+1,updated_at=now()
+     WHERE id=$1 AND state IN ('queued','retrying') RETURNING *`,
+    [databaseJobId],
+  );
   const job = rows[0];
-  if (!job) throw new Error("Dialogue patch job not found.");
-  await query("UPDATE jobs SET state='generating',started_at=COALESCE(started_at,now()),attempt=attempt+1 WHERE id=$1", [job.id]);
-  const client = await openAIClient();
-  const sourceResponse = await fetch(await signedObjectUrl(job.payload.originalStorageKey));
-  if (!sourceResponse.ok) throw new Error(`Unable to download original shot: ${sourceResponse.status}`);
-  let patched: Uint8Array = new Uint8Array(await sourceResponse.arrayBuffer());
+  if (!job) return { skipped: true, videoFramesPreserved: true };
   const segments = job.payload.dialogueSegments ?? (job.payload.dialogueId && job.payload.characterId && job.payload.text && job.payload.delivery && job.payload.startSeconds !== undefined && job.payload.durationSeconds !== undefined ? [{ id: job.payload.dialogueId, characterId: job.payload.characterId, text: job.payload.text, delivery: job.payload.delivery, startSeconds: job.payload.startSeconds, durationSeconds: job.payload.durationSeconds }] : []);
   if (!segments.length) throw new Error("Dialogue patch contains no dialogue segments.");
-  for (const segment of segments) {
-    const characters = await query<{ bible: { voice?: { providerVoiceId?: string | null; description?: string } } }>(
-      "SELECT bible FROM characters WHERE id=$1 AND project_id=$2",
-      [segment.characterId, job.project_id],
-    );
-    const requestedVoice = characters[0]?.bible.voice?.providerVoiceId;
-    const voice = requestedVoice && BUILT_IN_VOICES.includes(requestedVoice as (typeof BUILT_IN_VOICES)[number])
-      ? requestedVoice
-      : deterministicVoice(segment.characterId);
-    const speechResponse = await client.audio.speech.create({
-      model: "gpt-4o-mini-tts",
-      voice: voice as never,
-      input: segment.text,
-      instructions: `${characters[0]?.bible.voice?.description ?? "Natural cinematic dialogue"}. Delivery: ${segment.delivery}. Maintain the same character voice identity.`,
-      response_format: "mp3",
-    });
-    patched = await patchDialogueAudio({
-      video: patched,
-      speech: new Uint8Array(await speechResponse.arrayBuffer()),
-      startSeconds: segment.startSeconds,
-      endSeconds: segment.startSeconds + segment.durationSeconds,
-    });
-  }
-  const checksum = createHash("sha256").update(patched).digest("hex");
   const contentHash = createHash("sha256").update(JSON.stringify(job.payload)).digest("hex");
   const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/dialogue-${contentHash}.mp4`;
-  await putObject(storageKey, patched, "video/mp4");
+  const cached = await getObjectIfExists(storageKey);
+  let patched: Uint8Array;
+  if (cached) {
+    patched = cached.bytes;
+  } else {
+    const client = await openAIClient();
+    const sourceResponse = await fetch(await signedObjectUrl(job.payload.originalStorageKey));
+    if (!sourceResponse.ok) throw new Error(`Unable to download original shot: ${sourceResponse.status}`);
+    patched = new Uint8Array(await sourceResponse.arrayBuffer());
+    for (const segment of segments) {
+      const characters = await query<{ bible: { voice?: { providerVoiceId?: string | null; description?: string } } }>(
+        "SELECT bible FROM characters WHERE id=$1 AND project_id=$2",
+        [segment.characterId, job.project_id],
+      );
+      const requestedVoice = characters[0]?.bible.voice?.providerVoiceId;
+      const voice = requestedVoice && BUILT_IN_VOICES.includes(requestedVoice as (typeof BUILT_IN_VOICES)[number])
+        ? requestedVoice
+        : deterministicVoice(segment.characterId);
+      const speechResponse = await client.audio.speech.create({
+        model: "gpt-4o-mini-tts",
+        voice: voice as never,
+        input: segment.text,
+        instructions: `${characters[0]?.bible.voice?.description ?? "Natural cinematic dialogue"}. Delivery: ${segment.delivery}. Maintain the same character voice identity.`,
+        response_format: "mp3",
+      });
+      patched = await patchDialogueAudio({
+        video: patched,
+        speech: new Uint8Array(await speechResponse.arrayBuffer()),
+        startSeconds: segment.startSeconds,
+        endSeconds: segment.startSeconds + segment.durationSeconds,
+      });
+    }
+    await putObject(storageKey, patched, "video/mp4");
+  }
+  const checksum = createHash("sha256").update(patched).digest("hex");
   await transaction(async (db) => {
     const current = await db.query<{ current_version: number; audio_context: AudioContext; generation_spec: Shot }>("SELECT current_version,audio_context,generation_spec FROM shots WHERE id=$1 FOR UPDATE", [job.shot_id]);
     const version = (current.rows[0]?.current_version ?? 0) + 1;
@@ -109,8 +118,12 @@ export async function processDialoguePatch(databaseJobId: string) {
       };
       const nextPlanVersion = planRows.rows[0].current_plan_version + 1;
       const planHash = createHash("sha256").update(JSON.stringify(nextPlan)).digest("hex");
-      await db.query("INSERT INTO movie_plan_versions (project_id,version,content_hash,plan) VALUES ($1,$2,$3,$4)", [job.project_id, nextPlanVersion, planHash, JSON.stringify(nextPlan)]);
-      await db.query("UPDATE projects SET current_plan_version=$2,updated_at=now() WHERE id=$1", [job.project_id, nextPlanVersion]);
+      const savedPlan = await db.query<{ version: number }>(
+        `INSERT INTO movie_plan_versions (project_id,version,content_hash,plan) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (project_id,content_hash) DO UPDATE SET plan=EXCLUDED.plan RETURNING version`,
+        [job.project_id, nextPlanVersion, planHash, JSON.stringify(nextPlan)],
+      );
+      await db.query("UPDATE projects SET current_plan_version=$2,updated_at=now() WHERE id=$1", [job.project_id, savedPlan.rows[0].version]);
     }
     await db.query("UPDATE jobs SET state='completed',completed_at=now(),result=$2 WHERE id=$1", [job.id, JSON.stringify({ storageKey, version, videoFramesPreserved: true })]);
     await db.query(

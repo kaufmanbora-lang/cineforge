@@ -119,14 +119,14 @@ async function processProjectPlan(databaseJobId: string) {
 async function handleBackgroundFailure(databaseJobId: string, type: string, error: unknown) {
   const rows = await query<{ id: string; project_id: string; attempt: number; max_attempts: number; state: string }>("SELECT id,project_id,attempt,max_attempts,state FROM jobs WHERE id=$1", [databaseJobId]);
   const job = rows[0];
-  if (!job || job.state === "failed" || job.state === "paused" || job.state === "completed" || (type === "generate-shot" && job.state === "retrying")) return;
+  if (!job || job.state === "failed" || job.state === "paused" || job.state === "completed" || (type === "generate-shot" && ["queued", "retrying"].includes(job.state))) return;
   const failure = classifyFailure(error);
   const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
   const details = { failure, message: error instanceof Error ? error.message : String(error), jobType: type };
   if (decision.pauseProject) await pauseProjectJobs(job.project_id, details);
   await query(
     "UPDATE jobs SET state=$2,last_error=$3,available_at=now()+($4::text || ' milliseconds')::interval WHERE id=$1",
-    [job.id, decision.pauseProject ? "paused" : decision.retry ? "retrying" : "failed", JSON.stringify(details), decision.delayMs],
+    [job.id, decision.pauseProject ? "paused" : decision.retry ? "queued" : "failed", JSON.stringify(details), decision.delayMs],
   );
   if (decision.retry) await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: decision.delayMs, type });
   if (!decision.pauseProject && !decision.retry) await query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify(details)]);
