@@ -146,7 +146,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         if (Date.now() - Date.parse(providerStartedAt) >= 30 * 60_000) {
           throw Object.assign(new Error("Google video operation did not complete within 30 minutes."), { status: 408, code: "GOOGLE_TIMEOUT" });
         }
-        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
         await query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state='generating'", [job.id]).catch(() => undefined);
         operation = await adapter.poll(operation, apiKey);
         await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify(durableProviderOperation(operation, job.payload.specHash, providerStartedAt))]);

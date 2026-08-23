@@ -454,7 +454,7 @@ async function waitForGoogleFileActive(uri: string, apiKey: string): Promise<voi
     });
     if (!metadata.ok) {
       if ([400, 404, 409, 425].includes(metadata.status)) {
-        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
         continue;
       }
       throw await googleHttpError(metadata);
@@ -463,7 +463,7 @@ async function waitForGoogleFileActive(uri: string, apiKey: string): Promise<voi
     const state = typeof payload.state === "string" ? payload.state : payload.state?.name;
     if (state === "ACTIVE" || !state) return;
     if (state === "FAILED") throw new Error(payload.error?.message ?? "Google could not process the generated video file.");
-    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
   }
   throw Object.assign(new Error("Google video file processing timed out."), { status: 408, code: "GOOGLE_TIMEOUT" });
 }
