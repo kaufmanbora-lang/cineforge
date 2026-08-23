@@ -11,7 +11,7 @@ export function classifyFailure(error: unknown): FailureClass {
   // HTTP 429 is a rate/quota signal even when Google mentions the account's
   // billing tier in its explanatory metadata. It must never be converted into
   // a false "payment inactive" pause.
-  if (status === 429 && /quota|resource_exhausted|квот/.test(probe)) return "quota";
+  if (status === 429 && (/google_quota_exhausted/.test(code) || /daily|per day|requests per day|spend limit|spending limit|credit limit|prepay.*(?:empty|depleted)|limit(?:ed)?[^.]{0,30}\b0\b/.test(probe))) return "quota";
   if (status === 429) return "rate-limit";
   if (/google_billing_not_ready|billing (?:account )?(?:is )?(?:inactive|required|disabled)|prepay (?:balance )?(?:is )?(?:depleted|empty)|payment required|credit balance (?:is )?(?:depleted|empty)|no credits|оплата (?:не активна|требуется)/.test(probe)) return "billing";
   if (status === 401 || /authentication|unauthenticated|api[_ -]?key.*invalid/.test(probe)) return "authentication";
@@ -32,6 +32,7 @@ export function retryDecision(input: { failure: FailureClass; attempt: number; m
 } {
   if (["quota", "billing", "authentication", "permission", "model"].includes(input.failure)) return { retry: false, pauseProject: true, delayMs: 0 };
   if (input.failure === "moderation" || input.failure === "fatal") return { retry: false, pauseProject: false, delayMs: 0 };
+  if (input.failure === "rate-limit" && input.attempt >= input.maxAttempts) return { retry: false, pauseProject: true, delayMs: 0 };
   if (input.attempt >= input.maxAttempts) return { retry: false, pauseProject: false, delayMs: 0 };
   const exponential = (input.baseMs ?? 1_000) * 2 ** input.attempt;
   const deterministicJitter = Math.round(exponential * 0.15);

@@ -323,7 +323,12 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
-    const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
+    const decision = retryDecision({
+      failure,
+      attempt: job.attempt,
+      maxAttempts: job.max_attempts,
+      baseMs: failure === "rate-limit" ? 15_000 : undefined,
+    });
     if (decision.pauseProject) {
       await withDurableDatabaseRetry(() => pauseProjectJobs(job.project_id, { code: failure, message }));
       await withDurableDatabaseRetry(() => query(

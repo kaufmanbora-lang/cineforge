@@ -4,13 +4,19 @@ import { isRetryableDatabaseConnectionError } from "@/server/db";
 
 describe("API failure policy", () => {
   it("pauses on exhausted quota without a retry loop", () => {
-    const error = Object.assign(new Error("RESOURCE_EXHAUSTED quota"), { status: 429 });
+    const error = Object.assign(new Error("RESOURCE_EXHAUSTED: requests per day quota exhausted"), { status: 429 });
     expect(classifyFailure(error)).toBe("quota");
     expect(retryDecision({ failure: "quota", attempt: 1, maxAttempts: 3 })).toEqual({ retry: false, pauseProject: true, delayMs: 0 });
   });
   it("does not mistake a paid-tier 429 for inactive billing", () => {
     const error = Object.assign(new Error("RESOURCE_EXHAUSTED: spend limit for billing tier 1"), { status: 429 });
     expect(classifyFailure(error)).toBe("quota");
+  });
+  it("retries a short RESOURCE_EXHAUSTED window and pauses only after bounded attempts", () => {
+    const error = Object.assign(new Error("RESOURCE_EXHAUSTED: requests per minute"), { status: 429, code: "GOOGLE_RATE_LIMIT" });
+    expect(classifyFailure(error)).toBe("rate-limit");
+    expect(retryDecision({ failure: "rate-limit", attempt: 1, maxAttempts: 3, baseMs: 15_000 })).toEqual({ retry: true, pauseProject: false, delayMs: 34_500 });
+    expect(retryDecision({ failure: "rate-limit", attempt: 3, maxAttempts: 3, baseMs: 15_000 })).toEqual({ retry: false, pauseProject: true, delayMs: 0 });
   });
   it("does not treat generic billing metadata as a payment failure", () => {
     const error = Object.assign(new Error("Billing metadata failed a different precondition"), { status: 400 });

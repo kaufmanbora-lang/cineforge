@@ -538,10 +538,11 @@ export function normalizeGoogleProviderError(error: unknown): { code: string; me
   if (status === 401 || /api[_ -]?key.*(invalid|expired)|unauthenticated|authentication/.test(probe)) {
     return { code: "GOOGLE_AUTHENTICATION", status, retryable: false, message: "Google отклонил API-ключ. Создайте новый ключ Gemini API и замените его в разделе «Настройки → API»." };
   }
-  // Google can mention the billing tier or credit controls inside a 429 spend
-  // limit response. Status is authoritative: that response is a temporary
-  // quota window, not an inactive billing account.
-  if (status === 429 && /quota|resource_exhausted|daily|spend|tier|balance|квот/.test(probe)) {
+  // RESOURCE_EXHAUSTED is also Google's normal response for short RPM and
+  // concurrency windows. Pause only for an explicit daily/spend/credit ceiling;
+  // otherwise use bounded rate-limit backoff instead of making the user click
+  // Resume every minute.
+  if (status === 429 && /daily|per day|requests per day|spend limit|spending limit|credit limit|prepay.*(?:empty|depleted)|limit(?:ed)?[^.]{0,30}\b0\b/.test(probe)) {
     return { code: "GOOGLE_QUOTA_EXHAUSTED", status, retryable: false, message: "Google временно остановил генерацию из-за квоты или лимита расходов текущего уровня. Готовые кадры сохранены; продолжите проект после восстановления лимита." };
   }
   if (status === 429) {

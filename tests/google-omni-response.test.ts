@@ -341,6 +341,11 @@ describe("Google Omni response parsing", () => {
     expect(normalizeGoogleProviderError({ status: 429, message: "RESOURCE_EXHAUSTED: spend limit for billing tier 1" }).code)
       .toBe("GOOGLE_QUOTA_EXHAUSTED");
   });
+  it("treats a generic RESOURCE_EXHAUSTED response as a retryable short rate window", () => {
+    const normalized = normalizeGoogleProviderError({ status: 429, message: "RESOURCE_EXHAUSTED: requests per minute quota exceeded. Retry in 42 seconds." });
+    expect(normalized.code).toBe("GOOGLE_RATE_LIMIT");
+    expect(normalized.retryable).toBe(true);
+  });
 
   it("classifies only an explicit depleted Prepay balance as billing", () => {
     expect(normalizeGoogleProviderError({ status: 400, message: "Your prepayment credits are depleted" }).code)
