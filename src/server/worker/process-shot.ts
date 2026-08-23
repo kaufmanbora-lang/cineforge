@@ -27,7 +27,7 @@ interface JobRow {
   shot_id: string;
   attempt: number;
   max_attempts: number;
-  payload: { providerModelId?: string; editCommand?: string; shot: { durationSeconds: number; generationPrompt?: { prompt: string; negativeDirectives: string[]; seed: number | null }; continuity: ContinuityState; audioContext?: AudioContext }; specHash: string };
+  payload: { providerModelId?: string; omitProviderReferences?: boolean; editCommand?: string; shot: { durationSeconds: number; generationPrompt?: { prompt: string; negativeDirectives: string[]; seed: number | null }; continuity: ContinuityState; audioContext?: AudioContext }; specHash: string };
   model_id: string;
   resolution: Resolution;
   aspect_ratio: "16:9" | "9:16";
@@ -112,7 +112,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       const apiKey = await getProviderKey("google");
       if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
       providerApiKey = apiKey;
-      const references = await loadShotReferences(job, effectiveModelId);
+      const references = job.payload.omitProviderReferences ? [] : await loadShotReferences(job, effectiveModelId);
       // Google only accepts previous_interaction_id for a conversational edit.
       // A normal reference-to-video generation must continue from the extracted
       // final frame without attaching the interaction id (otherwise HTTP 400).
@@ -237,6 +237,14 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`Shot provider failure ${job.id}: ${failure}: ${message}\n`);
     await withDurableDatabaseRetry(() => settleFailedReservation(job.id, job.project_id, providerCompleted));
+    if (failure === "moderation"
+      && (job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni")
+      && job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")) {
+      const nextPayload = veoSafeBridgePayload(job.payload);
+      await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_VEO_SAFE_BRIDGE"));
+      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
+      return { cached: false, storageKey: "", retrying: true };
+    }
     if (failure === "moderation" && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE SAFETY RETRY")) {
       const nextPayload = moderationRetryPayload(job.payload);
       await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message));
@@ -326,6 +334,25 @@ export function veoNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pay
     negativeDirectives: [...generationPrompt.negativeDirectives, "violence", "dangerous driving", "logos", "public figures"],
   } };
   return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", shot, specHash: contentHash({ shot, providerModelId: "veo-3.1-fast-generate-preview", neutralRescue: 1 }) };
+}
+
+export function veoSafeBridgePayload(payload: JobRow["payload"]): JobRow["payload"] {
+  if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO SAFE BRIDGE")) return payload;
+  const generationPrompt = payload.shot.generationPrompt;
+  if (!generationPrompt) return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", omitProviderReferences: true };
+  const prompt = "Create one continuous photorealistic live-action continuity bridge at the same established location and time of day. Hold on stable architectural details, the doorway, furniture and persistent vehicles or props already established by the story. Nearby adult characters continue ordinary calm movement naturally through the space with relaxed body language and natural eyelines. Preserve solid geometry, realistic door hinges, object permanence, camera axis and screen direction. Clean ambient sound begins at zero and ends inside this clip. Plain surfaces contain no readable text. CINEFORGE VEO SAFE BRIDGE.";
+  const shot = { ...payload.shot, generationPrompt: {
+    ...generationPrompt,
+    prompt,
+    negativeDirectives: ["cartoon look", "camera eye contact", "teleportation", "geometry intersection", "disappearing objects", "readable text"],
+  } };
+  return {
+    ...payload,
+    providerModelId: "veo-3.1-fast-generate-preview",
+    omitProviderReferences: true,
+    shot,
+    specHash: contentHash({ shot, providerModelId: "veo-3.1-fast-generate-preview", safeBridge: 1 }),
+  };
 }
 
 function shouldSwitchFilteredVeoToOmni(job: JobRow): boolean {

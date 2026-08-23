@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
+import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, resumableProviderOperation, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
@@ -214,6 +214,15 @@ describe("Google Omni response parsing", () => {
     expect(rescued.specHash).not.toBe(omni.specHash);
     expect(rescued.shot.generationPrompt?.prompt).toContain("CINEFORGE VEO NEUTRAL RESCUE");
     expect(veoNeutralRescuePayload(rescued)).toBe(rescued);
+  });
+
+  it("uses a reference-free Veo bridge after a filtered neutral Omni frame", () => {
+    const neutral = omniNeutralRescuePayload({ shot: { ...shot("shot-safe-bridge"), generationPrompt: shot("shot-safe-bridge").generationPrompt! }, specHash: "original" });
+    const bridge = veoSafeBridgePayload(neutral);
+    expect(bridge.providerModelId).toBe("veo-3.1-fast-generate-preview");
+    expect(bridge.omitProviderReferences).toBe(true);
+    expect(bridge.shot.generationPrompt?.prompt).toContain("CINEFORGE VEO SAFE BRIDGE");
+    expect(veoSafeBridgePayload(bridge)).toBe(bridge);
   });
 
   it("resumes a persisted SDK polling failure without starting a second paid generation", () => {
