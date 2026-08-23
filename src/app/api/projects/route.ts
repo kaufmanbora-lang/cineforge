@@ -46,7 +46,7 @@ export async function GET(request: Request) {
     if (!project) return NextResponse.json({ error: "Проект не найден." }, { status: 404 });
     const [plan, jobs, checkpoints, timeline, versions, exports, characters, locations] = await Promise.all([
       latestMoviePlan(projectId),
-      query("SELECT id,type,state,scene_id,shot_id,attempt,max_attempts,last_error,created_at,updated_at FROM jobs WHERE project_id=$1 ORDER BY created_at DESC LIMIT 500", [projectId]),
+      query("SELECT id,type,state,scene_id,shot_id,attempt,max_attempts,last_error,created_at,updated_at,started_at,completed_at FROM jobs WHERE project_id=$1 ORDER BY created_at DESC LIMIT 500", [projectId]),
       query("SELECT sequence,event_type,completed_shot_ids,failed_shot_ids,pending_shot_ids,current_job_id,created_at FROM checkpoints WHERE project_id=$1 ORDER BY sequence DESC LIMIT 100", [projectId]),
       query("SELECT id,scene_id,shot_id,track,start_seconds,duration_seconds,source_version,metadata FROM timeline_clips WHERE project_id=$1 AND enabled=true ORDER BY start_seconds,track", [projectId]),
       query("SELECT sv.shot_id,sv.version,sv.reason,sv.continuity_score,sv.qc_report,sv.active,sv.created_at FROM shot_versions sv JOIN shots s ON s.id=sv.shot_id WHERE s.project_id=$1 ORDER BY sv.created_at DESC", [projectId]),

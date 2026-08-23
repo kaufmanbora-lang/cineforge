@@ -168,6 +168,7 @@ a { color: inherit; text-decoration: none; }
 .score-card .button { margin-left: auto; }
 .score-card p { margin: 0; color: #bcc5c9; font-size: 10px; line-height: 1.5; }
 .score-card small { color: var(--muted-2); }
+.score-card .eta-value { color: var(--accent); font: 600 15px var(--mono); }
 .checkpoint-card > div { justify-content: space-between; }
 .checkpoint-card p { margin: 8px 10px; color: var(--muted); font-size: 9px; display: flex; gap: 6px; }
 .checkpoint-card svg { color: var(--green); }

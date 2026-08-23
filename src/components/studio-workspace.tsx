@@ -6,13 +6,13 @@ import {
   ImageIcon, Lightbulb, ListVideo, Lock, MessageSquareText, Music2, Play,
   Mic, Sparkles, Square, Subtitles, Volume2, Waves, X, Zap, ZoomIn, ZoomOut,
 } from "lucide-react";
-import { estimateGeneration, formatDuration } from "@/domain/estimation";
+import { estimateGeneration, estimateRemainingGenerationSeconds, formatDuration, formatRemainingGenerationTime } from "@/domain/estimation";
 import { preservePreviewUrls, type MoviePlan, type ProjectRecord, type Scene } from "@/domain/movie";
 import { GOOGLE_VIDEO_MODELS, isNativeResolution, normalizeResolution, type AspectRatio, type Resolution } from "@/domain/video-models";
 import { Button, Segmented, StatusDot } from "./ui";
 import { errorMessageRu, lockLabelRu, projectStatusRu } from "@/lib/ru";
 
-type JobRow = { id: string; type: string; state: string; scene_id: string | null; shot_id: string | null; last_error: unknown };
+type JobRow = { id: string; type: string; state: string; scene_id: string | null; shot_id: string | null; last_error: unknown; created_at: string; updated_at: string; started_at: string | null; completed_at: string | null };
 type CheckpointRow = { sequence: string; event_type: string; completed_shot_ids: string[]; failed_shot_ids: string[]; pending_shot_ids: string[]; created_at: string };
 type DetailPayload = { project: ProjectRecord; plan: MoviePlan | null; jobs: JobRow[]; checkpoints: CheckpointRow[] };
 type PreviewClip = { shot_id: string; scene_id: string; url: string; version: number; continuity_score: string | null };
@@ -41,6 +41,7 @@ export function StudioWorkspace() {
   const [accountModelIds, setAccountModelIds] = useState<Set<string> | null>(null);
   const [timelineZoom, setTimelineZoom] = useState(100);
   const [voiceState, setVoiceState] = useState<"recording" | "transcribing" | null>(null);
+  const [etaClockMs, setEtaClockMs] = useState(0);
   const videoRef = useRef<HTMLVideoElement>(null);
   const autoContinueRef = useRef(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -58,6 +59,7 @@ export function StudioWorkspace() {
   const activeJobs = detail?.jobs.filter((job) => ["queued","generating","validating","retrying"].includes(job.state)) ?? [];
   const latestCheckpoint = detail?.checkpoints[0];
   const progress = detail?.project.progress ?? 0;
+  const productionStatus = detail?.project.status ?? "";
 
   const loadProject = useCallback(async (id: string, quiet = false) => {
     if (!id) return;
@@ -122,6 +124,12 @@ export function StudioWorkspace() {
     const interval = window.setInterval(() => void loadProject(projectId, true), 2_500);
     return () => window.clearInterval(interval);
   }, [detail, loadProject, projectId]);
+
+  useEffect(() => {
+    if (!["planning","queued","generating","validating","assembling"].includes(productionStatus)) return;
+    const interval = window.setInterval(() => setEtaClockMs(Date.now()), 1_000);
+    return () => window.clearInterval(interval);
+  }, [productionStatus]);
 
   useEffect(() => {
     if (!autoContinueRef.current || !selectedPreview) return;
@@ -244,6 +252,14 @@ export function StudioWorkspace() {
   const costOverBudget = estimate.estimatedTotalUsd > budget;
   const productionActive = Boolean(detail && ["planning","queued","generating","validating","assembling"].includes(detail.project.status));
   const productionComplete = detail?.project.status === "completed";
+  const etaSeconds = detail ? estimateRemainingGenerationSeconds({
+    jobs: detail.jobs,
+    completedShots: detail.project.completedShots,
+    totalShots: detail.project.totalShots,
+    status: detail.project.status,
+    modelId: detail.project.modelId,
+    nowMs: etaClockMs,
+  }) : null;
 
   return <div className="studio-grid">
     <section className="brief-panel" aria-label="Описание фильма">
@@ -269,7 +285,7 @@ export function StudioWorkspace() {
       <div className="seek-line"><i style={{ width: `${progress}%` }}/><b style={{ left: `${progress}%` }}/></div>
     </section>
 
-    <aside className="production-panel"><div className="panel-tabs">{(["overview","scenes","memory"] as const).map((tab) => <button className={rightTab === tab ? "active" : ""} key={tab} onClick={() => setRightTab(tab)} type="button">{{ overview: "Обзор", scenes: "Сцены", memory: "Память" }[tab]}</button>)}</div>{rightTab === "overview" ? <ProductionOverview detail={detail} onShowScenes={() => setRightTab("scenes")} selectedSceneId={selectedScene?.id ?? ""} setSelectedSceneId={setSelectedSceneId}/> : null}{rightTab === "scenes" ? <SceneList scenes={scenes} selectedSceneId={selectedScene?.id ?? ""} setSelectedSceneId={setSelectedSceneId}/> : null}{rightTab === "memory" ? <MemorySummary plan={plan}/> : null}</aside>
+    <aside className="production-panel"><div className="panel-tabs">{(["overview","scenes","memory"] as const).map((tab) => <button className={rightTab === tab ? "active" : ""} key={tab} onClick={() => setRightTab(tab)} type="button">{{ overview: "Обзор", scenes: "Сцены", memory: "Память" }[tab]}</button>)}</div>{rightTab === "overview" ? <ProductionOverview detail={detail} etaSeconds={etaSeconds} onShowScenes={() => setRightTab("scenes")} selectedSceneId={selectedScene?.id ?? ""} setSelectedSceneId={setSelectedSceneId}/> : null}{rightTab === "scenes" ? <SceneList scenes={scenes} selectedSceneId={selectedScene?.id ?? ""} setSelectedSceneId={setSelectedSceneId}/> : null}{rightTab === "memory" ? <MemorySummary plan={plan}/> : null}</aside>
 
     <section className="timeline-panel" aria-label="Монтажная шкала фильма"><div className="timeline-toolbar"><div><strong>ГЛАВНАЯ МОНТАЖНАЯ ШКАЛА</strong></div><strong className="timeline-time">{selectedScene ? formatTimecode(sceneStart(scenes, selectedScene.id)) : "00:00:00"} / {formatTimecode(duration)}</strong><div><button aria-label="Уменьшить масштаб" onClick={() => setTimelineZoom((value) => Math.max(50,value-25))} type="button"><ZoomOut size={15}/></button><input aria-label="Масштаб монтажной шкалы" max="250" min="50" onChange={(event) => setTimelineZoom(Number(event.target.value))} type="range" value={timelineZoom}/><button aria-label="Увеличить масштаб" onClick={() => setTimelineZoom((value) => Math.min(250,value+25))} type="button"><ZoomIn size={15}/></button></div></div><div className="time-ruler">{[0,.2,.4,.6,.8,1].map((ratio) => <span key={ratio}>{formatTimecode(duration*ratio)}</span>)}</div><div className="tracks" style={{ minWidth: `${timelineZoom}%` }}><div className="playhead" style={{ left: `${selectedScene && duration ? sceneStart(scenes,selectedScene.id)/duration*100 : 0}%` }}><i/></div>{tracks.map((track) => <TimelineTrack key={track.label} track={track} selectedSceneId={selectedScene?.id ?? ""} setSelectedSceneId={setSelectedSceneId}/>)}</div></section>
 
@@ -279,7 +295,7 @@ export function StudioWorkspace() {
   </div>;
 }
 
-function ProductionOverview({ detail, selectedSceneId, setSelectedSceneId, onShowScenes }: { detail: DetailPayload | null; selectedSceneId: string; setSelectedSceneId: (id: string) => void; onShowScenes: () => void }) {
+function ProductionOverview({ detail, etaSeconds, selectedSceneId, setSelectedSceneId, onShowScenes }: { detail: DetailPayload | null; etaSeconds: number | null; selectedSceneId: string; setSelectedSceneId: (id: string) => void; onShowScenes: () => void }) {
   const plan = detail?.plan; const status = detail?.project.status; const jobs = detail?.jobs ?? []; const checkpoints = detail?.checkpoints ?? [];
   const stages = [
     ["История", plan ? "complete" : "waiting"], ["Персонажи", plan?.characters.length ? "complete" : "waiting"], ["Раскадровка", plan?.scenes.length ? "complete" : "waiting"],
@@ -287,7 +303,7 @@ function ProductionOverview({ detail, selectedSceneId, setSelectedSceneId, onSho
     ["Согласованность", jobs.some((job) => job.state === "validating") ? "active" : status === "completed" ? "complete" : "waiting"],
     ["Монтаж", status === "assembling" ? "active" : status === "completed" ? "complete" : "waiting"], ["Финальный контроль", status === "completed" ? "complete" : "waiting"],
   ];
-  return <div className="production-content"><h2>Этапы производства</h2><div className="stage-list">{stages.map(([name,state]) => <div key={name}><span className={`stage-icon ${state}`}>{state === "complete" ? <Check size={12}/> : state === "active" ? <span/> : <Square size={10}/>}</span><strong>{name}</strong><em>{state === "active" ? "В работе" : state === "complete" ? "Готово" : "Ожидание"}</em></div>)}</div><div className="score-card"><span>Состояние проекта</span><div><Lightbulb size={20}/><p>{detail ? `Готово: ${detail.project.completedShots} · осталось: ${detail.project.totalShots-detail.project.completedShots}` : "Сначала создайте план фильма"}<br/><small>Ошибок заданий: {jobs.filter((job) => job.state === "failed").length}</small></p></div></div><div className="checkpoint-card"><div><span>Постоянные контрольные точки</span></div><p><Check size={13}/>{checkpoints.length ? `Загружено контрольных точек: ${checkpoints.length}; последняя последовательность ${checkpoints[0].sequence}` : "Контрольная точка кадров ещё не создана"}</p></div><h2>Сцены</h2><div className="scene-strip">{(plan?.scenes ?? []).slice(0,4).map((scene) => <button className={selectedSceneId === scene.id ? "selected" : ""} key={scene.id} onClick={() => setSelectedSceneId(scene.id)} type="button"><span className="resource-placeholder"><Film size={16}/></span><strong>Сцена {scene.number}</strong><small>{formatTimecode(scene.durationSeconds)}</small></button>)}</div>{(plan?.scenes.length ?? 0) > 4 ? <Button className="wide-inline" onClick={onShowScenes} variant="ghost">Открыть все сцены: {plan?.scenes.length}</Button> : null}</div>;
+  return <div className="production-content"><h2>Этапы производства</h2><div className="stage-list">{stages.map(([name,state]) => <div key={name}><span className={`stage-icon ${state}`}>{state === "complete" ? <Check size={12}/> : state === "active" ? <span/> : <Square size={10}/>}</span><strong>{name}</strong><em>{state === "active" ? "В работе" : state === "complete" ? "Готово" : "Ожидание"}</em></div>)}</div><div className="score-card"><span>Состояние проекта</span><div><Lightbulb size={20}/><p>{detail ? `Готово: ${detail.project.completedShots} · осталось: ${detail.project.totalShots-detail.project.completedShots}` : "Сначала создайте план фильма"}{etaSeconds !== null ? <><br/><strong className="eta-value">{formatRemainingGenerationTime(etaSeconds)}</strong><small> до готовности</small></> : detail && ["paused","failed"].includes(detail.project.status) ? <><br/><small>Расчёт продолжится после возобновления.</small></> : null}<br/><small>Ошибок заданий: {jobs.filter((job) => job.state === "failed").length}</small></p></div></div><div className="checkpoint-card"><div><span>Постоянные контрольные точки</span></div><p><Check size={13}/>{checkpoints.length ? `Загружено контрольных точек: ${checkpoints.length}; последняя последовательность ${checkpoints[0].sequence}` : "Контрольная точка кадров ещё не создана"}</p></div><h2>Сцены</h2><div className="scene-strip">{(plan?.scenes ?? []).slice(0,4).map((scene) => <button className={selectedSceneId === scene.id ? "selected" : ""} key={scene.id} onClick={() => setSelectedSceneId(scene.id)} type="button"><span className="resource-placeholder"><Film size={16}/></span><strong>Сцена {scene.number}</strong><small>{formatTimecode(scene.durationSeconds)}</small></button>)}</div>{(plan?.scenes.length ?? 0) > 4 ? <Button className="wide-inline" onClick={onShowScenes} variant="ghost">Открыть все сцены: {plan?.scenes.length}</Button> : null}</div>;
 }
 function SceneList({ scenes, selectedSceneId, setSelectedSceneId }: { scenes: Scene[]; selectedSceneId: string; setSelectedSceneId: (id: string) => void }) { return <div className="production-content"><h2>Граф сцен</h2><div className="inspector-list">{scenes.map((scene) => <button className={selectedSceneId === scene.id ? "selected" : ""} key={scene.id} onClick={() => setSelectedSceneId(scene.id)} type="button"><ListVideo size={15}/><span><strong>Сцена {scene.number}</strong><small>{scene.title}</small></span><em>{formatTimecode(scene.durationSeconds)}</em></button>)}</div>{!scenes.length ? <p className="field-help">Сценарий ещё не создан.</p> : null}</div>; }
 function MemorySummary({ plan }: { plan: MoviePlan | null | undefined }) { const facts = [...(plan?.characters ?? []).flatMap((character) => Object.entries(character.locks).filter(([,locked]) => locked).map(([key]) => `${character.name} · ${lockLabelRu(key)}`)), ...(plan?.locations ?? []).filter((location) => location.designLocked).map((location) => `${location.name} · ${lockLabelRu("design")}`)]; return <div className="production-content"><h2>Заблокированные параметры памяти</h2><div className="memory-facts">{facts.map((fact) => <p key={fact}><Lock size={13}/>{fact}</p>)}{!facts.length ? <p>Параметры согласованности не заблокированы.</p> : null}</div><div className="score-card"><span>Сборщик контекста</span><div><Lightbulb size={20}/><p>{plan ? `Персонажей: ${plan.characters.length} · локаций: ${plan.locations.length}` : "Память проекта ещё не создана"}<br/><small>Для каждого кадра передаётся только относящийся к нему контекст.</small></p></div></div></div>; }

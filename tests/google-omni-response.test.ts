@@ -11,8 +11,8 @@ describe("Google Omni response parsing", () => {
     expect(googleOmniVideoTask({ previousInteractionId: "v1_previous", editInstruction: "Make the coat grey", references: [] })).toBeUndefined();
     expect(googleOmniVideoTask({ previousInteractionId: undefined, editInstruction: undefined, references: [{ id: "previous-frame", data: "AAAA", mimeType: "image/jpeg", role: "first-frame" }] })).toBe("reference_to_video");
   });
-  it("uses Google's low-latency non-stored path only for ordinary fast drafts", () => {
-    expect(googleOmniShouldStore({ fastMode: true })).toBe(false);
+  it("always stores URI-delivered Omni video, including fast drafts", () => {
+    expect(googleOmniShouldStore({ fastMode: true })).toBe(true);
     expect(googleOmniShouldStore({ fastMode: false })).toBe(true);
     expect(googleOmniShouldStore({ fastMode: true, previousInteractionId: "v1", editInstruction: "Change the coat" })).toBe(true);
   });
