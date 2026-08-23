@@ -240,7 +240,35 @@ export async function resumeProjectJobs(projectId: string, options: { manual?: b
     const bullId = createHash("sha256").update(`${row.idempotency_key}:resume:${randomUUID()}`).digest("hex");
     await movieQueue().add(row.type, { databaseJobId: row.id }, { jobId: bullId });
   }
-  return rows.length + await enqueueReadyProjectJobs(projectId);
+  const resumed = rows.length + await enqueueReadyProjectJobs(projectId);
+  // A project may contain every generated shot but have a failed/stale assembly
+  // job. Resume must finish the free local assembly instead of returning zero
+  // and leaving the UI at 100% with a terminal error.
+  if (!resumed) await enqueueAutomaticAssemblyIfReady(projectId);
+  return resumed;
+}
+
+export async function recoverCompletedShotProjects(): Promise<number> {
+  const rows = await query<{ id: string }>(
+    `SELECT p.id FROM projects p
+     WHERE p.status IN ('paused','failed','generating','validating','assembling')
+       AND COALESCE(p.last_error->>'code','') <> 'FINAL_QC_FAILED'
+       AND EXISTS (SELECT 1 FROM shots s WHERE s.project_id=p.id AND s.state<>'cancelled')
+       AND NOT EXISTS (SELECT 1 FROM shots s WHERE s.project_id=p.id AND s.state NOT IN ('completed','cancelled'))
+       AND NOT EXISTS (
+         SELECT 1 FROM jobs j WHERE j.project_id=p.id AND j.type='assemble-movie' AND j.state='failed'
+           AND (j.attempt>=j.max_attempts OR COALESCE(j.last_error->>'code','')='FINAL_QC_FAILED')
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM jobs j WHERE j.project_id=p.id AND j.type='dialogue-patch'
+           AND j.state IN ('planned','queued','retrying','generating','validating')
+       )`,
+  );
+  let recovered = 0;
+  for (const row of rows) {
+    if (await enqueueAutomaticAssemblyIfReady(row.id)) recovered += 1;
+  }
+  return recovered;
 }
 
 export async function enqueueDialoguePatch(input: {
@@ -346,7 +374,8 @@ export async function enqueueAutomaticAssemblyIfReady(projectId: string): Promis
     `SELECT p.resolution,
        count(s.id) FILTER (WHERE s.state='completed')::int completed,
        count(s.id) FILTER (WHERE s.state<>'cancelled')::int total,
-       (SELECT count(*)::int FROM jobs j WHERE j.project_id=p.id AND j.type='dialogue-patch' AND j.state NOT IN ('completed','cancelled','failed')) active_audio
+       (SELECT count(*)::int FROM jobs j WHERE j.project_id=p.id AND j.type='dialogue-patch'
+          AND j.state IN ('planned','queued','retrying','generating','validating')) active_audio
      FROM projects p LEFT JOIN shots s ON s.project_id=p.id WHERE p.id=$1 GROUP BY p.id`,
     [projectId],
   );

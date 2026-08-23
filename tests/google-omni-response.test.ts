@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
-import { extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
+import { extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniInteractionRequest, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
 import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
@@ -17,10 +17,53 @@ describe("Google Omni response parsing", () => {
     expect(googleOmniShouldStore({ fastMode: false })).toBe(true);
     expect(googleOmniShouldStore({ fastMode: true, previousInteractionId: "v1", editInstruction: "Change the coat" })).toBe(true);
   });
+  it("keeps store=true in every real Omni request shape that delivers video by URI", () => {
+    const plannedShot = shot("shot-omni-request");
+    const base = {
+      projectId: "project-1",
+      sceneId: plannedShot.sceneId,
+      shotId: plannedShot.id,
+      modelId: "gemini-omni-flash-preview",
+      prompt: plannedShot.generationPrompt!.prompt,
+      negativeDirectives: [],
+      durationSeconds: 5,
+      resolution: "1080p" as const,
+      aspectRatio: "16:9" as const,
+      seed: null,
+      references: [],
+      fastMode: true,
+    };
+    const textRequest = googleOmniInteractionRequest(base);
+    expect(textRequest.store).toBe(true);
+    expect(textRequest.response_format).toMatchObject({ type: "video", delivery: "uri" });
+
+    const referenceRequest = googleOmniInteractionRequest({
+      ...base,
+      references: [{ id: "first", role: "first-frame", data: "AAAA", mimeType: "image/jpeg" }],
+    });
+    expect(referenceRequest.store).toBe(true);
+    expect(referenceRequest.generation_config).toEqual({ video_config: { task: "image_to_video" } });
+
+    const editRequest = googleOmniInteractionRequest({
+      ...base,
+      previousInteractionId: "interaction-1",
+      editInstruction: "Change only the coat colour",
+    });
+    expect(editRequest.store).toBe(true);
+    expect(editRequest.previous_interaction_id).toBe("interaction-1");
+    expect(editRequest.generation_config).toBeUndefined();
+  });
   it("turns an Omni Files API resource URI into the official media download endpoint", () => {
     expect(googleFileDownloadUrl("files/omni-output_123")).toBe("https://generativelanguage.googleapis.com/v1beta/files/omni-output_123:download?alt=media");
     expect(googleFileDownloadUrl("https://generativelanguage.googleapis.com/v1beta/files/omni-output_123"))
       .toBe("https://generativelanguage.googleapis.com/v1beta/files/omni-output_123:download?alt=media");
+  });
+  it("uses a numeric fallback when the SDK status is a symbolic Google status", () => {
+    expect(normalizeGoogleProviderError({ status: "RESOURCE_EXHAUSTED", code: 429, message: "Please retry later" }))
+      .toMatchObject({ code: "GOOGLE_RATE_LIMIT", status: 429, retryable: true });
+  });
+  it("classifies a policy rejection before a generic 403 permission error", () => {
+    expect(normalizeGoogleProviderError({ status: 403, message: "Blocked by safety policy" }).code).toBe("GOOGLE_MODERATION");
   });
   it("does not send the Enterprise-only seed parameter to Gemini Developer API", () => {
     const plannedShot = shot("shot-1");

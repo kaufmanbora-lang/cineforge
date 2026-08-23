@@ -379,35 +379,19 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
   async start(request: VideoGenerationRequest, apiKey: string): Promise<ProviderOperation> {
     const ai = new GoogleGenAI({ apiKey });
     try {
-      const statefulEdit = Boolean(request.previousInteractionId && request.editInstruction);
-      const input: Array<Record<string, unknown>> = request.references.map((reference) => ({
-        type: "image",
-        data: reference.data,
-        mime_type: reference.mimeType,
-      }));
-      input.push({ type: "text", text: statefulEdit ? request.editInstruction! : request.prompt });
-      const videoTask = googleOmniVideoTask(request);
-      const interaction = await ai.interactions.create({
-        model: request.modelId,
-        // A stateful edit already has the original generated video in its
-        // interaction history. Supplying reference images or video_config at
-        // the same time is rejected by the official API.
-        input: statefulEdit ? request.editInstruction! : request.references.length ? input : request.prompt,
-        previous_interaction_id: statefulEdit ? request.previousInteractionId : undefined,
-        // Unary generation is the lowest-latency official Interactions path.
-        // URI video delivery requires storage even in Fast Draft mode.
-        background: false,
-        stream: false,
-        store: googleOmniShouldStore(request),
-        response_format: {
-          type: "video",
-          aspect_ratio: request.aspectRatio,
-          // Official URI delivery prevents a large base64 MP4 from occupying
-          // the worker heap and is supported for every Omni video response.
-          delivery: "uri",
+      const interaction = await ai.interactions.create(
+        googleOmniInteractionRequest(request) as never,
+        {
+          // CineForge owns the durable, bounded retry policy. The SDK defaults
+          // to four additional retries for 429/5xx responses; stacking those
+          // retries multiplied requests and prolonged account rate limits.
+          maxRetries: 0,
+          // Omni is a unary video request. Give the official service enough
+          // time for its documented long generation latency, but never allow a
+          // lost HTTP response to hold a worker slot forever.
+          timeout: 15 * 60_000,
         },
-        generation_config: videoTask ? { video_config: { task: videoTask } } : undefined,
-      } as never);
+      );
       const raw = interaction as unknown as {
         id?: string;
         output_video?: { data?: string; uri?: string; mime_type?: string };
@@ -440,6 +424,36 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
   async poll(operation: ProviderOperation): Promise<ProviderOperation> {
     return operation;
   }
+}
+
+export function googleOmniInteractionRequest(request: VideoGenerationRequest): Record<string, unknown> {
+  const statefulEdit = Boolean(request.previousInteractionId && request.editInstruction);
+  const input: Array<Record<string, unknown>> = request.references.map((reference) => ({
+    type: "image",
+    data: reference.data,
+    mime_type: reference.mimeType,
+  }));
+  input.push({ type: "text", text: statefulEdit ? request.editInstruction! : request.prompt });
+  const videoTask = googleOmniVideoTask(request);
+  return {
+    model: request.modelId,
+    // A stateful edit already has the original generated video in its
+    // interaction history. Supplying reference images or video_config at the
+    // same time is rejected by the official API.
+    input: statefulEdit ? request.editInstruction! : request.references.length ? input : request.prompt,
+    previous_interaction_id: statefulEdit ? request.previousInteractionId : undefined,
+    background: false,
+    stream: false,
+    // URI delivery is invalid unless store=true. Keep this invariant in the
+    // single request builder used by normal, retry, rescue and edit flows.
+    store: googleOmniShouldStore(request),
+    response_format: {
+      type: "video",
+      aspect_ratio: request.aspectRatio,
+      delivery: "uri",
+    },
+    generation_config: videoTask ? { video_config: { task: videoTask } } : undefined,
+  };
 }
 
 export function googleOmniVideoTask(request: Pick<VideoGenerationRequest, "previousInteractionId" | "editInstruction" | "references">): "image_to_video" | "reference_to_video" | "text_to_video" | undefined {
@@ -529,8 +543,9 @@ function failedOperation(modelId: string, error: unknown, operationId = `failed-
 
 export function normalizeGoogleProviderError(error: unknown): { code: string; message: string; retryable: boolean; status?: number } {
   const record = typeof error === "object" && error ? error as Record<string, unknown> : {};
-  const rawStatus = record.status ?? record.statusCode ?? record.httpStatus ?? (typeof record.code === "number" ? record.code : undefined);
-  const status = rawStatus === undefined ? undefined : Number(rawStatus);
+  const status = [record.status, record.statusCode, record.httpStatus, record.code]
+    .map((value) => typeof value === "number" || (typeof value === "string" && /^\d{3}$/.test(value)) ? Number(value) : undefined)
+    .find((value) => value !== undefined && Number.isFinite(value));
   const rawMessage = error instanceof Error ? error.message : typeof record.message === "string" ? record.message : String(error ?? "");
   const providerMessage = typeof record.providerMessage === "string" ? record.providerMessage : "";
   const probe = `${String(record.code ?? "")} ${rawMessage} ${providerMessage}`.toLowerCase();
@@ -553,6 +568,9 @@ export function normalizeGoogleProviderError(error: unknown): { code: string; me
   if (/prepay(?:ment|paid)? credits? (?:are |is )?(?:depleted|exhausted|unavailable)|no (?:available )?(?:prepay )?credits|set up prepay|billing (?:account )?(?:is )?(?:inactive|not active|not enabled|unsupported)|payment required|credit balance (?:is )?(?:zero|0|depleted|exhausted)/.test(probe)) {
     return { code: "GOOGLE_BILLING_NOT_READY", status, retryable: false, message: "Google сообщил, что Prepay недоступен для проекта этого ключа. Готовые кадры сохранены. Проверьте статус Paid/Prepay этого проекта в Google AI Studio и после обновления продолжите с контрольной точки." };
   }
+  if (/safety|moderation|blocked|policy/.test(probe)) {
+    return { code: "GOOGLE_MODERATION", status, retryable: false, message: "Google отклонил этот кадр по правилам безопасности. Исправьте только проблемную сцену или её prompt." };
+  }
   if (status === 403 || /permission_denied|access restricted|permission/.test(probe)) {
     return { code: "GOOGLE_PERMISSION_DENIED", status, retryable: false, message: "У проекта Google нет доступа к выбранной видеомодели. Проверьте платный уровень, регион, права проекта и ограничения ключа." };
   }
@@ -564,9 +582,6 @@ export function normalizeGoogleProviderError(error: unknown): { code: string; me
   }
   if ((status && status >= 500) || /service_unavailable|api_error|server error/.test(probe)) {
     return { code: "GOOGLE_SERVER_ERROR", status, retryable: true, message: "Видеосервис Google временно недоступен. CineForge повторит запрос с ограниченной автоматической задержкой." };
-  }
-  if (/safety|moderation|blocked|policy/.test(probe)) {
-    return { code: "GOOGLE_MODERATION", status, retryable: false, message: "Google отклонил этот кадр по правилам безопасности. Исправьте только проблемную сцену или её prompt." };
   }
   return { code: "GOOGLE_REQUEST_FAILED", status, retryable: isRetryableCode(status), message: rawMessage ? `Google не выполнил запрос: ${rawMessage.slice(0, 500)}` : "Google не выполнил запрос по неизвестной причине." };
 }

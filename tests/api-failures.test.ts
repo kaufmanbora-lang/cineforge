@@ -18,6 +18,14 @@ describe("API failure policy", () => {
     expect(retryDecision({ failure: "rate-limit", attempt: 1, maxAttempts: 3, baseMs: 15_000 })).toEqual({ retry: true, pauseProject: false, delayMs: 34_500 });
     expect(retryDecision({ failure: "rate-limit", attempt: 3, maxAttempts: 3, baseMs: 15_000 })).toEqual({ retry: false, pauseProject: true, delayMs: 0 });
   });
+  it("recognizes a numeric 429 when the Google SDK status field is symbolic", () => {
+    const error = Object.assign(new Error("RESOURCE_EXHAUSTED"), { status: "RESOURCE_EXHAUSTED", code: 429 });
+    expect(classifyFailure(error)).toBe("rate-limit");
+  });
+  it("treats OpenAI insufficient credits as quota instead of a rapid rate retry", () => {
+    const error = Object.assign(new Error("You have no credits remaining"), { status: 429, code: "insufficient_quota" });
+    expect(classifyFailure(error)).toBe("quota");
+  });
   it("does not treat generic billing metadata as a payment failure", () => {
     const error = Object.assign(new Error("Billing metadata failed a different precondition"), { status: 400 });
     expect(classifyFailure(error)).toBe("fatal");

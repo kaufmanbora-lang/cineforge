@@ -21,6 +21,13 @@ import type { PoolClient } from "pg";
 
 type PersistedProviderOperation = ProviderOperation & { specHash?: string; startedAt?: string };
 
+// The current Google API project can accept fewer concurrent Omni video
+// interactions than the worker can process for planning, storage and FFmpeg.
+// Serializing Omni shot attempts prevents parallel 429s while preserving the
+// normal worker concurrency for planning, assembly and asynchronous Veo LROs.
+let omniProviderTail: Promise<void> = Promise.resolve();
+let omniProviderNotBeforeMs = 0;
+
 interface JobRow {
   id: string;
   project_id: string;
@@ -85,6 +92,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   }, 10_000);
   heartbeat.unref();
   let temporaryProviderFilePath: string | undefined;
+  let releaseOmniProviderSlot: (() => void) | undefined;
   try {
   await query("UPDATE projects SET status='generating',updated_at=now() WHERE id=$1 AND status NOT IN ('completed','cancelled')", [job.project_id]);
   let cached = await findCachedShot(job.project_id, job.shot_id, job.payload.specHash);
@@ -120,6 +128,24 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   // Check the durable provider checkpoint before reserving more budget. A
   // worker/database restart must never charge or reserve the same video twice.
   const staged = await getObjectIfExists(storageKey);
+  if (!staged && effectiveModelId.startsWith("gemini-omni")) {
+    // Hold the slot until the whole shot attempt has persisted its success,
+    // retry or pause state. Releasing immediately after the HTTP response let
+    // the next shot race ahead before a 429 could pause/cool down the project.
+    releaseOmniProviderSlot = await acquireOmniProviderSlot();
+    const runnable = await query<{ runnable: boolean }>(
+      `SELECT (j.state='generating' AND p.status NOT IN ('paused','failed','cancelled','completed')) runnable
+       FROM jobs j JOIN projects p ON p.id=j.project_id WHERE j.id=$1`,
+      [job.id],
+    );
+    if (!runnable[0]?.runnable) {
+      await query(
+        "UPDATE jobs SET state='paused',last_error=$2,updated_at=now() WHERE id=$1 AND state='generating'",
+        [job.id, JSON.stringify({ code: "PROJECT_PAUSED", message: "Платный запрос не отправлен: проект уже поставлен на паузу другим заданием." })],
+      );
+      return { cached: false, storageKey: "", paused: true };
+    }
+  }
   if (!staged && !await reserveBudget(job.id, job.project_id, projectedCost)) {
     const reason = { code: "BUDGET_REACHED", message: "Достигнут максимальный бюджет проекта. Готовые кадры сохранены; увеличьте лимит и продолжите с контрольной точки." };
     await pauseProjectJobs(job.project_id, reason);
@@ -329,6 +355,9 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       maxAttempts: job.max_attempts,
       baseMs: failure === "rate-limit" ? 15_000 : undefined,
     });
+    if (failure === "rate-limit") {
+      omniProviderNotBeforeMs = Math.max(omniProviderNotBeforeMs, Date.now() + Math.max(15_000, decision.delayMs));
+    }
     if (decision.pauseProject) {
       await withDurableDatabaseRetry(() => pauseProjectJobs(job.project_id, { code: failure, message }));
       await withDurableDatabaseRetry(() => query(
@@ -349,8 +378,19 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   }
   } finally {
     clearInterval(heartbeat);
+    releaseOmniProviderSlot?.();
     if (temporaryProviderFilePath) await rm(temporaryProviderFilePath, { force: true }).catch(() => undefined);
   }
+}
+
+async function acquireOmniProviderSlot(): Promise<() => void> {
+  const previous = omniProviderTail;
+  let release!: () => void;
+  omniProviderTail = new Promise<void>((resolve) => { release = resolve; });
+  await previous.catch(() => undefined);
+  const waitMs = Math.max(0, omniProviderNotBeforeMs - Date.now());
+  if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+  return release;
 }
 
 export function moderationRetryPayload(payload: JobRow["payload"]): JobRow["payload"] {

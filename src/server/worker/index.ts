@@ -1,5 +1,5 @@
 import { Worker } from "bullmq";
-import { MOVIE_QUEUE, enqueueAutomaticAssemblyIfReady, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob, resumeProjectJobs } from "@/server/movie/queue";
+import { MOVIE_QUEUE, enqueueAutomaticAssemblyIfReady, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverCompletedShotProjects, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob, resumeProjectJobs } from "@/server/movie/queue";
 import { processShot } from "./process-shot";
 import { processDialoguePatch } from "./process-dialogue";
 import { processAssembly } from "./process-assembly";
@@ -16,6 +16,7 @@ import type { Resolution } from "@/domain/video-models";
 
 await recoverInterruptedJobs();
 await recoverActiveProjects();
+await recoverCompletedShotProjects();
 await reconcileQueuedJobs();
 const settingRows = await query<{ settings: { workerConcurrency?: number } }>("SELECT settings FROM workspace_settings WHERE workspace_id=$1", [env().DEFAULT_WORKSPACE_ID]).catch(() => []);
 // Video payloads are streamed to object storage or a temporary file, so a
@@ -47,7 +48,7 @@ const worker = new Worker(
   { connection: redisConnection(), concurrency: workerConcurrency },
 );
 const reconciliationTimer = setInterval(() => {
-  void Promise.all([reconcileQueuedJobs(), recoverStaleJobs()]).catch((error) => process.stderr.write(`Queue reconciliation failed: ${error instanceof Error ? error.message : String(error)}\n`));
+  void Promise.all([reconcileQueuedJobs(), recoverStaleJobs(), recoverCompletedShotProjects()]).catch((error) => process.stderr.write(`Queue reconciliation failed: ${error instanceof Error ? error.message : String(error)}\n`));
 }, 30_000);
 reconciliationTimer.unref();
 
@@ -124,6 +125,20 @@ async function handleBackgroundFailure(databaseJobId: string, type: string, erro
   const failure = classifyFailure(error);
   const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
   const details = { failure, message: error instanceof Error ? error.message : String(error), jobType: type };
+  if (type === "dialogue-patch") {
+    // Consistent TTS is an enhancement over the already-checkpointed provider
+    // video/audio. A missing OpenAI balance or TTS outage must never convert a
+    // fully generated movie into a failed/paused project. Retry when useful;
+    // otherwise preserve the original shot and continue to local assembly.
+    const retry = decision.retry && !decision.pauseProject;
+    await query(
+      "UPDATE jobs SET state=$2,last_error=$3,available_at=now()+($4::text || ' milliseconds')::interval,completed_at=CASE WHEN $2='failed' THEN now() ELSE NULL END WHERE id=$1",
+      [job.id, retry ? "queued" : "failed", JSON.stringify({ ...details, videoFramesPreserved: true, providerAudioPreserved: true }), decision.delayMs],
+    );
+    if (retry) await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: decision.delayMs, type });
+    else await enqueueAutomaticAssemblyIfReady(job.project_id);
+    return;
+  }
   if (decision.pauseProject) await pauseProjectJobs(job.project_id, details);
   await query(
     "UPDATE jobs SET state=$2,last_error=$3,available_at=now()+($4::text || ' milliseconds')::interval WHERE id=$1",
@@ -136,13 +151,7 @@ async function handleBackgroundFailure(databaseJobId: string, type: string, erro
     );
   }
   if (decision.retry) await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: decision.delayMs, type });
-  if (!decision.pauseProject && !decision.retry && type === "dialogue-patch") {
-    // The provider-generated shot remains usable when deterministic voice
-    // replacement fails. Do not strand a fully generated film in Failed;
-    // assemble the active video/audio version and retain the failed edit job.
-    await enqueueAutomaticAssemblyIfReady(job.project_id);
-  }
-  if (!decision.pauseProject && !decision.retry && type !== "dialogue-patch" && !(type === "assemble-movie" && job.payload.sceneId)) {
+  if (!decision.pauseProject && !decision.retry && !(type === "assemble-movie" && job.payload.sceneId)) {
     await query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify(details)]);
   }
 }

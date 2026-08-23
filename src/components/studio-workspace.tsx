@@ -158,7 +158,31 @@ export function StudioWorkspace() {
   function openProductionConfirmation() {
     if (prompt.trim().length < 10) { setNotice("Описание фильма должно содержать не менее 10 символов."); return; }
     if (accountModelIds && !accountModelIds.has(modelId)) { setNotice("Выбранная видеомодель Google недоступна этому API-ключу."); return; }
+    if (allShotsReady) {
+      void resumeAssemblyOnly();
+      return;
+    }
     setBudgetOpen(true);
+  }
+
+  async function resumeAssemblyOnly() {
+    if (!projectId) return;
+    setBusy("generating");
+    setNotice("Все кадры сохранены. Запускаю только монтаж и финальную проверку без новой видеогенерации…");
+    try {
+      const response = await fetch(`/api/projects/${projectId}/resume`, {
+        method: "POST",
+        signal: AbortSignal.timeout(30_000),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(errorMessageRu(payload.error, "Не удалось продолжить монтаж."));
+      await loadProject(projectId, true);
+    } catch (error) {
+      await loadProject(projectId, true);
+      setNotice(errorMessageRu(error, "Монтаж сохранён и будет продолжен после восстановления очереди."));
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function toggleVoiceInput() {
@@ -265,6 +289,7 @@ export function StudioWorkspace() {
   const costOverBudget = estimate.estimatedTotalUsd > budget;
   const productionActive = Boolean(detail && ["planning","queued","generating","validating","assembling"].includes(detail.project.status));
   const productionComplete = detail?.project.status === "completed";
+  const allShotsReady = Boolean(detail && detail.project.totalShots > 0 && detail.project.completedShots >= detail.project.totalShots);
   const etaSeconds = detail ? estimateRemainingGenerationSeconds({
     jobs: detail.jobs,
     completedShots: detail.project.completedShots,
@@ -287,7 +312,7 @@ export function StudioWorkspace() {
         <label className="toggle-row"><span><Zap size={15}/>Быстрый черновик</span><button aria-pressed={draft} className={draft ? "toggle on" : "toggle"} disabled={Boolean(plan)} onClick={() => setDraft((value) => !value)} type="button"><i/></button></label>
       </div>
       <div className="estimate-lines"><div><span>Примерно кадров</span><strong>{estimate.shots}</strong></div><div><span>Генерация видео</span><strong>${estimate.videoUsd.toFixed(2)}</strong></div><div><span>Звук</span><strong>${estimate.audioUsd.toFixed(2)}</strong></div><div><span>Резерв на повторы</span><strong>${estimate.retriesReserveUsd.toFixed(2)}</strong></div><div className="budget-line"><span>Максимальный бюджет</span><label>$<input aria-label="Максимальный бюджет генерации" min="0" onChange={(event) => setBudget(Math.max(0, Number(event.target.value) || 0))} type="number" value={budget}/></label></div></div>
-      <Button className="plan-button" disabled={prompt.trim().length < 10 || busy !== null || productionActive || productionComplete} loading={busy !== null} onClick={openProductionConfirmation} variant="primary">{productionComplete ? "Фильм готов" : detail?.project.status === "planning" ? "Сценарий создаётся в фоне" : productionActive ? "Производство запущено" : detail?.project.status === "paused" ? "Продолжить с остановленного кадра" : detail?.project.status === "failed" ? "Повторить без потери готовых кадров" : plan ? "Продолжить и создать фильм" : "Создать фильм"}<Clapperboard size={16}/></Button>
+      <Button className="plan-button" disabled={prompt.trim().length < 10 || busy !== null || productionActive || productionComplete} loading={busy !== null} onClick={openProductionConfirmation} variant="primary">{productionComplete ? "Фильм готов" : detail?.project.status === "planning" ? "Сценарий создаётся в фоне" : productionActive ? "Производство запущено" : allShotsReady ? "Собрать готовые кадры" : detail?.project.status === "paused" ? "Продолжить с остановленного кадра" : detail?.project.status === "failed" ? "Повторить без потери готовых кадров" : plan ? "Продолжить и создать фильм" : "Создать фильм"}<Clapperboard size={16}/></Button>
       <div className={`production-notice ${detail?.project.status === "paused" || detail?.project.status === "failed" ? "warning" : productionActive ? "active" : ""}`} role="status"><StatusDot tone={detail?.project.status === "failed" ? "red" : detail?.project.status === "paused" ? "amber" : productionActive ? "teal" : "green"}/><span>{notice}</span></div>
       <p className="approx-note">Одно подтверждение запускает весь цикл. Быстрый черновик использует ускоренную модель и публикует кадры сразу после ответа Google.</p>
     </section>
