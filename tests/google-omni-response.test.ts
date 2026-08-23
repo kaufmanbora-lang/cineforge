@@ -181,6 +181,10 @@ describe("Google Omni response parsing", () => {
     expect(providerAudioContext(rescued.shot.generationPrompt!.prompt, audio)?.dialogue).toEqual([]);
     expect(audio.dialogue[0].text).toBe("ФБР! Руки вверх!");
     expect(omniNeutralRescuePayload(rescued)).toBe(rescued);
+    const legacy = { ...rescued, shot: { ...rescued.shot, generationPrompt: { ...rescued.shot.generationPrompt!, prompt: `${rescued.shot.generationPrompt!.prompt} no visible weapon` } } };
+    const refreshed = omniNeutralRescuePayload(legacy);
+    expect(refreshed.shot.generationPrompt?.prompt).not.toContain("weapon");
+    expect(refreshed).not.toBe(legacy);
   });
 
   it("switches only the repeatedly filtered shot to OmniFlash", () => {

@@ -299,9 +299,11 @@ export function omniFallbackPayload(payload: JobRow["payload"]): JobRow["payload
 }
 
 export function omniNeutralRescuePayload(payload: JobRow["payload"]): JobRow["payload"] {
-  if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")) return payload;
   const generationPrompt = payload.shot.generationPrompt;
   if (!generationPrompt) return { ...payload, providerModelId: "gemini-omni-flash-preview" };
+  const alreadyClean = generationPrompt.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")
+    && !containsLegacySensitiveTerms(`${generationPrompt.prompt} ${generationPrompt.negativeDirectives.join(" ")}`);
+  if (alreadyClean) return payload;
   const seconds = payload.shot.durationSeconds;
   const prompt = `Create one ${seconds}-second photorealistic live-action continuation of the supplied previous frame. Preserve the exact same adult characters, faces, wardrobe, location, weather, lighting, object positions and camera direction. Calm professional visitors move naturally through the already open doorway or across the room, then stop at their established positions for a quiet serious conversation. Their hands stay naturally relaxed and their body language remains ordinary and respectful. Plain clothing has no visible text. Show a continuous physically reachable walking path, solid walls and furniture, natural eyelines between the adults, and realistic door movement. Clean audio start with only subtle room ambience. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE OMNI NEUTRAL RESCUE.`;
   const shot = { ...payload.shot, generationPrompt: {
@@ -335,11 +337,19 @@ function shouldSwitchFilteredVeoToOmni(job: JobRow): boolean {
 }
 
 function shouldUseNeutralOmniRescue(job: JobRow): boolean {
-  return (job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni")
-    && Boolean(job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE SAFETY RETRY"))
-    && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")
+  const generationPrompt = job.payload.shot.generationPrompt;
+  if (!(job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni") || !generationPrompt) return false;
+  const legacyNeutralPrompt = generationPrompt.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")
+    && containsLegacySensitiveTerms(`${generationPrompt.prompt} ${generationPrompt.negativeDirectives.join(" ")}`);
+  const filteredSafetyRetry = generationPrompt.prompt.includes("CINEFORGE SAFETY RETRY")
+    && !generationPrompt.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")
     && job.shot_last_operation?.state === "failed"
     && job.shot_last_operation.error?.code === "GOOGLE_MODERATION";
+  return legacyNeutralPrompt || filteredSafetyRetry;
+}
+
+function containsLegacySensitiveTerms(value: string): boolean {
+  return /weapon|restraint|threat|agency|violence|оруж|наручник|задерж|угроз/i.test(value);
 }
 
 export function providerDurationSeconds(modelId: string, resolution: Resolution, plannedSeconds: number): number {
