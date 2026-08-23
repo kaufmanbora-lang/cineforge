@@ -1,5 +1,5 @@
 import { Queue } from "bullmq";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { PlannedJob } from "./job-planner";
 import { env } from "@/server/env";
 import { query, transaction } from "@/server/db";
@@ -167,12 +167,19 @@ export async function recoverStaleJobs(): Promise<number> {
 }
 
 export async function requeueDatabaseJob(input: { databaseJobId: string; attempt: number; delayMs: number; type?: string }): Promise<void> {
-  const retryIdentity = `${input.databaseJobId}:attempt:${input.attempt}`;
-  const bullId = createHash("sha256").update(retryIdentity).digest("hex");
+  // Manual resume may reset the database attempt counter. A stable BullMQ ID
+  // would then point at an old retained envelope and silently skip the retry.
+  // Each envelope is unique; the atomic database claim still guarantees that
+  // at most one worker can execute the paid generation job.
+  const bullId = retryEnvelopeJobId(input.databaseJobId, input.attempt, randomUUID());
   await movieQueue().add(input.type ?? "generate-shot", { databaseJobId: input.databaseJobId }, {
     jobId: bullId,
     delay: Math.max(0, input.delayMs),
   });
+}
+
+export function retryEnvelopeJobId(databaseJobId: string, attempt: number, nonce: string): string {
+  return createHash("sha256").update(`${databaseJobId}:attempt:${attempt}:retry:${nonce}`).digest("hex");
 }
 
 export async function pauseProjectJobs(projectId: string, reason: Record<string, unknown>): Promise<void> {

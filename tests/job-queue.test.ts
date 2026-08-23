@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { planGenerationJobs, readyJobs } from "@/server/movie/job-planner";
+import { retryEnvelopeJobId } from "@/server/movie/queue";
 import { scene, shot } from "./fixtures";
 
 describe("idempotent dependency-aware job queue", () => {
@@ -27,5 +28,11 @@ describe("idempotent dependency-aware job queue", () => {
     expect(readyJobs(normal, new Set(), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-1"]);
     expect(readyJobs(draft, new Set(), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-1"]);
     expect(draft[1].dependencies).toEqual(["shot-1"]);
+  });
+  it("creates a fresh retry envelope when a manual resume reuses an attempt number", () => {
+    const first = retryEnvelopeJobId("database-job", 1, "run-a");
+    const resumed = retryEnvelopeJobId("database-job", 1, "run-b");
+    expect(first).not.toBe(resumed);
+    expect(retryEnvelopeJobId("database-job", 1, "run-a")).toBe(first);
   });
 });

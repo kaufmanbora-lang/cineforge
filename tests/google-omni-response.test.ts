@@ -177,7 +177,7 @@ describe("Google Omni response parsing", () => {
     const rescued = omniNeutralRescuePayload({ shot: { ...plannedShot, audioContext: audio, generationPrompt: plannedShot.generationPrompt! }, specHash: "original" });
     expect(rescued.providerModelId).toBe("gemini-omni-flash-preview");
     expect(rescued.shot.generationPrompt?.prompt).toContain("CINEFORGE OMNI NEUTRAL RESCUE");
-    expect(rescued.shot.generationPrompt?.prompt).not.toMatch(/ФБР|наручник|задерж|оруж/i);
+    expect(rescued.shot.generationPrompt?.prompt).not.toMatch(/ФБР|наручник|задерж|оруж|weapon|restraint|threat|agency/i);
     expect(providerAudioContext(rescued.shot.generationPrompt!.prompt, audio)?.dialogue).toEqual([]);
     expect(audio.dialogue[0].text).toBe("ФБР! Руки вверх!");
     expect(omniNeutralRescuePayload(rescued)).toBe(rescued);

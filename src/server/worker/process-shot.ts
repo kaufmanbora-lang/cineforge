@@ -303,11 +303,11 @@ export function omniNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pa
   const generationPrompt = payload.shot.generationPrompt;
   if (!generationPrompt) return { ...payload, providerModelId: "gemini-omni-flash-preview" };
   const seconds = payload.shot.durationSeconds;
-  const prompt = `Create one ${seconds}-second photorealistic live-action continuation of the supplied previous frame. Preserve the exact same adult characters, faces, wardrobe, location, weather, lighting, object positions and camera direction. Calm professional visitors move naturally through the already open doorway or across the room, then stop at their established positions for a quiet serious conversation. Everyone remains calm with empty relaxed hands. No physical contact, restraint, confrontation, threatening gesture, visible weapon, agency name, insignia, readable logo, private information or public figure. Solid realistic geometry, ordinary walking speed, no teleportation, no intersections with walls or furniture. Clean audio start with only subtle room ambience; no speech or audio carry-over. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE OMNI NEUTRAL RESCUE.`;
+  const prompt = `Create one ${seconds}-second photorealistic live-action continuation of the supplied previous frame. Preserve the exact same adult characters, faces, wardrobe, location, weather, lighting, object positions and camera direction. Calm professional visitors move naturally through the already open doorway or across the room, then stop at their established positions for a quiet serious conversation. Their hands stay naturally relaxed and their body language remains ordinary and respectful. Plain clothing has no visible text. Show a continuous physically reachable walking path, solid walls and furniture, natural eyelines between the adults, and realistic door movement. Clean audio start with only subtle room ambience. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE OMNI NEUTRAL RESCUE.`;
   const shot = { ...payload.shot, generationPrompt: {
     ...generationPrompt,
     prompt,
-    negativeDirectives: [...new Set([...generationPrompt.negativeDirectives, "violence", "restraint", "weapons", "threats", "agency insignia", "readable logos"])],
+    negativeDirectives: ["cartoon look", "camera eye contact", "teleportation", "geometry intersection", "readable text"],
   } };
   return { ...payload, providerModelId: "gemini-omni-flash-preview", shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview", neutralRescue: 1 }) };
 }
@@ -436,6 +436,8 @@ export function buildContinuityChainPrompt(
     `Canonical location state: ${JSON.stringify({ locationId: continuity.locationId, ...continuity.locationState })}.`,
     `Immutable locked values: ${JSON.stringify(continuity.lockedValues)}.`,
     "PHYSICAL WORLD CONTRACT: preserve ordinary geometry, gravity, inertia, collisions and occlusion. People, vehicles, walls, doors, furniture and props are solid. They cannot intersect, pass through one another, teleport, reverse direction without motion, change scale or appear/disappear between frames.",
+    "TOPOLOGY AND DOOR CONTRACT: keep every character on the recorded inside/outside side of each wall and doorway until their body visibly follows a continuous path across the threshold. A person outside cannot operate or appear on the indoor side without first crossing; a person inside cannot appear outside without crossing. Door panels, frames, handles, walls and bodies remain solid, hinged and correctly oriented.",
+    "BLOCKING AND EYELINE CONTRACT: preserve the recorded left/right/foreground/background positions and travel direction. Each changed position must be reached through visible continuous motion. Characters look at the other character, the relevant prop or their travel path; nobody looks into or acknowledges the camera unless the screenplay explicitly requires it.",
     `Exact dialogue for this shot only: ${JSON.stringify(dialogue)}.`,
     "AUDIO ISOLATION: start a completely new audio context at 00:00. Do not repeat, continue or leak any word, voice, music, ambience or sound effect from a previous generated clip. Characters not listed as speakers remain silent. End every sound inside this shot boundary.",
   ].join("\n");
