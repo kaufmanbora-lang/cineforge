@@ -106,8 +106,11 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
       providerApiKey = apiKey;
       const references = await loadShotReferences(job, effectiveModelId);
-      const previousInteractionId = effectiveModelId.startsWith("gemini-omni")
-        ? await loadPreviousInteractionId(job, Boolean(job.payload.editCommand))
+      // Google only accepts previous_interaction_id for a conversational edit.
+      // A normal reference-to-video generation must continue from the extracted
+      // final frame without attaching the interaction id (otherwise HTTP 400).
+      const previousInteractionId = effectiveModelId.startsWith("gemini-omni") && job.payload.editCommand
+        ? await loadCurrentInteractionId(job)
         : undefined;
       const request: VideoGenerationRequest = {
         projectId: job.project_id,
@@ -421,15 +424,8 @@ async function loadShotReferences(job: JobRow, modelId: string): Promise<Referen
   return references;
 }
 
-async function loadPreviousInteractionId(job: JobRow, editingCurrentShot: boolean): Promise<string | undefined> {
-  if (editingCurrentShot) return job.shot_last_operation?.output?.interactionId;
-  const previousShotId = job.payload.shot.continuity.previousShotId;
-  if (!previousShotId) return undefined;
-  const rows = await query<{ last_operation: PersistedProviderOperation | null }>(
-    "SELECT last_operation FROM shots WHERE project_id=$1 AND id=$2",
-    [job.project_id, previousShotId],
-  );
-  return rows[0]?.last_operation?.output?.interactionId;
+async function loadCurrentInteractionId(job: JobRow): Promise<string | undefined> {
+  return job.shot_last_operation?.output?.interactionId;
 }
 
 async function runShotQc(job: JobRow, bytes: Uint8Array, mimeType: string, operationId: string): Promise<ShotQcReport | null> {

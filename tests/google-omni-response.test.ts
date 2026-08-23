@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
-import { extractOmniVideo, extractVeoVideo, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
+import { extractOmniVideo, extractVeoVideo, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
 import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, providerDurationSeconds, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
 
 describe("Google Omni response parsing", () => {
+  it("never combines previous_interaction_id with a video task", () => {
+    expect(googleOmniVideoTask({ previousInteractionId: "v1_previous", editInstruction: "Make the coat grey", references: [] })).toBeUndefined();
+    expect(googleOmniVideoTask({ previousInteractionId: undefined, editInstruction: undefined, references: [{ id: "previous-frame", data: "AAAA", mimeType: "image/jpeg", role: "first-frame" }] })).toBe("reference_to_video");
+  });
   it("does not send the Enterprise-only seed parameter to Gemini Developer API", () => {
     const plannedShot = shot("shot-1");
     expect(googleVeoConfig({

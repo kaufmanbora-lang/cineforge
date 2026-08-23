@@ -364,10 +364,15 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
         mime_type: reference.mimeType,
       }));
       input.push({ type: "text", text: request.editInstruction ?? request.prompt });
+      const statefulEdit = Boolean(request.previousInteractionId && request.editInstruction);
+      const videoTask = googleOmniVideoTask(request);
       const interaction = await ai.interactions.create({
         model: request.modelId,
-        input: request.references.length || request.editInstruction ? input : request.prompt,
-        previous_interaction_id: request.previousInteractionId,
+        // A stateful edit already has the original generated video in its
+        // interaction history. Supplying reference images or video_config at
+        // the same time is rejected by the official API.
+        input: statefulEdit ? request.editInstruction! : request.references.length ? input : request.prompt,
+        previous_interaction_id: statefulEdit ? request.previousInteractionId : undefined,
         // Unary generation is the lowest-latency official Interactions path.
         // Keep storage enabled because targeted follow-up editing relies on the
         // returned previous_interaction_id.
@@ -381,11 +386,7 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
           // the worker heap and is supported for every Omni video response.
           delivery: "uri",
         },
-        generation_config: {
-          video_config: {
-            task: request.editInstruction ? "edit" : request.references.length ? "reference_to_video" : "text_to_video",
-          },
-        },
+        generation_config: videoTask ? { video_config: { task: videoTask } } : undefined,
       } as never);
       const raw = interaction as unknown as {
         id?: string;
@@ -419,6 +420,12 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
   async poll(operation: ProviderOperation): Promise<ProviderOperation> {
     return operation;
   }
+}
+
+export function googleOmniVideoTask(request: Pick<VideoGenerationRequest, "previousInteractionId" | "editInstruction" | "references">): "edit" | "reference_to_video" | "text_to_video" | undefined {
+  if (request.previousInteractionId && request.editInstruction) return undefined;
+  if (request.editInstruction) return "edit";
+  return request.references.length ? "reference_to_video" : "text_to_video";
 }
 
 export function extractOmniVideo(raw: {
