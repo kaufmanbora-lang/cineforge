@@ -15,6 +15,13 @@ export interface ShotIntent {
   audio: AudioContext;
 }
 
+export function realismProductionProfile(styleOrPrompt: string): string {
+  const negatedAnimation = /(?:not|no|without|не|без)\s+(?:a\s+)?(?:animation|animated|anime|cartoon|illustration|cgi|мульт\w*|аним\w*|рисован\w*)/i.test(styleOrPrompt);
+  const explicitAnimation = !negatedAnimation && /(?:animation|animated|anime|cartoon|illustration|stop[ -]?motion|3d render|мульт\w*|аним\w*|рисован\w*|стоп[ -]?моуш)/i.test(styleOrPrompt);
+  if (explicitAnimation) return "Honor the explicitly requested animated or illustrated production style while preserving coherent physics and continuity.";
+  return "PHOTOREALISTIC LIVE-ACTION DEFAULT: footage must look captured by a real cinema camera in the physical world, with natural skin texture, materials, lens behavior, exposure, motion blur, anatomy and weight. Not animation, not anime, not cartoon, not illustration, not a 3D render, not game-engine footage, no plastic CGI skin.";
+}
+
 export class VeoPromptAdapter implements PromptAdapter<ShotIntent> {
   readonly family = "veo" as const;
 
@@ -30,7 +37,7 @@ export class VeoPromptAdapter implements PromptAdapter<ShotIntent> {
       `CHARACTER CONTINUITY: ${intent.characterDetails.join("; ")}`,
       `CAMERA: ${intent.camera.shotSize}, ${intent.camera.angle}, ${intent.camera.lens}; ${intent.camera.movement}; framing ${intent.camera.framing}.`,
       `LIGHTING / WEATHER: ${intent.lighting}; ${intent.weather}.`,
-      `VISUAL STYLE: ${intent.visualStyle}; natural physical motion, coherent anatomy, consistent identity and wardrobe. Enforce ordinary real-world geometry, inertia, gravity, collisions and occlusion: solid people, vehicles, walls, doors and props never intersect, pass through each other, teleport or change scale.`,
+      `VISUAL STYLE: ${intent.visualStyle}. ${realismProductionProfile(intent.visualStyle)} Natural physical motion, coherent anatomy, consistent identity and wardrobe. Enforce ordinary real-world geometry, inertia, gravity, collisions and occlusion: solid people, vehicles, walls, doors and props never intersect, pass through each other, teleport or change scale.`,
       `AUDIO CONTEXT: clean audio start=${intent.audio.cleanStart}. Speakers: ${intent.audio.speakers.join(", ") || "none"}.`,
       dialogue || "No dialogue.",
       `Ambience: ${intent.audio.ambience.join(", ") || "none"}. Sound effects: ${intent.audio.soundEffects.join(", ") || "none"}. Music: ${intent.audio.musicCue ?? "none"}.`,
@@ -45,6 +52,7 @@ export class VeoPromptAdapter implements PromptAdapter<ShotIntent> {
         "extra dialogue",
         "audio carry-over",
         "unexpected text overlays",
+        "cartoon, anime, illustration or CGI look unless explicitly requested",
       ],
     };
   }
@@ -73,7 +81,7 @@ export class OmniPromptAdapter implements PromptAdapter<ShotIntent> {
         dialogue || "No dialogue.",
         `Sound design: ${intent.audio.ambience.join(", ") || "clean ambience"}; ${intent.audio.soundEffects.join(", ") || "no extra effects"}; music ${intent.audio.musicCue ?? "none"}.`,
         `Clean audio start. ${negatives.join(". ")}.`,
-        `Visual treatment: ${intent.visualStyle}. Consider micro-detail, natural expression and physical timing. Enforce real-world geometry, gravity, inertia, collision and occlusion. Solid bodies never pass through walls, vehicles, furniture or each other; no teleportation, impossible pose, sudden scale change or discontinuous motion.`,
+        `Visual treatment: ${intent.visualStyle}. ${realismProductionProfile(intent.visualStyle)} Consider micro-detail, natural expression and physical timing. Enforce real-world geometry, gravity, inertia, collision and occlusion. Solid bodies never pass through walls, vehicles, furniture or each other; no teleportation, impossible pose, sudden scale change or discontinuous motion.`,
       ].join(" "),
       negativeDirectives: negatives,
     };

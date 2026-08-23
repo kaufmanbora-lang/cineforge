@@ -75,12 +75,10 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       stage = "queueing";
       queued = await enqueueJobs(planGenerationJobs(id, plan.scenes, { fastDraft: rows[0].render_tier === "draft" }));
       if (!queued) {
-        const recoverable = await query<{ count: number }>(
-          `SELECT count(*)::int count FROM jobs WHERE project_id=$1 AND state IN ('paused','retrying','failed')
-             AND (attempt < max_attempts OR (state='failed' AND COALESCE(last_error->>'message','') ~* 'ECONNREFUSED|connection refused'))`,
-          [id],
-        );
-        if (recoverable[0]?.count) queued = await resumeProjectJobs(id);
+        // Reaching this branch means the user explicitly confirmed production
+        // again. Reset exhausted attempts and resume only unfinished jobs; the
+        // completed shot versions remain immutable and are never regenerated.
+        queued = await resumeProjectJobs(id, { manual: true });
       }
       await query(
         "UPDATE projects SET title=$2,status=CASE WHEN status IN ('completed','cancelled') THEN status ELSE 'queued'::project_status END,maximum_budget_usd=$3,estimated_cost_usd=$4,last_error=NULL,updated_at=now() WHERE id=$1",

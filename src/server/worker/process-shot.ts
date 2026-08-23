@@ -16,6 +16,7 @@ import { extractFinalFrame, extractRepresentativeFrame } from "@/server/movie/ff
 import { evaluateShot, type ShotQcReport } from "@/server/providers/openai";
 import type { ReferenceImage } from "@/server/providers/video/types";
 import type { AudioContext, ContinuityState } from "@/domain/movie";
+import { realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 
 type PersistedProviderOperation = ProviderOperation & { specHash?: string; startedAt?: string };
 
@@ -359,6 +360,7 @@ export function buildContinuityChainPrompt(
   const dialogue = audio?.dialogue.map((line) => ({ speaker: line.characterName, exactText: line.text, delivery: line.delivery })) ?? [];
   return [
     originalPrompt,
+    realismProductionProfile(originalPrompt),
     "CINEFORGE STRICT CONTINUITY CONTRACT:",
     hasFirstFrame
       ? "The supplied first-frame image is the exact final frame of the previous chronological shot. Begin on that exact composition and continue its physical movement. Do not reset, teleport, reverse or randomly reposition any person, vehicle, prop or camera."

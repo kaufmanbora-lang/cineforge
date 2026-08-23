@@ -8,7 +8,10 @@ export interface VideoModelCapabilities {
   family: "omni" | "veo";
   lifecycle: "preview" | "stable";
   endpointKind: "interactions" | "generate-videos";
+  /** Resolutions a user can receive from the Movie Engine. */
   resolutions: Resolution[];
+  /** Resolutions returned natively by the provider rather than at export. */
+  nativeResolutions: Resolution[];
   aspectRatios: AspectRatio[];
   durationsSeconds: number[];
   nativeAudio: boolean;
@@ -31,7 +34,10 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     family: "omni",
     lifecycle: "preview",
     endpointKind: "interactions",
-    resolutions: ["preview", "720p"],
+    // Omni does not expose a resolution control. CineForge keeps its fast
+    // native response and can produce an honest 1080p/4K master at export.
+    resolutions: ["preview", "720p", "1080p", "4k"],
+    nativeResolutions: ["preview", "720p"],
     aspectRatios: ["16:9", "9:16"],
     // Omni does not currently expose a durationSeconds API field. Five-second
     // production beats keep requested runtimes accurate when it returns its
@@ -44,12 +50,13 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     lastFrame: false,
     extension: false,
     conversationalEditing: true,
-    pricePerSecondUsd: { preview: 0.1, "720p": 0.1 },
+    pricePerSecondUsd: { preview: 0.1, "720p": 0.1, "1080p": 0.1, "4k": 0.1 },
     notes: [
       "Preview model; availability depends on the Google project.",
       "Uploaded-video editing is unavailable in the EEA, Switzerland and the UK.",
       "Voice editing, interpolation and extension are not supported.",
       "Clip duration is guided by prompt timecodes; the API has no explicit duration parameter.",
+      "1080p and 4K are Movie Engine export resolutions; Omni does not expose a native resolution parameter.",
     ],
     sourceCheckedAt: "2026-08-23",
   },
@@ -61,6 +68,7 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     lifecycle: "preview",
     endpointKind: "generate-videos",
     resolutions: ["preview", "720p", "1080p", "4k"],
+    nativeResolutions: ["preview", "720p", "1080p", "4k"],
     aspectRatios: ["16:9", "9:16"],
     durationsSeconds: [4, 6, 8],
     nativeAudio: true,
@@ -82,6 +90,7 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     lifecycle: "preview",
     endpointKind: "generate-videos",
     resolutions: ["preview", "720p", "1080p", "4k"],
+    nativeResolutions: ["preview", "720p", "1080p", "4k"],
     aspectRatios: ["16:9", "9:16"],
     durationsSeconds: [4, 6, 8],
     nativeAudio: true,
@@ -103,6 +112,7 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     lifecycle: "preview",
     endpointKind: "generate-videos",
     resolutions: ["preview", "720p", "1080p"],
+    nativeResolutions: ["preview", "720p", "1080p"],
     aspectRatios: ["16:9", "9:16"],
     durationsSeconds: [4, 6, 8],
     nativeAudio: true,
@@ -126,8 +136,15 @@ export function getVideoModel(modelId: string): VideoModelCapabilities {
 
 export function getAllowedDurations(modelId: string, resolution: Resolution): number[] {
   const model = getVideoModel(modelId);
+  // Interactions currently has no duration/resolution fields. Resolution is
+  // applied later by the Movie Engine and must not change Omni shot planning.
+  if (model.family === "omni") return [...model.durationsSeconds];
   if (resolution === "1080p" || resolution === "4k") return [8];
   return [...model.durationsSeconds];
+}
+
+export function isNativeResolution(modelId: string, resolution: Resolution): boolean {
+  return getVideoModel(modelId).nativeResolutions.includes(resolution);
 }
 
 export function normalizeResolution(modelId: string, requested: Resolution): Resolution {

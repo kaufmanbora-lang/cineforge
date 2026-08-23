@@ -191,7 +191,14 @@ export async function resumeProjectJobs(projectId: string, options: { manual?: b
     const candidates = await client.query<{ id: string; type: string; idempotency_key: string; state: string; attempt: number; max_attempts: number; payload: { shot?: { dependencies?: string[] } } }>(
       `SELECT id,type,idempotency_key,state,attempt,max_attempts,payload FROM jobs
        WHERE project_id=$1 AND state IN ('paused','retrying','failed')
-         AND (attempt < max_attempts OR $2::boolean OR (state='failed' AND COALESCE(last_error->>'message','') ~* 'ECONNREFUSED|connection refused'))
+         AND (
+           attempt < max_attempts
+           OR $2::boolean
+           OR (
+             state='failed'
+             AND COALESCE(last_error->>'message','') ~* 'ECONNREFUSED|connection refused|previous_interaction_id is not allowed when video task is set'
+           )
+         )
        FOR UPDATE`,
       [projectId, Boolean(options.manual)],
     );

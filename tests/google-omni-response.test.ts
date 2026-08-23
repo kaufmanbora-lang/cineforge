@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
 import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, providerDurationSeconds, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
-import { normalizeMoviePlanRuntime } from "@/server/providers/video/prompt-adapters";
+import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
 
@@ -54,6 +54,13 @@ describe("Google Omni response parsing", () => {
     expect(providerDurationSeconds("veo-3.1-fast-generate-preview", "720p", 5)).toBe(6);
     expect(providerDurationSeconds("veo-3.1-fast-generate-preview", "720p", 7)).toBe(8);
     expect(providerDurationSeconds("gemini-omni-flash-preview", "720p", 5)).toBe(5);
+    expect(providerDurationSeconds("gemini-omni-flash-preview", "1080p", 5)).toBe(5);
+  });
+
+  it("defaults ordinary film prompts to photorealistic live action", () => {
+    expect(realismProductionProfile("grounded winter detective drama")).toContain("PHOTOREALISTIC LIVE-ACTION DEFAULT");
+    expect(realismProductionProfile("не мультяшное реалистичное кино")).toContain("PHOTOREALISTIC LIVE-ACTION DEFAULT");
+    expect(realismProductionProfile("hand-drawn animation")).toContain("explicitly requested animated");
   });
 
   it("extracts the production Interactions API video content part", () => {

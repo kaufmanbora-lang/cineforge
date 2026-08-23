@@ -71,7 +71,7 @@ export async function assembleMovie(input: {
       await execFileAsync(env().FFMPEG_PATH, [
         "-y", "-nostdin", "-threads", "1", "-filter_threads", "1", "-i", source,
         ...(input.clips[index].durationSeconds ? ["-t", input.clips[index].durationSeconds!.toFixed(3)] : []),
-        "-vf", `scale=${dimensions}:force_original_aspect_ratio=decrease,pad=${dimensions}:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p`,
+        "-vf", `scale=${dimensions}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${dimensions}:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p`,
         // Every generated shot is an isolated audio context. Trimming, resetting
         // timestamps and fading the few boundary milliseconds prevents packets,
         // old speech or a finished music cue from leaking into the next shot.

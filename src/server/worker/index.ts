@@ -1,5 +1,5 @@
 import { Worker } from "bullmq";
-import { MOVIE_QUEUE, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob } from "@/server/movie/queue";
+import { MOVIE_QUEUE, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob, resumeProjectJobs } from "@/server/movie/queue";
 import { processShot } from "./process-shot";
 import { processDialoguePatch } from "./process-dialogue";
 import { processAssembly } from "./process-assembly";
@@ -59,6 +59,10 @@ async function recoverActiveProjects() {
     const plan = await latestMoviePlan(project.id);
     if (!plan) continue;
     await enqueueJobs(planGenerationJobs(project.id, plan.scenes, { fastDraft: project.render_tier === "draft" }));
+    // Deploys recover jobs rejected by the old Omni request shape. This is
+    // limited to already-confirmed active projects and never touches completed
+    // shots, so a fixed worker continues from the last checkpoint by itself.
+    await resumeProjectJobs(project.id);
   }
 }
 
