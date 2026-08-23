@@ -153,13 +153,19 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         ? await loadCurrentInteractionId(job)
         : undefined;
       const providerPrompt = providerSafetyFraming(prompt.prompt);
-      const providerAudio = providerAudioContext(providerPrompt, job.payload.shot.audioContext);
+      const neutralRescue = isNeutralRescuePrompt(providerPrompt);
+      const providerAudio = neutralRescue
+        ? neutralRescueAudioContext(job.payload.shot.audioContext)
+        : providerAudioContext(providerPrompt, job.payload.shot.audioContext);
+      const providerContinuity = neutralRescue
+        ? neutralRescueContinuity(job.payload.shot.continuity)
+        : job.payload.shot.continuity;
       const request: VideoGenerationRequest = {
         projectId: job.project_id,
         sceneId: job.scene_id,
         shotId: job.shot_id,
         modelId: effectiveModelId,
-        prompt: buildContinuityChainPrompt(providerPrompt, job.payload.shot.continuity, providerAudio, references.some((reference) => reference.role === "first-frame")),
+        prompt: buildContinuityChainPrompt(providerPrompt, providerContinuity, providerAudio, references.some((reference) => reference.role === "first-frame")),
         negativeDirectives: [...new Set([
           ...prompt.negativeDirectives,
           "character identity drift",
@@ -365,7 +371,7 @@ export function omniNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pa
   if (!generationPrompt) return { ...payload, providerModelId: "gemini-omni-flash-preview" };
   const alreadyClean = generationPrompt.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")
     && !containsLegacySensitiveTerms(`${generationPrompt.prompt} ${generationPrompt.negativeDirectives.join(" ")}`);
-  if (alreadyClean) return payload;
+  if (alreadyClean) return { ...payload, omitProviderReferences: true };
   const seconds = payload.shot.durationSeconds;
   const action = neutralizeSensitiveStoryTerms(`${payload.shot.title}. ${payload.shot.action}`);
   const camera = payload.shot.camera;
@@ -375,7 +381,7 @@ export function omniNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pa
     prompt,
     negativeDirectives: ["cartoon look", "camera eye contact", "teleportation", "geometry intersection", "readable text"],
   } };
-  return { ...payload, providerModelId: "gemini-omni-flash-preview", shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview", neutralRescue: 1 }) };
+  return { ...payload, providerModelId: "gemini-omni-flash-preview", omitProviderReferences: true, shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview", neutralRescue: 1 }) };
 }
 
 export function shouldRestoreLegacyBillingFallback(job: Pick<JobRow, "payload">): boolean {
@@ -405,7 +411,7 @@ function neutralizeSensitiveStoryTerms(value: string): string {
 }
 
 export function veoNeutralRescuePayload(payload: JobRow["payload"]): JobRow["payload"] {
-  if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE")) return payload;
+  if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE")) return { ...payload, omitProviderReferences: true };
   const generationPrompt = payload.shot.generationPrompt;
   if (!generationPrompt) return { ...payload, providerModelId: "veo-3.1-fast-generate-preview" };
   const seconds = payload.shot.durationSeconds;
@@ -415,7 +421,7 @@ export function veoNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pay
     prompt,
     negativeDirectives: [...generationPrompt.negativeDirectives, "violence", "dangerous driving", "logos", "public figures"],
   } };
-  return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", shot, specHash: contentHash({ shot, providerModelId: "veo-3.1-fast-generate-preview", neutralRescue: 1 }) };
+  return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", omitProviderReferences: true, shot, specHash: contentHash({ shot, providerModelId: "veo-3.1-fast-generate-preview", neutralRescue: 1 }) };
 }
 
 export function veoSafeBridgePayload(payload: JobRow["payload"]): JobRow["payload"] {
@@ -424,7 +430,7 @@ export function veoSafeBridgePayload(payload: JobRow["payload"]): JobRow["payloa
   const alreadyClean = generationPrompt.prompt.includes("CINEFORGE VEO SAFE BRIDGE")
     && generationPrompt.prompt.includes("SAFE FICTIONAL PRODUCTION FRAME")
     && !containsLegacySensitiveTerms(`${generationPrompt.prompt} ${generationPrompt.negativeDirectives.join(" ")}`);
-  if (alreadyClean) return payload;
+  if (alreadyClean) return { ...payload, omitProviderReferences: true };
   const prompt = "Create one continuous photorealistic live-action continuity bridge at the same established location and time of day. Hold on stable architectural details, the doorway, furniture and persistent vehicles or props already established by the story. Nearby adult characters continue ordinary calm movement naturally through the space with relaxed body language and natural eyelines. Preserve solid geometry, realistic door hinges, object permanence, camera axis and screen direction. Clean ambient sound begins at zero and ends inside this clip. Plain surfaces contain no readable text. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE VEO SAFE BRIDGE.";
   const shot = { ...payload.shot, generationPrompt: {
     ...generationPrompt,
@@ -537,6 +543,65 @@ export function providerAudioContext(providerPrompt: string, audio: AudioContext
     cleanStart: true,
     forbidCarryOver: [...new Set([...audio.forbidCarryOver, "all generated dialogue"])],
   };
+}
+
+function isNeutralRescuePrompt(prompt: string): boolean {
+  return /CINEFORGE (?:OMNI NEUTRAL RESCUE|VEO NEUTRAL RESCUE|VEO SAFE BRIDGE)/.test(prompt);
+}
+
+export function neutralRescueAudioContext(audio: AudioContext | undefined): AudioContext | undefined {
+  if (!audio) return undefined;
+  return {
+    cleanStart: true,
+    speakers: [],
+    silentCharacters: [],
+    dialogue: [],
+    ambience: ["quiet natural ambience recorded only inside this clip"],
+    soundEffects: [],
+    musicCue: null,
+    forbidCarryOver: ["all previous dialogue", "all previous music", "all previous sound effects"],
+  };
+}
+
+export function neutralRescueContinuity(continuity: ContinuityState): ContinuityState {
+  const characterStates = Object.fromEntries(Object.values(continuity.characterStates).map((state, index) => [
+    `adult-${index + 1}`,
+    {
+      locationId: "established-location",
+      wardrobeId: `established-outfit-${index + 1}`,
+      heldProps: [],
+      injuries: [],
+      appearanceChanges: [],
+      position: sanitizeNeutralRescueText(state.position),
+      emotionalState: "calm",
+    },
+  ]));
+  const objectPositions = Object.fromEntries(Object.values(continuity.locationState.objectPositions).map((position, index) => [
+    `persistent-object-${index + 1}`,
+    sanitizeNeutralRescueText(position),
+  ]));
+  return {
+    characterStates,
+    locationId: "established-location",
+    locationState: {
+      timeOfDay: sanitizeNeutralRescueText(continuity.locationState.timeOfDay),
+      weather: sanitizeNeutralRescueText(continuity.locationState.weather),
+      lighting: sanitizeNeutralRescueText(continuity.locationState.lighting),
+      objectPositions,
+    },
+    previousShotId: null,
+    nextShotId: null,
+    requiredReferences: [],
+    lockedValues: {},
+  };
+}
+
+function sanitizeNeutralRescueText(value: string): string {
+  return neutralizeSensitiveStoryTerms(value)
+    .replace(/Nick Fury|Niko Fury|Ник(?:о)? Фьюри|Mysterio|Мистерио|Marvel|Spider-?Man|Человек(?:а)?[- ]паука/giu, "established adult performer")
+    .replace(/Cadillac/giu, "black civilian vehicle")
+    .replace(/gun|rifle|firearm|weapon|ammo|handcuff|restraint|threat|assault|arrest|detain/giu, "ordinary production prop")
+    .replace(/пистолет\w*|автомат\w*|винтовк\w*|оружи\w*|наручник\w*|угроз\w*|штурм\w*|арест\w*|задерж\w*/giu, "обычный реквизит");
 }
 
 export function buildContinuityChainPrompt(

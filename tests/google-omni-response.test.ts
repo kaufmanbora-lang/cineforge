@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
+import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
@@ -197,9 +197,10 @@ describe("Google Omni response parsing", () => {
     expect(rescued.providerModelId).toBe("gemini-omni-flash-preview");
     expect(rescued.shot.generationPrompt?.prompt).toContain("CINEFORGE OMNI NEUTRAL RESCUE");
     expect(rescued.shot.generationPrompt?.prompt).not.toMatch(/ФБР|наручник|задерж|оруж|weapon|restraint|threat|agency/i);
+    expect(rescued.omitProviderReferences).toBe(true);
     expect(providerAudioContext(rescued.shot.generationPrompt!.prompt, audio)?.dialogue).toEqual([]);
     expect(audio.dialogue[0].text).toBe("ФБР! Руки вверх!");
-    expect(omniNeutralRescuePayload(rescued)).toBe(rescued);
+    expect(omniNeutralRescuePayload(rescued)).toEqual(rescued);
     const legacy = { ...rescued, shot: { ...rescued.shot, generationPrompt: { ...rescued.shot.generationPrompt!, prompt: `${rescued.shot.generationPrompt!.prompt} no visible weapon` } } };
     const refreshed = omniNeutralRescuePayload(legacy);
     expect(refreshed.shot.generationPrompt?.prompt).not.toContain("weapon");
@@ -223,7 +224,8 @@ describe("Google Omni response parsing", () => {
     expect(rescued.providerModelId).toBe("veo-3.1-fast-generate-preview");
     expect(rescued.specHash).not.toBe(omni.specHash);
     expect(rescued.shot.generationPrompt?.prompt).toContain("CINEFORGE VEO NEUTRAL RESCUE");
-    expect(veoNeutralRescuePayload(rescued)).toBe(rescued);
+    expect(rescued.omitProviderReferences).toBe(true);
+    expect(veoNeutralRescuePayload(rescued)).toEqual(rescued);
   });
 
   it("uses a reference-free Veo bridge after a filtered neutral Omni frame", () => {
@@ -233,9 +235,39 @@ describe("Google Omni response parsing", () => {
     expect(bridge.omitProviderReferences).toBe(true);
     expect(bridge.shot.generationPrompt?.prompt).toContain("CINEFORGE VEO SAFE BRIDGE");
     expect(providerAudioContext(bridge.shot.generationPrompt!.prompt, neutral.shot.audioContext)?.dialogue).toEqual([]);
-    expect(veoSafeBridgePayload(bridge)).toBe(bridge);
+    expect(veoSafeBridgePayload(bridge)).toEqual(bridge);
     const legacy = { ...bridge, shot: { ...bridge.shot, generationPrompt: { ...bridge.shot.generationPrompt!, prompt: bridge.shot.generationPrompt!.prompt.replace("SAFE FICTIONAL PRODUCTION FRAME. ", "") } } };
     expect(veoSafeBridgePayload(legacy).shot.generationPrompt?.prompt).toContain("SAFE FICTIONAL PRODUCTION FRAME");
+  });
+
+  it("removes sensitive names, props, references and dialogue from a neutral rescue request only", () => {
+    const plannedShot = shot("shot-neutral-context");
+    const continuity = {
+      ...plannedShot.continuity,
+      characterStates: {
+        "Nick Fury": {
+          ...plannedShot.continuity.characterStates["character-elias"],
+          heldProps: ["rifle"],
+          position: "Mysterio stands beside a Cadillac with a weapon",
+        },
+      },
+      locationState: {
+        ...plannedShot.continuity.locationState,
+        objectPositions: { Cadillac: "Marvel car beside an armed arrest team" },
+      },
+      lockedValues: { "Nick Fury.face": "Marvel likeness" },
+    };
+    const safeContinuity = neutralRescueContinuity(continuity);
+    const safeAudio = neutralRescueAudioContext({
+      ...plannedShot.audioContext,
+      speakers: ["Nick Fury"],
+      dialogue: [{ id: "d1", characterId: "Nick Fury", characterName: "Nick Fury", text: "Вы арестованы", delivery: "firm", startSeconds: 0, durationSeconds: 1 }],
+    });
+    expect(JSON.stringify(safeContinuity)).not.toMatch(/Nick Fury|Mysterio|Marvel|Cadillac|rifle|weapon|arrest/i);
+    expect(safeContinuity.requiredReferences).toEqual([]);
+    expect(safeContinuity.lockedValues).toEqual({});
+    expect(safeAudio?.dialogue).toEqual([]);
+    expect(safeAudio?.soundEffects).toEqual([]);
   });
 
   it("resumes a persisted SDK polling failure without starting a second paid generation", () => {
