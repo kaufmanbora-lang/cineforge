@@ -119,7 +119,8 @@ export async function persistMoviePlan(plan: MoviePlan): Promise<void> {
       [plan.projectId],
     );
     await client.query(
-      "UPDATE projects SET completed_shots=$2,total_shots=$3,progress=CASE WHEN $3=0 THEN 0 ELSE $2::numeric/$3*100 END WHERE id=$1",
+      `UPDATE projects SET completed_shots=$2::integer,total_shots=$3::integer,
+         progress=CASE WHEN $3::integer=0 THEN 0 ELSE ($2::integer)::numeric/($3::integer)*100 END WHERE id=$1`,
       [plan.projectId, counts.rows[0].completed, counts.rows[0].total],
     );
   });

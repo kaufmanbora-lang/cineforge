@@ -231,6 +231,7 @@ export function StudioWorkspace() {
         const created = await fetch("/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: "Фильм без названия", prompt, durationSeconds: duration, modelId, resolution, aspectRatio, mode, renderTier: draft ? "draft" : "final", maximumBudgetUsd: budget }), signal: AbortSignal.timeout(30_000) });
         const createdPayload = await created.json(); if (!created.ok) throw new Error(errorMessageRu(createdPayload.error, "Не удалось создать проект."));
         activeProjectId = createdPayload.projectId as string; setProjectId(activeProjectId); localStorage.setItem("cineforge.projectId", activeProjectId);
+        window.history.replaceState(null, "", `/create?project=${encodeURIComponent(activeProjectId)}`);
       }
       const response = await fetch(`/api/projects/${activeProjectId}/plan`, {
         method: "POST",
