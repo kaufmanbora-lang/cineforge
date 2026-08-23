@@ -368,6 +368,12 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
         model: request.modelId,
         input: request.references.length || request.editInstruction ? input : request.prompt,
         previous_interaction_id: request.previousInteractionId,
+        // Unary generation is the lowest-latency official Interactions path.
+        // Keep storage enabled because targeted follow-up editing relies on the
+        // returned previous_interaction_id.
+        background: false,
+        stream: false,
+        store: true,
         response_format: {
           type: "video",
           aspect_ratio: request.aspectRatio,
