@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
 import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, providerDurationSeconds, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
-import { shot } from "./fixtures";
+import { normalizeMoviePlanRuntime } from "@/server/providers/video/prompt-adapters";
+import type { MoviePlan } from "@/domain/movie";
+import { character, location, scene, shot } from "./fixtures";
 
 describe("Google Omni response parsing", () => {
   it("does not send the Enterprise-only seed parameter to Gemini Developer API", () => {
@@ -214,5 +216,21 @@ describe("Google Omni response parsing", () => {
     expect(generationAccountingCost(1, 0, true)).toBe(0);
     expect(generationAccountingCost(1, 1, true)).toBe(1);
     expect(generationAccountingCost(1, 0, false)).toBe(1);
+  });
+
+  it("plans an exact ten-second Omni movie as linked five-second beats", () => {
+    const longShot = { ...shot("shot-1"), durationSeconds: 10 };
+    const sourceScene = scene([longShot]);
+    const plan: MoviePlan = {
+      id: "plan-1", projectId: "project-1", createdAt: new Date(0).toISOString(),
+      summary: { title: "Test", genre: "Drama", style: "realistic", mood: "calm", durationSeconds: 10, logline: "Test", synopsis: "Test" },
+      characters: [character()], locations: [location()], acts: [{ id: "act-1", number: 1, title: "Act", purpose: "Test", startSceneNumber: 1, endSceneNumber: 1 }], scenes: [sourceScene],
+    };
+    const normalized = normalizeMoviePlanRuntime(plan, "gemini-omni-flash-preview");
+    const shots = normalized.scenes.flatMap((item) => item.shots);
+    expect(shots.map((item) => item.durationSeconds)).toEqual([5, 5]);
+    expect(shots.reduce((sum, item) => sum + item.durationSeconds, 0)).toBe(10);
+    expect(shots[1].continuity.previousShotId).toBe(shots[0].id);
+    expect(shots[1].dependencies).toContain(shots[0].id);
   });
 });

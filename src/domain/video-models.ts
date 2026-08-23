@@ -33,7 +33,10 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     endpointKind: "interactions",
     resolutions: ["preview", "720p"],
     aspectRatios: ["16:9", "9:16"],
-    durationsSeconds: [3, 4, 5, 6, 7, 8, 9, 10],
+    // Omni does not currently expose a durationSeconds API field. Five-second
+    // production beats keep requested runtimes accurate when it returns its
+    // common short clip; the exact total is enforced by the Movie Engine.
+    durationsSeconds: [5],
     nativeAudio: true,
     referenceImages: 6,
     referenceVideo: false,
@@ -46,8 +49,9 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
       "Preview model; availability depends on the Google project.",
       "Uploaded-video editing is unavailable in the EEA, Switzerland and the UK.",
       "Voice editing, interpolation and extension are not supported.",
+      "Clip duration is guided by prompt timecodes; the API has no explicit duration parameter.",
     ],
-    sourceCheckedAt: "2026-08-22",
+    sourceCheckedAt: "2026-08-23",
   },
   "veo-3.1-generate-preview": {
     id: "veo-3.1-generate-preview",

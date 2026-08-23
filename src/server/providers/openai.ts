@@ -92,12 +92,13 @@ export async function generateStructuredMoviePlan(input: {
   projectId: string;
   idea: string;
   durationSeconds: number;
-  modelId?: string;
+  screenwriterModelId?: string;
+  videoModelId?: string;
 }): Promise<MoviePlan> {
   try {
     const client = await openAIClient();
     const response = await client.responses.parse({
-      model: input.modelId ?? (await openAIModelRouting()).screenwriting,
+      model: input.screenwriterModelId ?? (await openAIModelRouting()).screenwriting,
       reasoning: { effort: "high" },
       instructions: SCREENWRITER_INSTRUCTIONS,
       input: [
@@ -143,8 +144,11 @@ export async function generateStructuredMoviePlan(input: {
   }
 }
 
-function moviePlanRequest(input: { projectId: string; idea: string; durationSeconds: number }): string {
-  return `Create a production-ready MoviePlan for project ${input.projectId}. Exact target runtime: ${input.durationSeconds} seconds. User idea: ${input.idea}`;
+function moviePlanRequest(input: { projectId: string; idea: string; durationSeconds: number; videoModelId?: string }): string {
+  const shotLimit = input.videoModelId?.startsWith("gemini-omni")
+    ? "For Gemini Omni Flash, make every shot at most 5 seconds so the Movie Engine can guarantee the requested total runtime."
+    : "Make every shot at most 8 seconds and use only 4, 6 or 8 second provider beats where practical.";
+  return `Create a production-ready MoviePlan for project ${input.projectId}. Exact target runtime: ${input.durationSeconds} seconds. The sum of all shot durationSeconds must equal exactly ${input.durationSeconds}; never return a shorter plan. ${shotLimit} User idea: ${input.idea}`;
 }
 
 async function selectGeminiFallbackModels(apiKey: string): Promise<string[]> {
@@ -312,7 +316,8 @@ const SCREENWRITER_INSTRUCTIONS = `You are CineForge's production screenwriter. 
 Write every user-visible field in the language of the user's idea. If the language is Russian, all titles, descriptions, actions, dialogue, camera notes, sound notes and continuity descriptions must be in Russian. Keep only stable IDs and provider model IDs in ASCII.
 The screenplay must have meaningful dramatic content for the full target runtime without repeated shots, artificial slow motion, filler, reused dialogue or padding.
 Every scene and shot requires stable IDs. Every shot must be short enough for the chosen Google video model (maximum 10 seconds).
-Build character, location, wardrobe, voice, audio and continuity state explicitly. Dialogue text is exact. Audio contexts start clean unless carry-over is intentional.
+Build character, location, wardrobe, voice, audio and continuity state explicitly. Dialogue text is exact. Every audio context starts clean and forbids prior dialogue, prior music and prior sound effects unless the screenplay explicitly requests a continuous sound bridge.
+Link every chronologically adjacent shot with previousShotId, nextShotId and a matching shot dependency, including across scene boundaries. The next shot must begin from the exact end state of the previous shot: character and vehicle positions, movement direction, wardrobe, props, injuries, weather, time, lighting, location layout and unfinished dialogue. An intentional jump in time or place must still preserve character, wardrobe, voice and locked identity state and must be described explicitly in continuity requirements.
 Locked values must never change without a direct user request. The total of shot durations should closely match the requested runtime.`;
 
 const SCREENWRITER_CHAT_INSTRUCTIONS = `You are CineForge AI Screenwriter. Help develop titles, concepts, characters, acts, scenes, dialogue and production-ready screenplays.

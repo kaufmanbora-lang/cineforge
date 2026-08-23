@@ -4,6 +4,7 @@ import { query, transaction } from "@/server/db";
 import { patchDialogueAudio } from "@/server/movie/ffmpeg";
 import { putObject, signedObjectUrl } from "@/server/storage";
 import { enqueueAutomaticAssemblyIfReady } from "@/server/movie/queue";
+import type { AudioContext, MoviePlan, Shot } from "@/domain/movie";
 
 const BUILT_IN_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", "verse", "marin", "cedar"] as const;
 
@@ -64,8 +65,17 @@ export async function processDialoguePatch(databaseJobId: string) {
   const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/dialogue-${contentHash}.mp4`;
   await putObject(storageKey, patched, "video/mp4");
   await transaction(async (db) => {
-    const current = await db.query<{ current_version: number }>("SELECT current_version FROM shots WHERE id=$1 FOR UPDATE", [job.shot_id]);
+    const current = await db.query<{ current_version: number; audio_context: AudioContext; generation_spec: Shot }>("SELECT current_version,audio_context,generation_spec FROM shots WHERE id=$1 FOR UPDATE", [job.shot_id]);
     const version = (current.rows[0]?.current_version ?? 0) + 1;
+    const replacementById = new Map(segments.map((segment) => [segment.id, segment]));
+    const revisedAudio: AudioContext = {
+      ...current.rows[0].audio_context,
+      dialogue: current.rows[0].audio_context.dialogue.map((line) => {
+        const replacement = replacementById.get(line.id);
+        return replacement ? { ...line, text: replacement.text, delivery: replacement.delivery } : line;
+      }),
+    };
+    const revisedSpec = { ...current.rows[0].generation_spec, audioContext: revisedAudio };
     await db.query("UPDATE shot_versions SET active=false WHERE shot_id=$1", [job.shot_id]);
     const shotVersion = await db.query<{ id: string }>(
       `INSERT INTO shot_versions (shot_id,version,reason,generation_spec,content_hash,active)
@@ -79,7 +89,29 @@ export async function processDialoguePatch(databaseJobId: string) {
         JSON.stringify({ videoFramesPreserved: true, sourceAssetId: job.payload.originalAssetId, dialogueIds: segments.map((segment) => segment.id) })],
     );
     await db.query("UPDATE timeline_clips SET asset_id=$2 WHERE shot_id=$1 AND track='video' AND enabled=true", [job.shot_id, asset.rows[0].id]);
-    await db.query("UPDATE shots SET current_version=$2,state='completed' WHERE id=$1", [job.shot_id, version]);
+    await db.query("UPDATE shots SET current_version=$2,state='completed',audio_context=$3,generation_spec=$4 WHERE id=$1", [job.shot_id, version, JSON.stringify(revisedAudio), JSON.stringify(revisedSpec)]);
+    await db.query("UPDATE timeline_clips SET metadata=$2 WHERE shot_id=$1 AND track='dialogue' AND enabled=true", [job.shot_id, JSON.stringify({ dialogue: revisedAudio.dialogue })]);
+    await db.query("UPDATE timeline_clips SET metadata=$2 WHERE shot_id=$1 AND track='subtitles' AND enabled=true", [job.shot_id, JSON.stringify({ lines: revisedAudio.dialogue.map((line) => ({ id: line.id, text: line.text, startSeconds: line.startSeconds, durationSeconds: line.durationSeconds })) })]);
+
+    const planRows = await db.query<{ current_plan_version: number; plan: MoviePlan }>(
+      `SELECT p.current_plan_version,m.plan FROM projects p
+       JOIN movie_plan_versions m ON m.project_id=p.id AND m.version=p.current_plan_version
+       WHERE p.id=$1 FOR UPDATE OF p`,
+      [job.project_id],
+    );
+    if (planRows.rows[0]) {
+      const nextPlan: MoviePlan = {
+        ...planRows.rows[0].plan,
+        scenes: planRows.rows[0].plan.scenes.map((scene) => ({
+          ...scene,
+          shots: scene.shots.map((shot) => shot.id === job.shot_id ? { ...shot, audioContext: revisedAudio } : shot),
+        })),
+      };
+      const nextPlanVersion = planRows.rows[0].current_plan_version + 1;
+      const planHash = createHash("sha256").update(JSON.stringify(nextPlan)).digest("hex");
+      await db.query("INSERT INTO movie_plan_versions (project_id,version,content_hash,plan) VALUES ($1,$2,$3,$4)", [job.project_id, nextPlanVersion, planHash, JSON.stringify(nextPlan)]);
+      await db.query("UPDATE projects SET current_plan_version=$2,updated_at=now() WHERE id=$1", [job.project_id, nextPlanVersion]);
+    }
     await db.query("UPDATE jobs SET state='completed',completed_at=now(),result=$2 WHERE id=$1", [job.id, JSON.stringify({ storageKey, version, videoFramesPreserved: true })]);
     await db.query(
       `INSERT INTO checkpoints (project_id,event_type,completed_shot_ids,pending_shot_ids,snapshot)

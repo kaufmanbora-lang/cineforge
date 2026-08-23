@@ -11,20 +11,21 @@ import { query } from "@/server/db";
 
 export const runtime = "nodejs";
 
-const Body = z.object({ command: z.string().min(3).max(5_000) });
+const Body = z.object({ command: z.string().min(3).max(5_000), sceneId: z.string().optional(), shotId: z.string().optional() });
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await context.params;
-    const { command } = Body.parse(await request.json());
+    const { command, sceneId, shotId } = Body.parse(await request.json());
     const plan = await latestMoviePlan(id);
     if (!plan) return NextResponse.json({ error: "No screenplay is available for impact analysis." }, { status: 409 });
-    const impact = analyzeEdit(command, buildTimelineIndex(plan.scenes));
+    const impact = analyzeEdit(command, buildTimelineIndex(plan.scenes), { sceneId, shotId });
     const target = impact.affected[0];
     const scene = plan.scenes.find((item) => item.id === target.sceneId)!;
     const shot = scene.shots.find((item) => item.id === target.shotId)!;
     const projectContext = await buildProjectContext({ projectId: id, selectedSceneId: scene.id });
     const projectRows = await query<{ model_id: string; resolution: string; aspect_ratio: string }>("SELECT model_id,resolution,aspect_ratio FROM projects WHERE id=$1", [id]);
+    const operationRows = await query<{ last_operation: { modelId?: string; output?: { interactionId?: string } } | null }>("SELECT last_operation FROM shots WHERE id=$1 AND project_id=$2", [shot.id, id]);
 
     if (impact.intent === "dialogue" && shot.audioContext.dialogue.length) {
       const dialogue = shot.audioContext.dialogue.find((line) => target.dialogueIds.includes(line.id)) ?? shot.audioContext.dialogue[0];
@@ -76,6 +77,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       references: shot.continuity.requiredReferences,
     });
     await query("UPDATE shots SET state='planned',generation_spec=$2,content_hash=$3 WHERE id=$1", [shot.id, JSON.stringify(nextShot), specHash]);
+    const omniEditable = Boolean(operationRows[0]?.last_operation?.output?.interactionId) && operationRows[0]?.last_operation?.modelId?.startsWith("gemini-omni");
     const queued = await enqueueJobs([{
       projectId: id,
       sceneId: scene.id,
@@ -84,7 +86,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       idempotencyKey: `generate-shot:${shot.id}:${specHash}`,
       dependencies: shot.dependencies,
       priority: 20_000,
-      payload: { shot: nextShot, specHash, editCommand: command },
+      payload: { shot: nextShot, specHash, editCommand: command, ...(omniEditable ? { providerModelId: "gemini-omni-flash-preview" } : {}) },
     }]);
     return NextResponse.json({ impact, queued, prompt: enhanced, videoFramesPreserved: false }, { status: 202 });
   } catch (error) {

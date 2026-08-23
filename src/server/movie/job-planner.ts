@@ -21,14 +21,22 @@ export function planGenerationJobs(projectId: string, scenes: Scene[], options: 
     // Structured screenplay models occasionally put character, wardrobe or location
     // IDs in this field. Only shot IDs are scheduling dependencies; accepting any
     // other graph node leaves the first generation permanently in `planned`.
-    const dependencies = [...new Set(shot.dependencies)]
-      .filter((id) => id !== shot.id && shotIds.has(id))
-      .filter((id) => !options.fastDraft || sceneByShot.get(id) === scene.id);
+    // Fast Draft may skip expensive QC, but it must never break the story graph.
+    // In particular, cross-scene dependencies are what make the previous final
+    // frame, blocking and project state available to the next generation.
+    const dependencies = [...new Set([
+      ...shot.dependencies,
+      shot.continuity.previousShotId,
+    ].filter((id): id is string => Boolean(id)))]
+      .filter((id) => id !== shot.id && shotIds.has(id));
     const specHash = contentHash({
       prompt: shot.generationPrompt,
       references: shot.continuity.requiredReferences,
+      dependencies,
+      continuity: shot.continuity,
       durationSeconds: shot.durationSeconds,
       audioContext: shot.audioContext,
+      renderTier: options.fastDraft ? "draft" : "final",
     });
     return {
       projectId,

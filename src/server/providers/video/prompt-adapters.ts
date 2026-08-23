@@ -1,4 +1,4 @@
-import type { AudioContext, ContinuityState, MoviePlan } from "@/domain/movie";
+import type { AudioContext, ContinuityState, MoviePlan, Shot } from "@/domain/movie";
 import type { PromptAdapter } from "./types";
 
 export interface ShotIntent {
@@ -30,7 +30,7 @@ export class VeoPromptAdapter implements PromptAdapter<ShotIntent> {
       `CHARACTER CONTINUITY: ${intent.characterDetails.join("; ")}`,
       `CAMERA: ${intent.camera.shotSize}, ${intent.camera.angle}, ${intent.camera.lens}; ${intent.camera.movement}; framing ${intent.camera.framing}.`,
       `LIGHTING / WEATHER: ${intent.lighting}; ${intent.weather}.`,
-      `VISUAL STYLE: ${intent.visualStyle}; natural physical motion, coherent anatomy, consistent identity and wardrobe.`,
+      `VISUAL STYLE: ${intent.visualStyle}; natural physical motion, coherent anatomy, consistent identity and wardrobe. Enforce ordinary real-world geometry, inertia, gravity, collisions and occlusion: solid people, vehicles, walls, doors and props never intersect, pass through each other, teleport or change scale.`,
       `AUDIO CONTEXT: clean audio start=${intent.audio.cleanStart}. Speakers: ${intent.audio.speakers.join(", ") || "none"}.`,
       dialogue || "No dialogue.",
       `Ambience: ${intent.audio.ambience.join(", ") || "none"}. Sound effects: ${intent.audio.soundEffects.join(", ") || "none"}. Music: ${intent.audio.musicCue ?? "none"}.`,
@@ -73,7 +73,7 @@ export class OmniPromptAdapter implements PromptAdapter<ShotIntent> {
         dialogue || "No dialogue.",
         `Sound design: ${intent.audio.ambience.join(", ") || "clean ambience"}; ${intent.audio.soundEffects.join(", ") || "no extra effects"}; music ${intent.audio.musicCue ?? "none"}.`,
         `Clean audio start. ${negatives.join(". ")}.`,
-        `Visual treatment: ${intent.visualStyle}. Consider micro-detail, natural expression and physical timing.`,
+        `Visual treatment: ${intent.visualStyle}. Consider micro-detail, natural expression and physical timing. Enforce real-world geometry, gravity, inertia, collision and occlusion. Solid bodies never pass through walls, vehicles, furniture or each other; no teleportation, impossible pose, sudden scale change or discontinuous motion.`,
       ].join(" "),
       negativeDirectives: negatives,
     };
@@ -89,6 +89,7 @@ export function promptAdapterFor(modelId: string): PromptAdapter<ShotIntent> {
 }
 
 export function adaptMoviePlanPrompts(plan: MoviePlan, modelId: string): MoviePlan {
+  plan = normalizeMoviePlanRuntime(plan, modelId);
   const adapter = promptAdapterFor(modelId);
   return {
     ...plan,
@@ -131,4 +132,116 @@ export function adaptMoviePlanPrompts(plan: MoviePlan, modelId: string): MoviePl
       };
     }),
   };
+}
+
+/**
+ * Turns an approximate screenplay timeline into an exact production timeline.
+ * Omni currently has no durationSeconds request field, so short five-second
+ * beats are considerably more reliable than asking one interaction for a long
+ * clip. Every beat is newly generated; no frame repetition or slow-down is used.
+ */
+export function normalizeMoviePlanRuntime(plan: MoviePlan, modelId: string): MoviePlan {
+  const maxBeatSeconds = modelId.startsWith("gemini-omni") ? 5 : 8;
+  let scenes = plan.scenes.map((scene) => ({
+    ...scene,
+    shots: scene.shots.flatMap((shot) => splitShotIntoBeats(shot, maxBeatSeconds)),
+  }));
+  const target = plan.summary.durationSeconds;
+  let total = scenes.flatMap((scene) => scene.shots).reduce((sum, shot) => sum + shot.durationSeconds, 0);
+
+  // Structured models can be a few seconds short. Fill the missing runtime with
+  // newly described chronological action, never with duplicated media.
+  if (total < target && scenes.length) {
+    const sceneIndex = scenes.length - 1;
+    const shots = [...scenes[sceneIndex].shots];
+    const template = shots.at(-1);
+    if (template) {
+      let remaining = target - total;
+      let part = 1;
+      while (remaining > 0.001) {
+        const durationSeconds = Math.min(maxBeatSeconds, remaining);
+        shots.push({
+          ...template,
+          id: `${template.id}-runtime-${part}`,
+          sequence: template.sequence + part,
+          title: `${template.title} — продолжение ${part}`,
+          durationSeconds,
+          action: `${template.action}. Следующий содержательный момент: действие естественно продолжается вперёд, без повтора уже показанных кадров и без паузы.`,
+          audioContext: { ...template.audioContext, speakers: [], dialogue: [], cleanStart: true },
+          dependencies: [],
+        });
+        remaining -= durationSeconds;
+        part += 1;
+      }
+      scenes[sceneIndex] = { ...scenes[sceneIndex], shots };
+      total = target;
+    }
+  }
+
+  // If the draft is long, trim only ungenerated tail beats to the requested
+  // runtime. Provider output itself is never slowed down or duplicated.
+  if (total > target) {
+    let cursor = 0;
+    scenes = scenes.map((scene) => {
+      const shots: Shot[] = [];
+      for (const shot of scene.shots) {
+        const remaining = target - cursor;
+        if (remaining <= 0) break;
+        const durationSeconds = Math.min(shot.durationSeconds, remaining);
+        shots.push({ ...shot, durationSeconds });
+        cursor += durationSeconds;
+      }
+      return { ...scene, shots };
+    }).filter((scene) => scene.shots.length > 0);
+  }
+
+  // Canonical chronological chain: this is the source of truth for scheduling,
+  // previous-frame references and Project Memory across scene boundaries.
+  const timeline = scenes.flatMap((scene) => scene.shots);
+  const validIds = new Set(timeline.map((shot) => shot.id));
+  let timelineIndex = 0;
+  scenes = scenes.map((scene) => {
+    const shots = scene.shots.map((shot) => {
+      const previous = timeline[timelineIndex - 1];
+      const next = timeline[timelineIndex + 1];
+      timelineIndex += 1;
+      return {
+        ...shot,
+        sequence: timelineIndex,
+        dependencies: [...new Set([
+          ...shot.dependencies.filter((id) => validIds.has(id) && id !== shot.id),
+          ...(previous ? [previous.id] : []),
+        ])],
+        continuity: { ...shot.continuity, previousShotId: previous?.id ?? null, nextShotId: next?.id ?? null },
+      };
+    });
+    return { ...scene, shots, durationSeconds: shots.reduce((sum, shot) => sum + shot.durationSeconds, 0) };
+  });
+
+  return { ...plan, summary: { ...plan.summary, durationSeconds: target }, scenes };
+}
+
+function splitShotIntoBeats(shot: Shot, maxBeatSeconds: number): Shot[] {
+  if (shot.durationSeconds <= maxBeatSeconds) return [shot];
+  const beats: Shot[] = [];
+  let offset = 0;
+  while (offset < shot.durationSeconds - 0.001) {
+    const durationSeconds = Math.min(maxBeatSeconds, shot.durationSeconds - offset);
+    const index = beats.length + 1;
+    const dialogue = shot.audioContext.dialogue
+      .filter((line) => line.startSeconds >= offset && line.startSeconds < offset + durationSeconds)
+      .map((line) => ({ ...line, startSeconds: line.startSeconds - offset, durationSeconds: Math.min(line.durationSeconds, durationSeconds - (line.startSeconds - offset)) }));
+    beats.push({
+      ...shot,
+      id: `${shot.id}-beat-${index}`,
+      sequence: shot.sequence + index - 1,
+      title: `${shot.title} — часть ${index}`,
+      durationSeconds,
+      action: `${shot.action}. Хронологическая часть ${index}: продолжить движение и состояние с предыдущей части без скачка.`,
+      audioContext: { ...shot.audioContext, speakers: dialogue.map((line) => line.characterId), dialogue, cleanStart: true },
+      dependencies: [],
+    });
+    offset += durationSeconds;
+  }
+  return beats;
 }

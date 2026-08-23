@@ -19,4 +19,10 @@ describe("non-destructive editing", () => {
     expect(result.requiresVideoRegeneration).toBe(true);
     expect(result.affected[0].shotId).toBe("shot-2");
   });
+  it("uses the editor selection when the command has no timestamp", () => {
+    const result = analyzeEdit("Поменяй пальто на серое, остальное не трогай", timeline, { shotId: "shot-3" });
+    expect(result.requiresVideoRegeneration).toBe(true);
+    expect(result.affected[0].shotId).toBe("shot-3");
+    expect(result.unaffected.before).toEqual(["shot-1", "shot-2"]);
+  });
 });

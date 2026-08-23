@@ -18,12 +18,14 @@ describe("idempotent dependency-aware job queue", () => {
     expect(jobs[0].dependencies).toEqual([]);
     expect(readyJobs(jobs, new Set(), new Set(), 1).map((job) => job.shotId)).toEqual(["shot-1"]);
   });
-  it("parallelizes independent scenes in fast draft mode", () => {
+  it("preserves cross-scene continuity dependencies in fast draft mode", () => {
     const first = scene([shot("shot-1")]);
-    const second = { ...scene([shot("shot-2", ["shot-1"])]), id: "scene-2", number: 2, shots: [{ ...shot("shot-2", ["shot-1"]), sceneId: "scene-2" }] };
+    const linked = { ...shot("shot-2"), sceneId: "scene-2", continuity: { ...shot("shot-2").continuity, previousShotId: "shot-1" } };
+    const second = { ...scene([linked]), id: "scene-2", number: 2, shots: [linked] };
     const normal = planGenerationJobs("project", [first, second]);
     const draft = planGenerationJobs("project", [first, second], { fastDraft: true });
     expect(readyJobs(normal, new Set(), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-1"]);
-    expect(readyJobs(draft, new Set(), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-1", "shot-2"]);
+    expect(readyJobs(draft, new Set(), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-1"]);
+    expect(draft[1].dependencies).toEqual(["shot-1"]);
   });
 });

@@ -64,11 +64,18 @@ export async function assembleMovie(input: {
       const source = path.join(tempRoot, `source-${index}.${input.clips[index].extension ?? "mp4"}`);
       const target = path.join(tempRoot, `clip-${index}.mp4`);
       await writeFile(source, input.clips[index].bytes);
+      const clipDuration = input.clips[index].durationSeconds;
+      const audioBoundaryFilter = clipDuration
+        ? `atrim=start=0:end=${clipDuration.toFixed(3)},asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,afade=t=in:st=0:d=0.04,afade=t=out:st=${Math.max(0, clipDuration - 0.06).toFixed(3)}:d=0.06,loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur=${clipDuration.toFixed(3)},atrim=end=${clipDuration.toFixed(3)}`
+        : "aresample=48000:async=1:first_pts=0,loudnorm=I=-16:TP=-1.5:LRA=11";
       await execFileAsync(env().FFMPEG_PATH, [
         "-y", "-nostdin", "-threads", "1", "-filter_threads", "1", "-i", source,
         ...(input.clips[index].durationSeconds ? ["-t", input.clips[index].durationSeconds!.toFixed(3)] : []),
         "-vf", `scale=${dimensions}:force_original_aspect_ratio=decrease,pad=${dimensions}:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p`,
-        "-af", "aresample=48000:async=1:first_pts=0,loudnorm=I=-16:TP=-1.5:LRA=11",
+        // Every generated shot is an isolated audio context. Trimming, resetting
+        // timestamps and fading the few boundary milliseconds prevents packets,
+        // old speech or a finished music cue from leaking into the next shot.
+        "-af", audioBoundaryFilter,
         "-c:v", "libx264", "-threads:v", "1", "-preset", "veryfast", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart", target,

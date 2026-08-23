@@ -231,13 +231,15 @@ export async function enqueueAssembly(input: {
   projectId: string;
   format: "mp4" | "mov";
   resolution: "720p" | "1080p" | "4k";
+  sceneId?: string;
 }): Promise<{ exportId: string; jobId: string }> {
   return transaction(async (client) => {
     const versions = await client.query<{ versions: string }>(
-      "SELECT string_agg(id::text,',' ORDER BY created_at) versions FROM shot_versions WHERE active=true AND shot_id IN (SELECT id FROM shots WHERE project_id=$1)",
-      [input.projectId],
+      `SELECT string_agg(sv.id::text,',' ORDER BY sv.created_at) versions FROM shot_versions sv
+       JOIN shots sh ON sh.id=sv.shot_id WHERE sv.active=true AND sh.project_id=$1 AND ($2::text IS NULL OR sh.scene_id=$2)`,
+      [input.projectId, input.sceneId ?? null],
     );
-    const key = `assemble:${input.projectId}:${input.format}:${createHash("sha256").update(versions.rows[0]?.versions ?? "").digest("hex")}`;
+    const key = `assemble:${input.projectId}:${input.sceneId ?? "all"}:${input.format}:${createHash("sha256").update(versions.rows[0]?.versions ?? "").digest("hex")}`;
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [key]);
     const existing = await client.query<{ id: string; payload: { exportId?: string } }>("SELECT id,payload FROM jobs WHERE idempotency_key=$1", [key]);
     if (existing.rows[0]?.payload.exportId) return { exportId: existing.rows[0].payload.exportId, jobId: existing.rows[0].id };

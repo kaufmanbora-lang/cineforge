@@ -61,7 +61,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
     if (!plan) {
       await query("UPDATE projects SET status='planning',last_error=NULL,updated_at=now() WHERE id=$1", [id]);
-      const rawPlan = await generateStructuredMoviePlan({ projectId: id, idea: rows[0].prompt, durationSeconds: rows[0].duration_seconds });
+      const rawPlan = await generateStructuredMoviePlan({ projectId: id, idea: rows[0].prompt, durationSeconds: rows[0].duration_seconds, videoModelId: rows[0].model_id });
       const adaptedPlan = adaptMoviePlanPrompts(rawPlan, rows[0].model_id);
       await persistMoviePlan(adaptedPlan);
       // Persistence scopes every graph ID to the project. Queue only the stored

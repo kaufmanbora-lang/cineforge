@@ -92,7 +92,7 @@ async function processProjectPlan(databaseJobId: string) {
     await query("UPDATE projects SET status='planning',last_error=NULL,updated_at=now() WHERE id=$1", [job.project_id]);
     let plan = await latestMoviePlan(job.project_id);
     if (!plan) {
-      const rawPlan = await generateStructuredMoviePlan({ projectId: job.project_id, idea: job.prompt, durationSeconds: job.duration_seconds });
+      const rawPlan = await generateStructuredMoviePlan({ projectId: job.project_id, idea: job.prompt, durationSeconds: job.duration_seconds, videoModelId: job.model_id });
       await persistMoviePlan(adaptMoviePlanPrompts(rawPlan, job.model_id));
       plan = await latestMoviePlan(job.project_id);
       if (!plan) throw new Error("Сохранённый план фильма не найден после записи.");

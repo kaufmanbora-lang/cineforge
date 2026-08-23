@@ -140,11 +140,15 @@ export async function getObjectIfExists(key: string): Promise<{ bytes: Uint8Arra
   }
 }
 
-export async function signedObjectUrl(key: string, expiresIn = 900): Promise<string> {
+export async function signedObjectUrl(key: string, expiresIn = 900, downloadName?: string): Promise<string> {
   await ensureBucket();
   return getSignedUrl(
     publicS3(),
-    new GetObjectCommand({ Bucket: env().S3_BUCKET, Key: key }),
+    new GetObjectCommand({
+      Bucket: env().S3_BUCKET,
+      Key: key,
+      ResponseContentDisposition: downloadName ? `attachment; filename="${downloadName.replaceAll('"', "")}"` : undefined,
+    }),
     { expiresIn },
   );
 }

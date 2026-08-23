@@ -33,6 +33,7 @@ export function StudioWorkspace() {
   const [detail, setDetail] = useState<DetailPayload | null>(null);
   const [preview, setPreview] = useState<PreviewPayload>({ clips: [], movieUrl: null });
   const [selectedSceneId, setSelectedSceneId] = useState("");
+  const [selectedShotId, setSelectedShotId] = useState("");
   const [rightTab, setRightTab] = useState<"overview" | "scenes" | "memory">("overview");
   const [budgetOpen, setBudgetOpen] = useState(false);
   const [busy, setBusy] = useState<"planning" | "generating" | null>(null);
@@ -41,6 +42,7 @@ export function StudioWorkspace() {
   const [timelineZoom, setTimelineZoom] = useState(100);
   const [voiceState, setVoiceState] = useState<"recording" | "transcribing" | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const autoContinueRef = useRef(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const microphoneStreamRef = useRef<MediaStream | null>(null);
 
@@ -49,7 +51,9 @@ export function StudioWorkspace() {
   const plan = detail?.plan;
   const scenes = plan?.scenes ?? [];
   const selectedScene = scenes.find((scene) => scene.id === selectedSceneId) ?? scenes[0];
-  const selectedPreview = preview.clips.find((clip) => clip.scene_id === selectedScene?.id) ?? null;
+  const selectedPreview = preview.clips.find((clip) => clip.shot_id === selectedShotId && clip.scene_id === selectedScene?.id)
+    ?? preview.clips.find((clip) => clip.scene_id === selectedScene?.id)
+    ?? null;
   const activeJobs = detail?.jobs.filter((job) => ["queued","generating","validating","retrying"].includes(job.state)) ?? [];
   const latestCheckpoint = detail?.checkpoints[0];
   const progress = detail?.project.progress ?? 0;
@@ -68,7 +72,11 @@ export function StudioWorkspace() {
       setResolution(payload.project.resolution); setAspectRatio(payload.project.aspectRatio); setBudget(Number(payload.project.maximumBudgetUsd));
       setDraft(payload.project.renderTier !== "final");
       setSelectedSceneId((current) => current && payload.plan?.scenes.some((scene: Scene) => scene.id === current) ? current : payload.plan?.scenes?.[0]?.id ?? "");
-      if (previewResponse.ok) setPreview(await previewResponse.json());
+      if (previewResponse.ok) {
+        const nextPreview = await previewResponse.json() as PreviewPayload;
+        setPreview(nextPreview);
+        setSelectedShotId((current) => nextPreview.clips.some((clip) => clip.shot_id === current) ? current : nextPreview.clips[0]?.shot_id ?? "");
+      }
       if (payload.project.lastError?.message) {
         setNotice(errorMessageRu(payload.project.lastError.message, "Проект остановлен с ошибкой. Можно безопасно повторить действие."));
       } else if (payload.project.status === "planning") {
@@ -111,9 +119,15 @@ export function StudioWorkspace() {
     return () => window.clearInterval(interval);
   }, [detail, loadProject, projectId]);
 
+  useEffect(() => {
+    if (!autoContinueRef.current || !selectedPreview) return;
+    autoContinueRef.current = false;
+    void videoRef.current?.play().catch(() => setNotice("Следующий кадр выбран. Нажмите воспроизведение, если браузер заблокировал автозапуск."));
+  }, [selectedPreview]);
+
   function changeModel(nextId: string) { setModelId(nextId); setResolution((current) => normalizeResolution(nextId, current)); }
   function startNewProject() {
-    setProjectId(""); setDetail(null); setPreview({ clips: [], movieUrl: null }); setSelectedSceneId(""); setPrompt(""); setBudgetOpen(false);
+    setProjectId(""); setDetail(null); setPreview({ clips: [], movieUrl: null }); setSelectedSceneId(""); setSelectedShotId(""); setPrompt(""); setBudgetOpen(false);
     localStorage.removeItem("cineforge.projectId"); sessionStorage.removeItem("cineforge.preparedProject"); setNotice("Опишите идею нового фильма.");
   }
 
@@ -209,7 +223,16 @@ export function StudioWorkspace() {
     finally { setBusy(null); }
   }
 
-  function selectRelative(offset: number) { const index = scenes.findIndex((scene) => scene.id === selectedScene?.id); const next = scenes[Math.max(0, Math.min(scenes.length - 1, index + offset))]; if (next) setSelectedSceneId(next.id); }
+  function selectRelative(offset: number) { const index = scenes.findIndex((scene) => scene.id === selectedScene?.id); const next = scenes[Math.max(0, Math.min(scenes.length - 1, index + offset))]; if (next) { setSelectedSceneId(next.id); setSelectedShotId(preview.clips.find((clip) => clip.scene_id === next.id)?.shot_id ?? ""); } }
+  function continuePreview() {
+    if (!selectedPreview) return;
+    const index = preview.clips.findIndex((clip) => clip.shot_id === selectedPreview.shot_id);
+    const next = preview.clips[index + 1];
+    if (!next) return;
+    autoContinueRef.current = true;
+    setSelectedSceneId(next.scene_id);
+    setSelectedShotId(next.shot_id);
+  }
   async function togglePreview() { if (!videoRef.current) return; if (videoRef.current.paused) await videoRef.current.play(); else videoRef.current.pause(); }
   async function openFullscreen() { const node = videoRef.current?.parentElement; if (node?.requestFullscreen) await node.requestFullscreen(); }
 
@@ -237,7 +260,7 @@ export function StudioWorkspace() {
     </section>
 
     <section className="preview-panel" aria-label="Предпросмотр фильма">
-      <div className="preview-frame">{selectedPreview ? <video controls key={selectedPreview.url} ref={videoRef} src={selectedPreview.url}/> : <div className="preview-empty"><Film size={36}/><strong>{selectedScene ? "Кадр ещё не создан" : "Сцена не выбрана"}</strong><span>{selectedScene ? "Видео появится после успешной контрольной точки." : "Создайте план фильма, чтобы построить граф сцен."}</span></div>}{selectedScene ? <div className="preview-corner"><span>СЦЕНА {selectedScene.number}</span><strong>{selectedScene.title}</strong></div> : null}</div>
+      <div className="preview-frame">{selectedPreview ? <video controls key={selectedPreview.url} onEnded={continuePreview} ref={videoRef} src={selectedPreview.url}/> : <div className="preview-empty"><Film size={36}/><strong>{selectedScene ? "Кадр ещё не создан" : "Сцена не выбрана"}</strong><span>{selectedScene ? "Видео появится после успешной контрольной точки." : "Создайте план фильма, чтобы построить граф сцен."}</span></div>}{selectedScene ? <div className="preview-corner"><span>СЦЕНА {selectedScene.number}</span><strong>{selectedScene.title}</strong></div> : null}</div>
       <div className="transport"><strong>{selectedScene ? formatTimecode(sceneStart(scenes, selectedScene.id)) : "00:00:00"}</strong><span className="fit-control">{selectedPreview ? `Кадр ${selectedPreview.shot_id} · v${selectedPreview.version}` : "Нет видео"}</span><div className="transport-center"><button aria-label="Предыдущая сцена" disabled={!selectedScene || scenes[0]?.id === selectedScene.id} onClick={() => selectRelative(-1)} type="button"><Play size={17} style={{ transform: "rotate(180deg)" }}/></button>{selectedPreview ? <button aria-label="Воспроизвести или приостановить" className="play-control" onClick={() => void togglePreview()} type="button"><Play size={21} fill="currentColor"/></button> : null}<button aria-label="Следующая сцена" disabled={!selectedScene || scenes.at(-1)?.id === selectedScene.id} onClick={() => selectRelative(1)} type="button"><Play size={17}/></button></div><div className="transport-actions">{selectedPreview ? <button aria-label="Полноэкранный режим" onClick={() => void openFullscreen()} type="button"><Expand size={17}/></button> : null}</div></div>
       <div className="seek-line"><i style={{ width: `${progress}%` }}/><b style={{ left: `${progress}%` }}/></div>
     </section>

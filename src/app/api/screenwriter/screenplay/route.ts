@@ -16,7 +16,7 @@ export async function POST(request: Request) {
     const body = Body.parse(await request.json());
     const projects = await query<{ model_id: string; duration_seconds: number }>("SELECT model_id,duration_seconds FROM projects WHERE id=$1", [body.projectId]);
     if (!projects[0]) return NextResponse.json({ error: "Проект не найден." }, { status: 404 });
-    const plan = adaptMoviePlanPrompts(await generateStructuredMoviePlan({ ...body, durationSeconds: projects[0].duration_seconds }), projects[0].model_id);
+    const plan = adaptMoviePlanPrompts(await generateStructuredMoviePlan({ ...body, durationSeconds: projects[0].duration_seconds, videoModelId: projects[0].model_id }), projects[0].model_id);
     await persistMoviePlan(plan);
     return NextResponse.json({ plan });
   } catch (error) {

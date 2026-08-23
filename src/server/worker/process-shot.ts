@@ -15,6 +15,7 @@ import { contentHash } from "@/server/movie/content-hash";
 import { extractFinalFrame, extractRepresentativeFrame } from "@/server/movie/ffmpeg";
 import { evaluateShot, type ShotQcReport } from "@/server/providers/openai";
 import type { ReferenceImage } from "@/server/providers/video/types";
+import type { AudioContext, ContinuityState } from "@/domain/movie";
 
 type PersistedProviderOperation = ProviderOperation & { specHash?: string; startedAt?: string };
 
@@ -25,7 +26,7 @@ interface JobRow {
   shot_id: string;
   attempt: number;
   max_attempts: number;
-  payload: { providerModelId?: string; shot: { durationSeconds: number; generationPrompt?: { prompt: string; negativeDirectives: string[]; seed: number | null }; continuity: { requiredReferences: string[] }; audioContext?: { dialogue: Array<{ id: string; characterId: string; text: string; delivery: string; startSeconds: number; durationSeconds: number }> } }; specHash: string };
+  payload: { providerModelId?: string; editCommand?: string; shot: { durationSeconds: number; generationPrompt?: { prompt: string; negativeDirectives: string[]; seed: number | null }; continuity: ContinuityState; audioContext?: AudioContext }; specHash: string };
   model_id: string;
   resolution: Resolution;
   aspect_ratio: "16:9" | "9:16";
@@ -104,19 +105,34 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       const apiKey = await getProviderKey("google");
       if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
       providerApiKey = apiKey;
+      const references = await loadShotReferences(job, effectiveModelId);
+      const previousInteractionId = effectiveModelId.startsWith("gemini-omni")
+        ? await loadPreviousInteractionId(job, Boolean(job.payload.editCommand))
+        : undefined;
       const request: VideoGenerationRequest = {
         projectId: job.project_id,
         sceneId: job.scene_id,
         shotId: job.shot_id,
         modelId: effectiveModelId,
-        prompt: prompt.prompt,
-        negativeDirectives: prompt.negativeDirectives,
+        prompt: buildContinuityChainPrompt(prompt.prompt, job.payload.shot.continuity, job.payload.shot.audioContext, references.some((reference) => reference.role === "first-frame")),
+        negativeDirectives: [...new Set([
+          ...prompt.negativeDirectives,
+          "character identity drift",
+          "wardrobe changes",
+          "teleportation",
+          "weather or lighting reset",
+          "previous dialogue, music or sound leaking into this shot",
+        ])],
         durationSeconds: providerDuration,
         resolution: job.resolution,
         aspectRatio: job.aspect_ratio,
         seed: prompt.seed,
-        references: await loadShotReferences(job, effectiveModelId),
+        references,
         fastMode: job.render_tier === "draft",
+        previousInteractionId,
+        editInstruction: job.payload.editCommand && previousInteractionId
+          ? buildTargetedEditInstruction(job.payload.editCommand, job.shot_id)
+          : undefined,
       };
       const adapter = googleVideoAdapter(effectiveModelId);
       const resumable = resumableProviderOperation(job.shot_last_operation, job.payload.specHash);
@@ -127,7 +143,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         if (Date.now() - Date.parse(providerStartedAt) >= 30 * 60_000) {
           throw Object.assign(new Error("Google video operation did not complete within 30 minutes."), { status: 408, code: "GOOGLE_TIMEOUT" });
         }
-        await new Promise((resolve) => setTimeout(resolve, 10_000));
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
         await query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state='generating'", [job.id]).catch(() => undefined);
         operation = await adapter.poll(operation, apiKey);
         await query("UPDATE shots SET last_operation=$2 WHERE id=$1", [job.shot_id, JSON.stringify(durableProviderOperation(operation, job.payload.specHash, providerStartedAt))]);
@@ -164,7 +180,8 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     if (localFilePath) await rm(localFilePath, { force: true }).catch(() => undefined);
     await query("UPDATE jobs SET state='validating' WHERE id=$1", [job.id]).catch(() => undefined);
     // Fast Draft is the interactive path: publish the provider result immediately.
-    // Expensive vision QC and consistent-voice replacement remain enabled for Final.
+    // Expensive vision QC remains enabled for Final; deterministic dialogue voices
+    // are kept in both tiers so a character cannot change voice between shots.
     const qc = job.render_tier === "draft"
       ? null
       : inMemoryBytes ? await runShotQc(job, inMemoryBytes, operation.output.mimeType, operation.operationId) : null;
@@ -188,7 +205,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       : null;
     const assetId = await withDurableDatabaseRetry(() => persistCompletedAsset(job, storageKey, checksum, stored.byteSize, operation.operationId, cost, classifiedQc));
     const dialogueSegments = job.payload.shot.audioContext?.dialogue ?? [];
-    if (dialogueSegments.length && job.render_tier === "final") {
+    if (dialogueSegments.length && await getProviderKey("openai")) {
       const dialoguePayload = { dialogueSegments, originalAssetId: assetId, originalStorageKey: storageKey };
       await enqueueDialoguePatch({
         projectId: job.project_id,
@@ -321,6 +338,41 @@ export function generationAccountingCost(projectedCost: number, outstandingReser
   return staged ? Math.max(0, outstandingReservation) : projectedCost;
 }
 
+export function buildContinuityChainPrompt(
+  originalPrompt: string,
+  continuity: ContinuityState,
+  audio: AudioContext | undefined,
+  hasFirstFrame: boolean,
+): string {
+  const characterState = Object.entries(continuity.characterStates).map(([characterId, state]) => ({
+    characterId,
+    wardrobeId: state.wardrobeId,
+    position: state.position,
+    heldProps: state.heldProps,
+    injuries: state.injuries,
+    appearanceChanges: state.appearanceChanges,
+    emotionalState: state.emotionalState,
+  }));
+  const dialogue = audio?.dialogue.map((line) => ({ speaker: line.characterName, exactText: line.text, delivery: line.delivery })) ?? [];
+  return [
+    originalPrompt,
+    "CINEFORGE STRICT CONTINUITY CONTRACT:",
+    hasFirstFrame
+      ? "The supplied first-frame image is the exact final frame of the previous chronological shot. Begin on that exact composition and continue its physical movement. Do not reset, teleport, reverse or randomly reposition any person, vehicle, prop or camera."
+      : "Preserve the canonical project state and locked references exactly; do not invent a visual reset.",
+    `Canonical character state: ${JSON.stringify(characterState)}.`,
+    `Canonical location state: ${JSON.stringify({ locationId: continuity.locationId, ...continuity.locationState })}.`,
+    `Immutable locked values: ${JSON.stringify(continuity.lockedValues)}.`,
+    "PHYSICAL WORLD CONTRACT: preserve ordinary geometry, gravity, inertia, collisions and occlusion. People, vehicles, walls, doors, furniture and props are solid. They cannot intersect, pass through one another, teleport, reverse direction without motion, change scale or appear/disappear between frames.",
+    `Exact dialogue for this shot only: ${JSON.stringify(dialogue)}.`,
+    "AUDIO ISOLATION: start a completely new audio context at 00:00. Do not repeat, continue or leak any word, voice, music, ambience or sound effect from a previous generated clip. Characters not listed as speakers remain silent. End every sound inside this shot boundary.",
+  ].join("\n");
+}
+
+export function buildTargetedEditInstruction(command: string, shotId: string): string {
+  return `TARGETED NON-DESTRUCTIVE EDIT OF SHOT ${shotId}: ${command}. Change only the explicitly requested visible detail. Preserve all other pixels and timing as closely as the model permits: same identity, face, voice, pose, movement, camera, composition, lighting, weather, location, props and audio. Never alter another shot.`;
+}
+
 async function withDurableDatabaseRetry<T>(operation: () => Promise<T>): Promise<T> {
   const deadline = Date.now() + 10 * 60_000;
   let delayMs = 1_000;
@@ -367,6 +419,17 @@ async function loadShotReferences(job: JobRow, modelId: string): Promise<Referen
     }
   }
   return references;
+}
+
+async function loadPreviousInteractionId(job: JobRow, editingCurrentShot: boolean): Promise<string | undefined> {
+  if (editingCurrentShot) return job.shot_last_operation?.output?.interactionId;
+  const previousShotId = job.payload.shot.continuity.previousShotId;
+  if (!previousShotId) return undefined;
+  const rows = await query<{ last_operation: PersistedProviderOperation | null }>(
+    "SELECT last_operation FROM shots WHERE project_id=$1 AND id=$2",
+    [job.project_id, previousShotId],
+  );
+  return rows[0]?.last_operation?.output?.interactionId;
 }
 
 async function runShotQc(job: JobRow, bytes: Uint8Array, mimeType: string, operationId: string): Promise<ShotQcReport | null> {

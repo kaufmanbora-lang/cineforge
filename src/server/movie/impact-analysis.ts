@@ -18,18 +18,23 @@ export interface ImpactAnalysis {
   reason: string;
 }
 
-const VISUAL_TERMS = /rain|дожд|цвет|black|white|чёрн|бел|remove person|убер.*человек|lighting|свет|appearance|внешност/i;
+const VISUAL_TERMS = /rain|дожд|цвет|black|white|чёрн|бел|remove person|убер.*человек|убер.*машин|lighting|свет|appearance|внешност|одежд|куртк|пальто|рубаш|плать|wardrobe|outfit|лиц|волос|погод|локац|фон/i;
 const DIALOGUE_TERMS = /слово|реплик|говор|dialogue|says|phrase|фраз|tone|груб|спокой/i;
 
-export function analyzeEdit(command: string, timeline: TimelineIndexEntry[]): ImpactAnalysis {
+export function analyzeEdit(command: string, timeline: TimelineIndexEntry[], selected?: { sceneId?: string; shotId?: string }): ImpactAnalysis {
   if (!timeline.length) throw new Error("Timeline is empty.");
   const timestamp = parseTimestamp(command);
   const sceneNumber = parseSceneNumber(command);
+  const explicitTarget = selected?.shotId
+    ? timeline.find((entry) => entry.shotId === selected.shotId)
+    : selected?.sceneId
+      ? timeline.find((entry) => entry.sceneId === selected.sceneId)
+      : undefined;
   const target = timestamp !== null
     ? timeline.find((entry) => timestamp >= entry.startSeconds && timestamp < entry.endSeconds)
     : sceneNumber !== null
       ? timeline.find((entry) => entry.sceneNumber === sceneNumber)
-      : timeline[0];
+      : explicitTarget ?? timeline[0];
   if (!target) throw new Error("The requested edit does not match a scene or timestamp.");
 
   const dialogue = DIALOGUE_TERMS.test(command);

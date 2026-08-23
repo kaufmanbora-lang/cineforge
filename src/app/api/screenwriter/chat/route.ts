@@ -151,7 +151,7 @@ async function prepareMovieFromScreenwriterAction(action: z.infer<typeof Prepare
   let plan = await latestMoviePlan(projectId);
   const plannedModelId = plan?.scenes[0]?.shots[0]?.generationPrompt?.modelId;
   if (!plan || plan.summary.durationSeconds !== action.durationSeconds || plannedModelId !== action.modelId) {
-    const rawPlan = await generateStructuredMoviePlan({ projectId, idea: userMessage, durationSeconds: action.durationSeconds });
+    const rawPlan = await generateStructuredMoviePlan({ projectId, idea: userMessage, durationSeconds: action.durationSeconds, videoModelId: action.modelId });
     plan = adaptMoviePlanPrompts(rawPlan, action.modelId);
     await persistMoviePlan(plan);
     await query("UPDATE projects SET title=$2,model_id=$3,resolution=$4,duration_seconds=$5,estimated_cost_usd=$6,total_shots=$7 WHERE id=$1", [
