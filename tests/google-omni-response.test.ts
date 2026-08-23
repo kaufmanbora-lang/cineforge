@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, resumableProviderOperation, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
+import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
@@ -281,6 +281,30 @@ describe("Google Omni response parsing", () => {
   it("does not label every failed precondition as a billing failure", () => {
     expect(normalizeGoogleProviderError({ status: 400, message: "FAILED_PRECONDITION: another precondition" }).code)
       .toBe("GOOGLE_REQUEST_FAILED");
+  });
+
+  it("classifies a billing-tier spend limit as quota before billing", () => {
+    expect(normalizeGoogleProviderError({ status: 429, message: "RESOURCE_EXHAUSTED: spend limit for billing tier 1" }).code)
+      .toBe("GOOGLE_QUOTA_EXHAUSTED");
+  });
+
+  it("classifies only an explicit depleted Prepay balance as billing", () => {
+    expect(normalizeGoogleProviderError({ status: 400, message: "Your prepayment credits are depleted" }).code)
+      .toBe("GOOGLE_BILLING_NOT_READY");
+    expect(normalizeGoogleProviderError({ status: 400, message: "Billing metadata failed a different precondition" }).code)
+      .toBe("GOOGLE_REQUEST_FAILED");
+  });
+
+  it("repairs the old cross-model billing fallback without losing the shot beat", () => {
+    const plannedShot = { ...shot("shot-billing-repair"), title: "Выход команды", action: "Ник Фьюри и агенты спокойно выходят из машины и подходят к Мистерио." };
+    const legacy = veoNeutralRescuePayload({ providerModelId: "gemini-omni-flash-preview", shot: plannedShot, specHash: "original" });
+    expect(shouldRestoreLegacyBillingFallback({ payload: legacy })).toBe(true);
+    const restored = restoreOmniAfterLegacyBillingFallbackPayload(legacy);
+    expect(restored.providerModelId).toBe("gemini-omni-flash-preview");
+    expect(restored.shot.generationPrompt?.prompt).toContain("Выход команды");
+    expect(restored.shot.generationPrompt?.prompt).toContain("CINEFORGE OMNI NEUTRAL RESCUE");
+    expect(restored.shot.generationPrompt?.prompt).not.toContain("CINEFORGE VEO NEUTRAL RESCUE");
+    expect(restored.specHash).not.toBe(legacy.specHash);
   });
 
   it("does not charge a recovered staged video twice", () => {

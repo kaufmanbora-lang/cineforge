@@ -98,6 +98,8 @@ export async function enqueueJobs(jobs: PlannedJob[]): Promise<number> {
 
 export async function enqueueReadyProjectJobs(projectId: string): Promise<number> {
   const ready = await transaction(async (client) => {
+    const project = await client.query<{ status: string }>("SELECT status FROM projects WHERE id=$1 FOR UPDATE", [projectId]);
+    if (!project.rows[0] || ["paused", "failed", "cancelled", "completed"].includes(project.rows[0].status)) return [];
     const completed = await client.query<{ id: string }>("SELECT id FROM shots WHERE project_id=$1 AND state='completed'", [projectId]);
     const completedIds = new Set(completed.rows.map((row) => row.id));
     const planned = await client.query<{ id: string; type: string; idempotency_key: string; priority: number; payload: { shot?: { dependencies?: string[] } } }>(

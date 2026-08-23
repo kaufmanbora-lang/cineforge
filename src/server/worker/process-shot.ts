@@ -15,7 +15,7 @@ import { contentHash } from "@/server/movie/content-hash";
 import { extractFinalFrame, extractRepresentativeFrame } from "@/server/movie/ffmpeg";
 import { evaluateShot, type ShotQcReport } from "@/server/providers/openai";
 import type { ReferenceImage } from "@/server/providers/video/types";
-import type { AudioContext, ContinuityState } from "@/domain/movie";
+import type { AudioContext, ContinuityState, Shot } from "@/domain/movie";
 import { realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 
 type PersistedProviderOperation = ProviderOperation & { specHash?: string; startedAt?: string };
@@ -27,7 +27,7 @@ interface JobRow {
   shot_id: string;
   attempt: number;
   max_attempts: number;
-  payload: { providerModelId?: string; omitProviderReferences?: boolean; editCommand?: string; shot: { durationSeconds: number; generationPrompt?: { prompt: string; negativeDirectives: string[]; seed: number | null }; continuity: ContinuityState; audioContext?: AudioContext }; specHash: string };
+  payload: { providerModelId?: string; omitProviderReferences?: boolean; editCommand?: string; shot: Shot; specHash: string };
   model_id: string;
   resolution: Resolution;
   aspect_ratio: "16:9" | "9:16";
@@ -39,7 +39,7 @@ interface JobRow {
   shot_last_operation: PersistedProviderOperation | null;
 }
 
-export async function processShot(databaseJobId: string): Promise<{ cached: boolean; storageKey: string; retrying?: boolean }> {
+export async function processShot(databaseJobId: string): Promise<{ cached: boolean; storageKey: string; retrying?: boolean; paused?: boolean; failed?: boolean }> {
   const rows = await query<JobRow>(
     `WITH claimed AS (
        UPDATE jobs SET state='generating',started_at=now(),attempt=attempt+1,updated_at=now()
@@ -55,6 +55,12 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   // Another worker/reconciler may already own this database job. Treat that as
   // an idempotent no-op; only the atomic claimant may call the paid provider.
   if (!job) return { cached: false, storageKey: "", retrying: true };
+  if (shouldRestoreLegacyBillingFallback(job)) {
+    job.payload = restoreOmniAfterLegacyBillingFallbackPayload(job.payload);
+    job.shot_last_operation = null;
+    await query("UPDATE jobs SET payload=$2,last_error=NULL WHERE id=$1", [job.id, JSON.stringify(job.payload)]);
+    await query("UPDATE shots SET last_operation=NULL WHERE id=$1", [job.shot_id]);
+  }
   if (shouldSwitchFilteredVeoToOmni(job)) {
     job.payload = omniFallbackPayload(job.payload);
     job.shot_last_operation = null;
@@ -96,8 +102,10 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   // worker/database restart must never charge or reserve the same video twice.
   const staged = await getObjectIfExists(storageKey);
   if (!staged && !await reserveBudget(job.id, job.project_id, projectedCost)) {
-    await pauseProjectJobs(job.project_id, { code: "BUDGET_REACHED", message: "Maximum generation budget reached." });
-    throw new Error("Maximum generation budget reached; project paused.");
+    const reason = { code: "BUDGET_REACHED", message: "Достигнут максимальный бюджет проекта. Готовые кадры сохранены; увеличьте лимит и продолжите с контрольной точки." };
+    await pauseProjectJobs(job.project_id, reason);
+    await query("UPDATE jobs SET state='paused',last_error=$2,reserved_cost_usd=0 WHERE id=$1", [job.id, JSON.stringify(reason)]);
+    return { cached: false, storageKey: "", paused: true };
   }
   let providerCompleted = false;
   try {
@@ -271,23 +279,24 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
-    if (failure === "billing" && job.payload.providerModelId === "gemini-omni-flash-preview" && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE")) {
-      const nextPayload = veoNeutralRescuePayload(job.payload);
-      await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_VEO_BILLING_FALLBACK"));
-      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
-      return { cached: false, storageKey: "", retrying: true };
-    }
     const decision = retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
-    if (decision.pauseProject) await withDurableDatabaseRetry(() => pauseProjectJobs(job.project_id, { code: failure, message }));
+    if (decision.pauseProject) {
+      await withDurableDatabaseRetry(() => pauseProjectJobs(job.project_id, { code: failure, message }));
+      await withDurableDatabaseRetry(() => query(
+        "UPDATE jobs SET state='paused',last_error=$2,reserved_cost_usd=0 WHERE id=$1",
+        [job.id, JSON.stringify({ failure, message })],
+      ));
+      return { cached: false, storageKey: "", paused: true };
+    }
     await withDurableDatabaseRetry(() => query(
       "UPDATE jobs SET state=$2, last_error=$3, available_at=now()+($4::text || ' milliseconds')::interval WHERE id=$1",
-      [job.id, decision.pauseProject ? "paused" : decision.retry ? "queued" : "failed", JSON.stringify({ failure, message }), decision.delayMs],
+      [job.id, decision.retry ? "queued" : "failed", JSON.stringify({ failure, message }), decision.delayMs],
     ));
-    if (!decision.pauseProject && !decision.retry) await withDurableDatabaseRetry(() => query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify({ failure, message, shotId: job.shot_id })]));
+    if (!decision.retry) await withDurableDatabaseRetry(() => query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify({ failure, message, shotId: job.shot_id })]));
     if (decision.retry) {
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: decision.delayMs });
     }
-    throw error;
+    return { cached: false, storageKey: "", retrying: decision.retry, failed: !decision.retry };
   }
   } finally {
     clearInterval(heartbeat);
@@ -319,13 +328,41 @@ export function omniNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pa
     && !containsLegacySensitiveTerms(`${generationPrompt.prompt} ${generationPrompt.negativeDirectives.join(" ")}`);
   if (alreadyClean) return payload;
   const seconds = payload.shot.durationSeconds;
-  const prompt = `Create one ${seconds}-second photorealistic live-action continuation of the supplied previous frame. Preserve the exact same adult characters, faces, wardrobe, location, weather, lighting, object positions and camera direction. Calm professional visitors move naturally through the already open doorway or across the room, then stop at their established positions for a quiet serious conversation. Their hands stay naturally relaxed and their body language remains ordinary and respectful. Plain clothing has no visible text. Show a continuous physically reachable walking path, solid walls and furniture, natural eyelines between the adults, and realistic door movement. Clean audio start with only subtle room ambience. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE OMNI NEUTRAL RESCUE.`;
+  const action = neutralizeSensitiveStoryTerms(`${payload.shot.title}. ${payload.shot.action}`);
+  const camera = payload.shot.camera;
+  const prompt = `Create one ${seconds}-second photorealistic live-action continuation of the supplied previous frame. Preserve the exact same established adult characters, faces, wardrobe, vehicle, location, weather, lighting, object positions and camera direction. Continue this exact story beat without a cut: ${action}. Camera: ${camera.shotSize}, ${camera.angle}, ${camera.lens}, ${camera.movement}; ${camera.framing}. Lighting: ${payload.shot.lighting}. Visual style: ${payload.shot.visualStyle}. Every person and object follows one continuous physically reachable path; solid walls, doors, vehicles and furniture keep fixed geometry; nobody teleports, crosses a solid surface or looks into the camera. Calm ordinary body language, no confrontation and no readable logos. Clean audio start with only the ambience and effects specified for this shot; no dialogue or audio from an earlier shot. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE OMNI NEUTRAL RESCUE.`;
   const shot = { ...payload.shot, generationPrompt: {
     ...generationPrompt,
     prompt,
     negativeDirectives: ["cartoon look", "camera eye contact", "teleportation", "geometry intersection", "readable text"],
   } };
   return { ...payload, providerModelId: "gemini-omni-flash-preview", shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview", neutralRescue: 1 }) };
+}
+
+export function shouldRestoreLegacyBillingFallback(job: Pick<JobRow, "payload">): boolean {
+  return job.payload.providerModelId === "veo-3.1-fast-generate-preview"
+    && Boolean(job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE"));
+}
+
+export function restoreOmniAfterLegacyBillingFallbackPayload(payload: JobRow["payload"]): JobRow["payload"] {
+  const generationPrompt = payload.shot.generationPrompt;
+  if (!generationPrompt) return { ...payload, providerModelId: "gemini-omni-flash-preview" };
+  const restored = omniNeutralRescuePayload({
+    ...payload,
+    providerModelId: "gemini-omni-flash-preview",
+    shot: { ...payload.shot, generationPrompt: { ...generationPrompt, prompt: "" } },
+  });
+  return { ...restored, specHash: contentHash({ shot: restored.shot, providerModelId: restored.providerModelId, restoredBillingFallback: 1 }) };
+}
+
+function neutralizeSensitiveStoryTerms(value: string): string {
+  return value
+    .replace(/Ник(?:о)?\s+Фьюри/giu, "the established adult team leader")
+    .replace(/Мистерио/giu, "the established adult man in a green and burgundy theatrical outfit")
+    .replace(/Marvel|Человек(?:а)?[- ]паука/giu, "the original fictional production")
+    .replace(/автомат(?:ами|а|ы|ов)?|винтовк(?:ами|а|и|у)?|оружи(?:е|я|ем)/giu, "secured professional equipment")
+    .replace(/задерж(?:ать|ивает|ивают|ание|ан|ана)|арест(?:овать|овывает|овывают|ован)?|наручник(?:и|ами|ов)?/giu, "calm voluntary handover")
+    .replace(/спецназ|агент(?:ы|ами|а|ов)?/giu, "professional team members");
 }
 
 export function veoNeutralRescuePayload(payload: JobRow["payload"]): JobRow["payload"] {
@@ -595,7 +632,7 @@ async function persistCompletedAsset(job: JobRow, storageKey: string, checksum: 
     );
     const progress = count.rows[0].total ? (count.rows[0].completed / count.rows[0].total) * 100 : 0;
     await client.query(
-      "UPDATE projects SET completed_shots=$2::integer, total_shots=$3::integer, progress=$4::numeric, spent_usd=spent_usd+$5::numeric,reserved_usd=GREATEST(0,reserved_usd-$5::numeric), status=CASE WHEN $2::integer=$3::integer THEN 'validating'::project_status ELSE 'generating'::project_status END WHERE id=$1",
+      "UPDATE projects SET completed_shots=$2::integer, total_shots=$3::integer, progress=$4::numeric, spent_usd=spent_usd+$5::numeric,reserved_usd=GREATEST(0,reserved_usd-$5::numeric), status=CASE WHEN $2::integer=$3::integer THEN 'validating'::project_status WHEN status='paused' THEN 'paused'::project_status ELSE 'generating'::project_status END WHERE id=$1",
       [job.project_id, count.rows[0].completed, count.rows[0].total, progress, cost],
     );
     const states = await client.query<{ id: string; state: string }>("SELECT id,state FROM shots WHERE project_id=$1 ORDER BY created_at", [job.project_id]);
