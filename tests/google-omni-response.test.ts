@@ -161,6 +161,8 @@ describe("Google Omni response parsing", () => {
     const retried = moderationRetryPayload(payload);
     expect(retried.specHash).not.toBe(payload.specHash);
     expect(retried.shot.generationPrompt?.prompt).toContain("CINEFORGE SAFETY RETRY");
+    expect(retried.shot.generationPrompt?.prompt).toContain("SAFE FICTIONAL PRODUCTION FRAME");
+    expect(retried.shot.generationPrompt?.prompt).not.toMatch(/weapon|violence|injury|pursuit|government/i);
     expect(moderationRetryPayload(retried)).toBe(retried);
   });
 
@@ -222,7 +224,10 @@ describe("Google Omni response parsing", () => {
     expect(bridge.providerModelId).toBe("veo-3.1-fast-generate-preview");
     expect(bridge.omitProviderReferences).toBe(true);
     expect(bridge.shot.generationPrompt?.prompt).toContain("CINEFORGE VEO SAFE BRIDGE");
+    expect(providerAudioContext(bridge.shot.generationPrompt!.prompt, neutral.shot.audioContext)?.dialogue).toEqual([]);
     expect(veoSafeBridgePayload(bridge)).toBe(bridge);
+    const legacy = { ...bridge, shot: { ...bridge.shot, generationPrompt: { ...bridge.shot.generationPrompt!, prompt: bridge.shot.generationPrompt!.prompt.replace("SAFE FICTIONAL PRODUCTION FRAME. ", "") } } };
+    expect(veoSafeBridgePayload(legacy).shot.generationPrompt?.prompt).toContain("SAFE FICTIONAL PRODUCTION FRAME");
   });
 
   it("resumes a persisted SDK polling failure without starting a second paid generation", () => {

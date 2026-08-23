@@ -67,6 +67,12 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     await query("UPDATE jobs SET payload=$2 WHERE id=$1", [job.id, JSON.stringify(job.payload)]);
     await query("UPDATE shots SET last_operation=NULL WHERE id=$1", [job.shot_id]);
   }
+  if (shouldRefreshVeoSafeBridge(job)) {
+    job.payload = veoSafeBridgePayload(job.payload);
+    job.shot_last_operation = null;
+    await query("UPDATE jobs SET payload=$2 WHERE id=$1", [job.id, JSON.stringify(job.payload)]);
+    await query("UPDATE shots SET last_operation=NULL WHERE id=$1", [job.shot_id]);
+  }
   const heartbeat = setInterval(() => {
     void query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state IN ('generating','validating')", [job.id]).catch(() => undefined);
   }, 10_000);
@@ -292,7 +298,7 @@ export function moderationRetryPayload(payload: JobRow["payload"]): JobRow["payl
   const generationPrompt = payload.shot.generationPrompt;
   if (!generationPrompt) return payload;
   if (generationPrompt.prompt.includes("CINEFORGE SAFETY RETRY")) return payload;
-  const prompt = `${generationPrompt.prompt}\nCINEFORGE SAFETY RETRY: This is a peaceful fictional cinematic scene with fictional people and organizations. No weapons, injury, violence, dangerous driving, pursuit, real government insignia, public figures, or readable brands. Keep every safe visual, camera, continuity, wardrobe, location, and audio detail unchanged.`;
+  const prompt = `${generationPrompt.prompt}\nCINEFORGE SAFETY RETRY: Peaceful fictional cinematic production with adult actors, relaxed ordinary movement, respectful body language, plain wardrobe, stable architecture, natural lighting and coherent camera continuity. Keep the established safe visual, wardrobe and location details unchanged. SAFE FICTIONAL PRODUCTION FRAME.`;
   const shot = { ...payload.shot, generationPrompt: { ...generationPrompt, prompt } };
   return { ...payload, shot, specHash: contentHash({ shot, safetyRetry: 1 }) };
 }
@@ -337,10 +343,13 @@ export function veoNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pay
 }
 
 export function veoSafeBridgePayload(payload: JobRow["payload"]): JobRow["payload"] {
-  if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO SAFE BRIDGE")) return payload;
   const generationPrompt = payload.shot.generationPrompt;
   if (!generationPrompt) return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", omitProviderReferences: true };
-  const prompt = "Create one continuous photorealistic live-action continuity bridge at the same established location and time of day. Hold on stable architectural details, the doorway, furniture and persistent vehicles or props already established by the story. Nearby adult characters continue ordinary calm movement naturally through the space with relaxed body language and natural eyelines. Preserve solid geometry, realistic door hinges, object permanence, camera axis and screen direction. Clean ambient sound begins at zero and ends inside this clip. Plain surfaces contain no readable text. CINEFORGE VEO SAFE BRIDGE.";
+  const alreadyClean = generationPrompt.prompt.includes("CINEFORGE VEO SAFE BRIDGE")
+    && generationPrompt.prompt.includes("SAFE FICTIONAL PRODUCTION FRAME")
+    && !containsLegacySensitiveTerms(`${generationPrompt.prompt} ${generationPrompt.negativeDirectives.join(" ")}`);
+  if (alreadyClean) return payload;
+  const prompt = "Create one continuous photorealistic live-action continuity bridge at the same established location and time of day. Hold on stable architectural details, the doorway, furniture and persistent vehicles or props already established by the story. Nearby adult characters continue ordinary calm movement naturally through the space with relaxed body language and natural eyelines. Preserve solid geometry, realistic door hinges, object permanence, camera axis and screen direction. Clean ambient sound begins at zero and ends inside this clip. Plain surfaces contain no readable text. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE VEO SAFE BRIDGE.";
   const shot = { ...payload.shot, generationPrompt: {
     ...generationPrompt,
     prompt,
@@ -373,6 +382,13 @@ function shouldUseNeutralOmniRescue(job: JobRow): boolean {
     && job.shot_last_operation?.state === "failed"
     && job.shot_last_operation.error?.code === "GOOGLE_MODERATION";
   return legacyNeutralPrompt || filteredSafetyRetry;
+}
+
+function shouldRefreshVeoSafeBridge(job: JobRow): boolean {
+  const generationPrompt = job.payload.shot.generationPrompt;
+  if (job.payload.providerModelId !== "veo-3.1-fast-generate-preview" || !generationPrompt?.prompt.includes("CINEFORGE VEO SAFE BRIDGE")) return false;
+  return !generationPrompt.prompt.includes("SAFE FICTIONAL PRODUCTION FRAME")
+    || containsLegacySensitiveTerms(`${generationPrompt.prompt} ${generationPrompt.negativeDirectives.join(" ")}`);
 }
 
 function containsLegacySensitiveTerms(value: string): boolean {
