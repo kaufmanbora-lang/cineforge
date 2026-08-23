@@ -8,12 +8,15 @@ export function classifyFailure(error: unknown): FailureClass {
   // The fallback provider's explicit server status is authoritative. If an
   // earlier provider mentioned billing but Gemini returned 503, retry Gemini.
   if (status && status >= 500) return "server";
-  if (/billing|prepay|payment|credit balance|no credits|оплат/.test(probe)) return "billing";
+  // HTTP 429 is a rate/quota signal even when Google mentions the account's
+  // billing tier in its explanatory metadata. It must never be converted into
+  // a false "payment inactive" pause.
+  if (status === 429 && /quota|resource_exhausted|квот/.test(probe)) return "quota";
+  if (status === 429) return "rate-limit";
+  if (/google_billing_not_ready|billing (?:account )?(?:is )?(?:inactive|required|disabled)|prepay (?:balance )?(?:is )?(?:depleted|empty)|payment required|credit balance (?:is )?(?:depleted|empty)|no credits|оплата (?:не активна|требуется)/.test(probe)) return "billing";
   if (status === 401 || /authentication|unauthenticated|api[_ -]?key.*invalid/.test(probe)) return "authentication";
   if (status === 403 || /permission|access restricted/.test(probe)) return "permission";
   if (status === 404 || /model_unavailable|model_not_found/.test(probe)) return "model";
-  if (status === 429 && /quota|resource_exhausted|квот/.test(probe)) return "quota";
-  if (status === 429) return "rate-limit";
   if (status === 408 || /timeout/.test(message)) return "timeout";
   if (/moderation|safety|blocked|безопасност/.test(probe)) return "moderation";
   if (/corrupt|invalid media|ffprobe/.test(message)) return "corrupt";

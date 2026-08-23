@@ -12,35 +12,87 @@ export async function persistMoviePlan(plan: MoviePlan): Promise<void> {
       [plan.projectId],
     );
     if (!versionResult.rows[0]) throw new Error("Project not found.");
-    const version = versionResult.rows[0].current_plan_version + 1;
-    await client.query(
+    const maximumVersion = await client.query<{ version: number }>(
+      "SELECT COALESCE(max(version),0)::int version FROM movie_plan_versions WHERE project_id=$1",
+      [plan.projectId],
+    );
+    const existingPlan = await client.query<{ version: number }>(
+      "SELECT version FROM movie_plan_versions WHERE project_id=$1 AND content_hash=$2",
+      [plan.projectId, hash],
+    );
+    if (existingPlan.rows[0]?.version === versionResult.rows[0].current_plan_version) {
+      await client.query(
+        `UPDATE projects SET title=$2,total_shots=$3,
+           status=CASE WHEN status IN ('draft','planning','planned','failed') THEN 'planned'::project_status ELSE status END,
+           updated_at=now() WHERE id=$1`,
+        [plan.projectId, plan.summary.title, plan.scenes.reduce((sum, scene) => sum + scene.shots.length, 0)],
+      );
+      return;
+    }
+    const rendered = await client.query<{ count: number }>(
+      `SELECT count(*)::int count FROM shot_versions sv
+       JOIN shots s ON s.id=sv.shot_id WHERE s.project_id=$1`,
+      [plan.projectId],
+    );
+    if (rendered.rows[0].count > 0) {
+      throw Object.assign(
+        new Error("Полная замена сценария запрещена после создания кадров. Используйте точечную правку в редакторе — готовые сцены останутся неизменными."),
+        { status: 409 },
+      );
+    }
+    // A pre-render screenplay can be replaced safely. Remove only its unrendered
+    // graph so changed LLM IDs cannot collide with the unique project/number
+    // constraints. Plan history, conversations, references and checkpoints stay.
+    await client.query("DELETE FROM acts WHERE project_id=$1", [plan.projectId]);
+    await client.query("DELETE FROM characters WHERE project_id=$1", [plan.projectId]);
+    await client.query("DELETE FROM locations WHERE project_id=$1", [plan.projectId]);
+    // The versions table is authoritative. This also repairs projects created
+    // by an older build that advanced current_plan_version after a conflict.
+    const version = Math.max(versionResult.rows[0].current_plan_version, maximumVersion.rows[0].version) + 1;
+    const savedPlan = await client.query<{ version: number }>(
       `INSERT INTO movie_plan_versions (project_id, version, content_hash, plan)
        VALUES ($1, $2, $3, $4)
-       ON CONFLICT (project_id, content_hash) DO NOTHING`,
+       ON CONFLICT (project_id, content_hash) DO UPDATE SET plan=EXCLUDED.plan
+       RETURNING version`,
       [plan.projectId, version, hash, JSON.stringify(plan)],
+    );
+    const storedVersion = savedPlan.rows[0].version;
+    const currentShotIds = plan.scenes.flatMap((scene) => scene.shots.map((shot) => shot.id));
+    await client.query(
+      "UPDATE jobs SET state='cancelled',updated_at=now() WHERE project_id=$1 AND shot_id IS NOT NULL AND NOT (shot_id=ANY($2::text[])) AND state NOT IN ('completed','cancelled')",
+      [plan.projectId, currentShotIds],
+    );
+    await client.query(
+      "UPDATE shots SET state='cancelled',updated_at=now() WHERE project_id=$1 AND NOT (id=ANY($2::text[]))",
+      [plan.projectId, currentShotIds],
     );
     await client.query("UPDATE projects SET title = $2, current_plan_version = $3, status = 'planned', total_shots = $4 WHERE id = $1", [
       plan.projectId,
       plan.summary.title,
-      version,
+      storedVersion,
       plan.scenes.reduce((sum, scene) => sum + scene.shots.length, 0),
     ]);
     await client.query("UPDATE timeline_clips SET enabled=false WHERE project_id=$1 AND enabled=true", [plan.projectId]);
 
     for (const character of plan.characters) {
+      const firstState = plan.scenes.flatMap((scene) => scene.shots)
+        .map((shot) => shot.continuity.characterStates[character.id])
+        .find(Boolean);
       await client.query(
-        `INSERT INTO characters (id, project_id, name, bible, locks)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO characters (id, project_id, name, bible, current_state, locks)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (id) DO UPDATE SET bible = EXCLUDED.bible, locks = EXCLUDED.locks`,
-        [character.id, plan.projectId, character.name, JSON.stringify(character), JSON.stringify(character.locks)],
+        [character.id, plan.projectId, character.name, JSON.stringify(character), JSON.stringify({ ...(firstState ?? {}), _lastShotSequence: 0 }), JSON.stringify(character.locks)],
       );
     }
     for (const location of plan.locations) {
+      const firstState = plan.scenes.flatMap((scene) => scene.shots)
+        .find((shot) => shot.continuity.locationId === location.id)?.continuity.locationState;
       await client.query(
-        `INSERT INTO locations (id, project_id, name, bible, locks)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO locations (id, project_id, name, bible, current_state, locks)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (id) DO UPDATE SET bible = EXCLUDED.bible, locks = EXCLUDED.locks`,
-        [location.id, plan.projectId, location.name, JSON.stringify(location), JSON.stringify({ design: location.designLocked })],
+        [location.id, plan.projectId, location.name, JSON.stringify(location), JSON.stringify({ ...(firstState ?? {}), _lastShotSequence: 0 }), JSON.stringify({ design: location.designLocked })],
       );
     }
     for (const act of plan.acts) {
@@ -60,8 +112,16 @@ export async function persistMoviePlan(plan: MoviePlan): Promise<void> {
     }
     let timelineCursor = 0;
     for (const scene of plan.scenes) {
-      timelineCursor = await persistScene(client, plan.projectId, scene, version, timelineCursor);
+      timelineCursor = await persistScene(client, plan.projectId, scene, storedVersion, timelineCursor);
     }
+    const counts = await client.query<{ completed: number; total: number }>(
+      "SELECT count(*) FILTER (WHERE state='completed')::int completed,count(*) FILTER (WHERE state<>'cancelled')::int total FROM shots WHERE project_id=$1",
+      [plan.projectId],
+    );
+    await client.query(
+      "UPDATE projects SET completed_shots=$2,total_shots=$3,progress=CASE WHEN $3=0 THEN 0 ELSE $2::numeric/$3*100 END WHERE id=$1",
+      [plan.projectId, counts.rows[0].completed, counts.rows[0].total],
+    );
   });
 }
 
@@ -86,6 +146,8 @@ async function persistScene(client: PoolClient, projectId: string, scene: Scene,
     const shotHash = contentHash({
       generationPrompt: shot.generationPrompt,
       references: shot.continuity.requiredReferences,
+      continuity: shot.continuity,
+      dependencies: shot.dependencies,
       audioContext: shot.audioContext,
       durationSeconds: shot.durationSeconds,
     });
@@ -94,7 +156,10 @@ async function persistScene(client: PoolClient, projectId: string, scene: Scene,
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        ON CONFLICT (id) DO UPDATE SET duration_seconds=EXCLUDED.duration_seconds, dependencies=EXCLUDED.dependencies,
          generation_spec=EXCLUDED.generation_spec, audio_context=EXCLUDED.audio_context,
-         continuity_state=EXCLUDED.continuity_state, content_hash=EXCLUDED.content_hash`,
+         continuity_state=EXCLUDED.continuity_state,
+         state=CASE WHEN shots.content_hash=EXCLUDED.content_hash AND shots.state<>'cancelled' THEN shots.state ELSE 'planned'::job_state END,
+         last_error=CASE WHEN shots.content_hash=EXCLUDED.content_hash THEN shots.last_error ELSE NULL END,
+         content_hash=EXCLUDED.content_hash`,
       [shot.id, projectId, scene.id, shot.sequence, shot.durationSeconds, shot.dependencies,
         JSON.stringify(shot), JSON.stringify(shot.audioContext), JSON.stringify(shot.continuity), shotHash],
     );
@@ -106,11 +171,18 @@ async function persistScene(client: PoolClient, projectId: string, scene: Scene,
       ["ambience", { ambience: shot.audioContext.ambience, cleanStart: shot.audioContext.cleanStart }],
       ["subtitles", { lines: shot.audioContext.dialogue.map((line) => ({ id: line.id, text: line.text, startSeconds: line.startSeconds, durationSeconds: line.durationSeconds })) }],
     ];
+    const activeAsset = await client.query<{ id: string }>(
+      `SELECT a.id FROM generation_assets a
+       JOIN shot_versions sv ON sv.id=a.shot_version_id AND sv.active=true
+       WHERE a.project_id=$1 AND a.shot_id=$2 AND a.kind='video'
+       ORDER BY a.created_at DESC LIMIT 1`,
+      [projectId, shot.id],
+    );
     for (const [track, metadata] of trackMetadata) {
       await client.query(
-        `INSERT INTO timeline_clips (project_id,scene_id,shot_id,track,start_seconds,duration_seconds,source_version,metadata)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [projectId, scene.id, shot.id, track, cursor, shot.durationSeconds, planVersion, JSON.stringify(metadata)],
+        `INSERT INTO timeline_clips (project_id,scene_id,shot_id,track,start_seconds,duration_seconds,source_version,metadata,asset_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [projectId, scene.id, shot.id, track, cursor, shot.durationSeconds, planVersion, JSON.stringify(metadata), track === "video" ? activeAsset.rows[0]?.id ?? null : null],
       );
     }
     cursor += shot.durationSeconds;
@@ -120,7 +192,10 @@ async function persistScene(client: PoolClient, projectId: string, scene: Scene,
 
 export async function latestMoviePlan(projectId: string): Promise<MoviePlan | null> {
   const rows = await query<{ plan: MoviePlan }>(
-    "SELECT plan FROM movie_plan_versions WHERE project_id = $1 ORDER BY version DESC LIMIT 1",
+    `SELECT plan FROM movie_plan_versions
+     WHERE project_id=$1
+     ORDER BY version=(SELECT current_plan_version FROM projects WHERE id=$1) DESC,version DESC
+     LIMIT 1`,
     [projectId],
   );
   return rows[0]?.plan ?? null;

@@ -21,8 +21,9 @@ export async function POST(request: Request) {
   try {
     assertRateLimit(request, "provider settings", 10, 60_000);
     const { apiKey } = Body.parse(await request.json());
+    // Validate the candidate before replacing a known-good encrypted key.
+    const result = await testOpenAIConnection(apiKey);
     await saveProviderKey("openai", apiKey);
-    const result = await testOpenAIConnection();
     await updateProviderStatus("openai", "connected", result);
     return NextResponse.json({ ...result, key: "saved" });
   } catch (error) {

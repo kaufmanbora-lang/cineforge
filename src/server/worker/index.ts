@@ -1,5 +1,5 @@
 import { Worker } from "bullmq";
-import { MOVIE_QUEUE, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob, resumeProjectJobs } from "@/server/movie/queue";
+import { MOVIE_QUEUE, enqueueAutomaticAssemblyIfReady, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob, resumeProjectJobs } from "@/server/movie/queue";
 import { processShot } from "./process-shot";
 import { processDialoguePatch } from "./process-dialogue";
 import { processAssembly } from "./process-assembly";
@@ -105,7 +105,8 @@ async function processProjectPlan(databaseJobId: string) {
       "UPDATE projects SET title=$2,status='queued',maximum_budget_usd=$3,estimated_cost_usd=$4,last_error=NULL,updated_at=now() WHERE id=$1",
       [job.project_id, plan.summary.title, maximumBudget, estimate.estimatedTotalUsd],
     );
-    const queued = await enqueueJobs(planGenerationJobs(job.project_id, plan.scenes, { fastDraft: job.render_tier === "draft" }));
+    let queued = await enqueueJobs(planGenerationJobs(job.project_id, plan.scenes, { fastDraft: job.render_tier === "draft" }));
+    if (!queued) queued = await resumeProjectJobs(job.project_id, { manual: true });
     await query("UPDATE jobs SET state='completed',result=$2,completed_at=now(),last_error=NULL WHERE id=$1", [
       job.id,
       JSON.stringify({ scenes: plan.scenes.length, shots: plan.scenes.reduce((sum, scene) => sum + scene.shots.length, 0), queued }),
@@ -117,7 +118,7 @@ async function processProjectPlan(databaseJobId: string) {
 }
 
 async function handleBackgroundFailure(databaseJobId: string, type: string, error: unknown) {
-  const rows = await query<{ id: string; project_id: string; attempt: number; max_attempts: number; state: string }>("SELECT id,project_id,attempt,max_attempts,state FROM jobs WHERE id=$1", [databaseJobId]);
+  const rows = await query<{ id: string; project_id: string; attempt: number; max_attempts: number; state: string; payload: { exportId?: string; sceneId?: string } }>("SELECT id,project_id,attempt,max_attempts,state,payload FROM jobs WHERE id=$1", [databaseJobId]);
   const job = rows[0];
   if (!job || job.state === "failed" || job.state === "paused" || job.state === "completed" || (type === "generate-shot" && ["queued", "retrying"].includes(job.state))) return;
   const failure = classifyFailure(error);
@@ -128,8 +129,22 @@ async function handleBackgroundFailure(databaseJobId: string, type: string, erro
     "UPDATE jobs SET state=$2,last_error=$3,available_at=now()+($4::text || ' milliseconds')::interval WHERE id=$1",
     [job.id, decision.pauseProject ? "paused" : decision.retry ? "queued" : "failed", JSON.stringify(details), decision.delayMs],
   );
+  if (type === "assemble-movie" && job.payload.exportId) {
+    await query(
+      "UPDATE exports SET state=$2::job_state,qc_report=$3,completed_at=CASE WHEN $2='failed' THEN now() ELSE NULL END WHERE id=$1",
+      [job.payload.exportId, decision.pauseProject ? "paused" : decision.retry ? "queued" : "failed", JSON.stringify(details)],
+    );
+  }
   if (decision.retry) await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: decision.delayMs, type });
-  if (!decision.pauseProject && !decision.retry) await query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify(details)]);
+  if (!decision.pauseProject && !decision.retry && type === "dialogue-patch") {
+    // The provider-generated shot remains usable when deterministic voice
+    // replacement fails. Do not strand a fully generated film in Failed;
+    // assemble the active video/audio version and retain the failed edit job.
+    await enqueueAutomaticAssemblyIfReady(job.project_id);
+  }
+  if (!decision.pauseProject && !decision.retry && type !== "dialogue-patch" && !(type === "assemble-movie" && job.payload.sceneId)) {
+    await query("UPDATE projects SET status='failed',last_error=$2 WHERE id=$1", [job.project_id, JSON.stringify(details)]);
+  }
 }
 
 worker.on("completed", (job) => process.stdout.write(`Completed ${job.id}\n`));

@@ -73,6 +73,13 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     let queued = 0;
     if (body.startGeneration) {
       stage = "queueing";
+      // Publish the active project state before the queue envelope. Otherwise a
+      // fast worker can pause or complete the project and this route would race
+      // behind it, incorrectly overwriting the authoritative result with queued.
+      await query(
+        "UPDATE projects SET title=$2,status=CASE WHEN status IN ('completed','cancelled') THEN status ELSE 'queued'::project_status END,maximum_budget_usd=$3,estimated_cost_usd=$4,last_error=NULL,updated_at=now() WHERE id=$1",
+        [id, plan.summary.title, maximumBudget, estimate.estimatedTotalUsd],
+      );
       queued = await enqueueJobs(planGenerationJobs(id, plan.scenes, { fastDraft: rows[0].render_tier === "draft" }));
       if (!queued) {
         // Reaching this branch means the user explicitly confirmed production
@@ -80,16 +87,34 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         // completed shot versions remain immutable and are never regenerated.
         queued = await resumeProjectJobs(id, { manual: true });
       }
-      await query(
-        "UPDATE projects SET title=$2,status=CASE WHEN status IN ('completed','cancelled') THEN status ELSE 'queued'::project_status END,maximum_budget_usd=$3,estimated_cost_usd=$4,last_error=NULL,updated_at=now() WHERE id=$1",
-        [id, plan.summary.title, maximumBudget, estimate.estimatedTotalUsd],
-      );
     } else {
       await query("UPDATE projects SET title=$2,status='planned',last_error=NULL,updated_at=now() WHERE id=$1", [id, plan.summary.title]);
     }
     return NextResponse.json({ plan, scenes: plan.scenes.length, shots, queued, estimate, projectId: id });
   } catch (error) {
     if (projectId) {
+      const queueStage = stage === "queueing" || stage === "queueing-plan";
+      if (queueStage) {
+        // Queue rows are durable and the worker reconciler republishes missing
+        // Redis envelopes. A transient queue connection must not convert a
+        // safely stored production into a terminal failed project.
+        const pending = await query<{ count: number }>(
+          "SELECT count(*)::int count FROM jobs WHERE project_id=$1 AND state IN ('planned','queued','retrying','generating','validating')",
+          [projectId],
+        ).catch(() => []);
+        if (Number(pending[0]?.count ?? 0) > 0) {
+          const details = { code: "QUEUE_DELIVERY_DELAY", stage, message: "Задание сохранено. Фоновый обработчик продолжит его автоматически после восстановления очереди." };
+          await query(
+            "UPDATE projects SET status=CASE WHEN $2='queueing-plan' THEN 'planning'::project_status ELSE 'queued'::project_status END,last_error=NULL,updated_at=now() WHERE id=$1",
+            [projectId, stage],
+          ).catch(() => []);
+          await query(
+            "INSERT INTO checkpoints (project_id,event_type,snapshot) VALUES ($1,'queue-delivery-delayed',$2)",
+            [projectId, JSON.stringify(details)],
+          ).catch(() => []);
+          return NextResponse.json({ accepted: true, projectId, queued: Number(pending[0]?.count ?? 0), warning: details.message }, { status: 202 });
+        }
+      }
       await query("UPDATE projects SET status='failed',last_error=$2,updated_at=now() WHERE id=$1", [projectId, JSON.stringify({ stage, message: error instanceof Error ? error.message : String(error) })]).catch(() => []);
     }
     return apiError(error);

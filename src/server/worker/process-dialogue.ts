@@ -34,6 +34,11 @@ export async function processDialoguePatch(databaseJobId: string) {
   );
   const job = rows[0];
   if (!job) return { skipped: true, videoFramesPreserved: true };
+  const heartbeat = setInterval(() => {
+    void query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state='generating'", [job.id]).catch(() => undefined);
+  }, 30_000);
+  heartbeat.unref();
+  try {
   const segments = job.payload.dialogueSegments ?? (job.payload.dialogueId && job.payload.characterId && job.payload.text && job.payload.delivery && job.payload.startSeconds !== undefined && job.payload.durationSeconds !== undefined ? [{ id: job.payload.dialogueId, characterId: job.payload.characterId, text: job.payload.text, delivery: job.payload.delivery, startSeconds: job.payload.startSeconds, durationSeconds: job.payload.durationSeconds }] : []);
   if (!segments.length) throw new Error("Dialogue patch contains no dialogue segments.");
   const contentHash = createHash("sha256").update(JSON.stringify(job.payload)).digest("hex");
@@ -44,7 +49,7 @@ export async function processDialoguePatch(databaseJobId: string) {
     patched = cached.bytes;
   } else {
     const client = await openAIClient();
-    const sourceResponse = await fetch(await signedObjectUrl(job.payload.originalStorageKey));
+    const sourceResponse = await fetch(await signedObjectUrl(job.payload.originalStorageKey), { signal: AbortSignal.timeout(120_000) });
     if (!sourceResponse.ok) throw new Error(`Unable to download original shot: ${sourceResponse.status}`);
     patched = new Uint8Array(await sourceResponse.arrayBuffer());
     for (const segment of segments) {
@@ -75,7 +80,9 @@ export async function processDialoguePatch(databaseJobId: string) {
   const checksum = createHash("sha256").update(patched).digest("hex");
   await transaction(async (db) => {
     const current = await db.query<{ current_version: number; audio_context: AudioContext; generation_spec: Shot }>("SELECT current_version,audio_context,generation_spec FROM shots WHERE id=$1 FOR UPDATE", [job.shot_id]);
-    const version = (current.rows[0]?.current_version ?? 0) + 1;
+    if (!current.rows[0]) throw new Error("Dialogue source shot no longer exists.");
+    const maximumVersion = await db.query<{ version: number }>("SELECT COALESCE(max(version),0)::int version FROM shot_versions WHERE shot_id=$1", [job.shot_id]);
+    const version = (maximumVersion.rows[0]?.version ?? 0) + 1;
     const replacementById = new Map(segments.map((segment) => [segment.id, segment]));
     const revisedAudio: AudioContext = {
       ...current.rows[0].audio_context,
@@ -89,7 +96,7 @@ export async function processDialoguePatch(databaseJobId: string) {
     const shotVersion = await db.query<{ id: string }>(
       `INSERT INTO shot_versions (shot_id,version,reason,generation_spec,content_hash,active)
        VALUES ($1,$2,'edited dialogue',$3,$4,true) RETURNING id`,
-      [job.shot_id, version, JSON.stringify(job.payload), contentHash],
+      [job.shot_id, version, JSON.stringify(revisedSpec), contentHash],
     );
     const asset = await db.query<{ id: string }>(
       `INSERT INTO generation_assets (project_id,scene_id,shot_id,shot_version_id,kind,storage_key,mime_type,byte_size,checksum,metadata)
@@ -102,9 +109,15 @@ export async function processDialoguePatch(databaseJobId: string) {
     await db.query("UPDATE timeline_clips SET metadata=$2 WHERE shot_id=$1 AND track='dialogue' AND enabled=true", [job.shot_id, JSON.stringify({ dialogue: revisedAudio.dialogue })]);
     await db.query("UPDATE timeline_clips SET metadata=$2 WHERE shot_id=$1 AND track='subtitles' AND enabled=true", [job.shot_id, JSON.stringify({ lines: revisedAudio.dialogue.map((line) => ({ id: line.id, text: line.text, startSeconds: line.startSeconds, durationSeconds: line.durationSeconds })) })]);
 
-    const planRows = await db.query<{ current_plan_version: number; plan: MoviePlan }>(
-      `SELECT p.current_plan_version,m.plan FROM projects p
-       JOIN movie_plan_versions m ON m.project_id=p.id AND m.version=p.current_plan_version
+    const planRows = await db.query<{ current_plan_version: number; maximum_plan_version: number; plan: MoviePlan }>(
+      `SELECT m.version current_plan_version,
+          (SELECT COALESCE(max(version),0)::int FROM movie_plan_versions WHERE project_id=p.id) maximum_plan_version,
+          m.plan FROM projects p
+        JOIN LATERAL (
+          SELECT version,plan FROM movie_plan_versions
+          WHERE project_id=p.id
+          ORDER BY version=p.current_plan_version DESC,version DESC LIMIT 1
+        ) m ON true
        WHERE p.id=$1 FOR UPDATE OF p`,
       [job.project_id],
     );
@@ -116,7 +129,7 @@ export async function processDialoguePatch(databaseJobId: string) {
           shots: scene.shots.map((shot) => shot.id === job.shot_id ? { ...shot, audioContext: revisedAudio } : shot),
         })),
       };
-      const nextPlanVersion = planRows.rows[0].current_plan_version + 1;
+      const nextPlanVersion = planRows.rows[0].maximum_plan_version + 1;
       const planHash = createHash("sha256").update(JSON.stringify(nextPlan)).digest("hex");
       const savedPlan = await db.query<{ version: number }>(
         `INSERT INTO movie_plan_versions (project_id,version,content_hash,plan) VALUES ($1,$2,$3,$4)
@@ -134,6 +147,9 @@ export async function processDialoguePatch(databaseJobId: string) {
   });
   await enqueueAutomaticAssemblyIfReady(job.project_id);
   return { storageKey, videoFramesPreserved: true };
+  } finally {
+    clearInterval(heartbeat);
+  }
 }
 
 function deterministicVoice(characterId: string): string {

@@ -61,7 +61,7 @@ Desktop-клиент и облачный Movie Engine разделены нам�
 - AES-256-GCM key vault, masked key hints, signed URLs, validated uploads и rate limiting.
 - Профессиональный интерфейс: Project Library, Create Movie, AI Screenwriter, Characters, Locations, Editor, Renders, Settings.
 
-## Актуальные API, проверенные 22 августа 2026
+## Актуальные API, проверенные 23 августа 2026
 
 Реестр capabilities в [`src/domain/video-models.ts`](src/domain/video-models.ts) основан только на официальной документации.
 
@@ -172,6 +172,7 @@ flowchart LR
 - `jobs.idempotency_key` и Bull job IDs предотвращают двойную генерацию.
 - `contentHash(prompt + references + audio + settings)` включает все generation inputs.
 - API operation ID сохраняется на shot; worker restart переводит interrupted jobs обратно в очередь.
+- Запрошенные 10/30/60 секунд разбиваются на допустимые для выбранной модели chunks, а сборщик обрезает каждый источник по плану и проверяет точную длительность master-файла с допуском 0,5 секунды.
 - Quota и maximum budget переводят проект в `paused`, а не `failed` и не удаляют assets; параллельные jobs сначала атомарно резервируют стоимость в PostgreSQL, поэтому вместе не могут превысить лимит.
 - Retry policy различает quota, rate limit, timeout, server, moderation, corrupted media, upload и fatal error.
 - Retry ограничен `MAX_AUTO_RETRIES`; бесконечных циклов нет.
@@ -200,4 +201,4 @@ pnpm build
 - Reference assets и continuity QC существенно уменьшают drift, но закрытая video model не даёт математической гарантии идентичности каждого пикселя.
 - Omni editing имеет региональные и feature-ограничения, описанные в официальной документации. Adapter не показывает неподдерживаемые controls.
 - Стоимость до запуска приблизительна: retries, moderation, provider billing rounding и изменение pricing заранее неизвестны. Budget limit остаётся жёстким приложенческим барьером.
-- Для 4K используются только модели, capabilities которых официально содержат 4K; `Veo 3.1 Lite` и Omni не показывают 4K.
+- Veo показывает только нативно поддерживаемые режимы. Для Omni 1080p/4K честно обозначены как разрешения финального Movie Engine export: сам Omni не принимает параметр resolution и возвращает короткий 720p-class source, поэтому увеличение размера не создаёт дополнительных деталей.

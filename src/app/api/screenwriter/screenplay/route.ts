@@ -14,8 +14,11 @@ const Body = z.object({ projectId: z.string().uuid(), idea: z.string().min(10), 
 export async function POST(request: Request) {
   try {
     const body = Body.parse(await request.json());
-    const projects = await query<{ model_id: string; duration_seconds: number }>("SELECT model_id,duration_seconds FROM projects WHERE id=$1", [body.projectId]);
+    const projects = await query<{ model_id: string; duration_seconds: number; status: string }>("SELECT model_id,duration_seconds,status FROM projects WHERE id=$1", [body.projectId]);
     if (!projects[0]) return NextResponse.json({ error: "Проект не найден." }, { status: 404 });
+    if (["planning", "queued", "generating", "validating", "assembling"].includes(projects[0].status)) {
+      return NextResponse.json({ error: "Нельзя заменять структуру сценария во время активного производства. Дождитесь завершения или используйте точечную правку в редакторе." }, { status: 409 });
+    }
     const plan = adaptMoviePlanPrompts(await generateStructuredMoviePlan({ ...body, durationSeconds: projects[0].duration_seconds, videoModelId: projects[0].model_id }), projects[0].model_id);
     await persistMoviePlan(plan);
     return NextResponse.json({ plan });

@@ -81,6 +81,11 @@ export function StudioWorkspace() {
         const nextPreview = await previewResponse.json() as PreviewPayload;
         setPreview((current) => ({ ...nextPreview, clips: preservePreviewUrls(current.clips, nextPreview.clips) }));
         setSelectedShotId((current) => nextPreview.clips.some((clip) => clip.shot_id === current) ? current : nextPreview.clips[0]?.shot_id ?? "");
+      } else {
+        // Never leave signed media from the previously opened project visible
+        // when this project's preview endpoint fails.
+        setPreview({ clips: [], movieUrl: null });
+        setSelectedShotId("");
       }
       if (payload.project.lastError?.message) {
         setNotice(errorMessageRu(payload.project.lastError.message, "Проект остановлен с ошибкой. Можно безопасно повторить действие."));
@@ -88,6 +93,10 @@ export function StudioWorkspace() {
         setNotice("Проект сохранён. ИИ-сценарист создаёт сценарий и память в фоновой очереди — окно можно закрыть.");
       } else if (["queued","generating","validating","assembling"].includes(payload.project.status)) {
         setNotice(`Производство работает: готово ${payload.project.completedShots} из ${payload.project.totalShots} кадров.`);
+      } else if (payload.project.status === "completed") {
+        setNotice("Фильм полностью собран и прошёл финальную проверку. Его можно смотреть, редактировать или экспортировать.");
+      } else if (payload.project.status === "paused") {
+        setNotice("Проект поставлен на паузу. Все готовые кадры и контрольные точки сохранены.");
       } else if (!quiet) {
         setNotice(payload.plan ? `Из памяти проекта загружено сцен: ${payload.plan.scenes.length}.` : "У проекта ещё нет сценария. Можно повторить планирование без создания копии.");
       }
@@ -112,8 +121,11 @@ export function StudioWorkspace() {
         if (!payload.connected) { setAccountModelIds(new Set()); setNotice((current) => existingId ? current : "Подключите Google API в настройках перед генерацией видео."); return; }
         const available = new Set<string>((payload.models ?? []).filter((entry: { available?: boolean; selectable?: boolean }) => entry.available && entry.selectable !== false).map((entry: { id: string }) => entry.id));
         setAccountModelIds(available);
-        if (available.size) setModelId((current) => { if (available.has(current)) return current; const next = [...available][0]; setResolution((value) => normalizeResolution(next, value)); return next; });
-        else setNotice("Для этого Google-проекта не включена ни одна поддерживаемая видеомодель.");
+        if (!existingId && available.size) {
+          setModelId((current) => { if (available.has(current)) return current; const next = [...available][0]; setResolution((value) => normalizeResolution(next, value)); return next; });
+        } else if (!available.size) {
+          setNotice("Для этого Google-проекта не включена ни одна поддерживаемая видеомодель.");
+        }
       } catch { setAccountModelIds(new Set()); setNotice("Не удалось проверить доступ к видеомоделям Google."); }
     }, 0);
     return () => window.clearTimeout(timer);

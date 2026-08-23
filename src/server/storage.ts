@@ -1,9 +1,12 @@
-import { CreateBucketCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { env } from "./env";
 
 let client: S3Client | undefined;
@@ -67,10 +70,30 @@ export async function putRemoteObject(
   headers: Record<string, string>,
 ): Promise<{ byteSize: number; checksum: string; contentType: string }> {
   await ensureBucket();
-  const response = await fetch(url, { headers, redirect: "follow" });
-  if (!response.ok || !response.body) throw new Error(`Remote media download failed with HTTP ${response.status}.`);
+  const response = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(10 * 60_000) });
+  if (!response.ok) {
+    const details = (await response.text()).slice(0, 500);
+    throw Object.assign(new Error(`Remote media upload staging failed with HTTP ${response.status}${details ? `: ${details}` : "."}`), { status: response.status, code: "UPLOAD_FAILED" });
+  }
+  if (!response.body) throw Object.assign(new Error("Remote media upload staging returned an empty response body."), { code: "UPLOAD_FAILED" });
   const contentLength = Number(response.headers.get("content-length") ?? 0);
-  if (!Number.isFinite(contentLength) || contentLength <= 0) throw new Error("Remote media response did not include a valid Content-Length header.");
+  const contentType = response.headers.get("content-type") ?? "video/mp4";
+  // Some Google signed media URLs are chunked and omit Content-Length. The S3
+  // streaming uploader needs a known size, so spool only that uncommon response
+  // shape to a temporary file instead of rejecting an otherwise valid result.
+  if (!Number.isFinite(contentLength) || contentLength <= 0) {
+    const tempRoot = await mkdtemp(join(tmpdir(), "cineforge-remote-"));
+    const filePath = join(tempRoot, "provider-output.mp4");
+    try {
+      await pipeline(
+        Readable.fromWeb(response.body as never),
+        createWriteStream(filePath, { flags: "wx" }),
+      );
+      return await putFileObject(key, filePath, contentType);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
   const hash = createHash("sha256");
   let byteSize = 0;
   const counter = new Transform({
@@ -81,7 +104,6 @@ export async function putRemoteObject(
     },
   });
   const body = Readable.fromWeb(response.body as never).pipe(counter);
-  const contentType = response.headers.get("content-type") ?? "video/mp4";
   await s3().send(new PutObjectCommand({
     Bucket: env().S3_BUCKET,
     Key: key,
@@ -138,6 +160,24 @@ export async function getObjectIfExists(key: string): Promise<{ bytes: Uint8Arra
     if (record.name === "NoSuchKey" || record.name === "NotFound" || record.$metadata?.httpStatusCode === 404) return null;
     throw error;
   }
+}
+
+export async function deleteObject(key: string): Promise<void> {
+  await ensureBucket();
+  await s3().send(new DeleteObjectCommand({ Bucket: env().S3_BUCKET, Key: key }));
+}
+
+export async function getObjectToFile(key: string, filePath: string): Promise<{ byteSize: number; contentType: string }> {
+  await ensureBucket();
+  const result = await s3().send(new GetObjectCommand({ Bucket: env().S3_BUCKET, Key: key }));
+  if (!result.Body) throw new Error(`Object ${key} has no readable body.`);
+  await pipeline(
+    Readable.fromWeb(result.Body.transformToWebStream() as never),
+    createWriteStream(filePath, { flags: "wx" }),
+  );
+  const file = await stat(filePath);
+  if (!file.isFile() || file.size <= 0) throw new Error(`Object ${key} downloaded as an empty file.`);
+  return { byteSize: file.size, contentType: result.ContentType ?? "application/octet-stream" };
 }
 
 export async function signedObjectUrl(key: string, expiresIn = 900, downloadName?: string): Promise<string> {

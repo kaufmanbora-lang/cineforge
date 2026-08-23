@@ -21,13 +21,21 @@ describe("idempotent dependency-aware job queue", () => {
   });
   it("preserves cross-scene continuity dependencies in fast draft mode", () => {
     const first = scene([shot("shot-1")]);
-    const linked = { ...shot("shot-2"), sceneId: "scene-2", continuity: { ...shot("shot-2").continuity, previousShotId: "shot-1" } };
+    const linked = { ...shot("shot-2", ["shot-1"]), sceneId: "scene-2", continuity: { ...shot("shot-2").continuity, previousShotId: "shot-1" } };
     const second = { ...scene([linked]), id: "scene-2", number: 2, shots: [linked] };
     const normal = planGenerationJobs("project", [first, second]);
     const draft = planGenerationJobs("project", [first, second], { fastDraft: true });
     expect(readyJobs(normal, new Set(), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-1"]);
     expect(readyJobs(draft, new Set(), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-1"]);
     expect(draft[1].dependencies).toEqual(["shot-1"]);
+  });
+  it("keeps chronological memory without serializing a hard cut", () => {
+    const first = scene([shot("shot-1")]);
+    const cut = { ...shot("shot-2"), sceneId: "scene-2", continuity: { ...shot("shot-2").continuity, previousShotId: "shot-1" } };
+    const second = { ...scene([cut]), id: "scene-2", number: 2, locationId: "different-location", shots: [cut] };
+    const jobs = planGenerationJobs("project", [first, second], { fastDraft: true });
+    expect(jobs[1].dependencies).toEqual([]);
+    expect(readyJobs(jobs, new Set(), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-1", "shot-2"]);
   });
   it("creates a fresh retry envelope when a manual resume reuses an attempt number", () => {
     const first = retryEnvelopeJobId("database-job", 1, "run-a");

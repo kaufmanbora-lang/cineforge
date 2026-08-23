@@ -1,7 +1,10 @@
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { query, transaction } from "@/server/db";
-import { assembleMovie } from "@/server/movie/ffmpeg";
-import { putObject, signedObjectUrl } from "@/server/storage";
+import { assembleMovieFiles } from "@/server/movie/ffmpeg";
+import { getObjectToFile, putFileObject } from "@/server/storage";
 
 interface AssemblyJobRow {
   id: string;
@@ -10,31 +13,42 @@ interface AssemblyJobRow {
 }
 
 export async function processAssembly(databaseJobId: string) {
-  const jobs = await query<AssemblyJobRow>("SELECT * FROM jobs WHERE id=$1", [databaseJobId]);
+  const jobs = await query<AssemblyJobRow>(
+    `UPDATE jobs SET state='generating',started_at=COALESCE(started_at,now()),attempt=attempt+1,updated_at=now()
+     WHERE id=$1 AND state IN ('queued','retrying') RETURNING *`,
+    [databaseJobId],
+  );
   const job = jobs[0];
-  if (!job) throw new Error("Assembly job not found.");
-  await query("UPDATE jobs SET state='generating',started_at=COALESCE(started_at,now()),attempt=attempt+1 WHERE id=$1", [job.id]);
+  if (!job) return { skipped: true };
+  const heartbeat = setInterval(() => {
+    void query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state='generating'", [job.id]).catch(() => undefined);
+  }, 30_000);
+  heartbeat.unref();
+  const tempRoot = join(tmpdir(), `cineforge-assembly-${randomUUID()}`);
+  try {
+  await mkdir(tempRoot, { recursive: true });
   const assets = await query<{ storage_key: string; shot_id: string; checksum: string; duration_seconds: number }>(
     `SELECT a.storage_key,a.shot_id,a.checksum,sh.duration_seconds FROM generation_assets a
      JOIN shot_versions sv ON sv.id=a.shot_version_id AND sv.active=true
      JOIN shots sh ON sh.id=a.shot_id JOIN scenes s ON s.id=sh.scene_id
-     WHERE a.project_id=$1 AND a.kind='video' AND ($2::text IS NULL OR s.id=$2) ORDER BY s.number,sh.sequence`,
+     WHERE a.project_id=$1 AND a.kind='video' AND sh.state<>'cancelled' AND ($2::text IS NULL OR s.id=$2) ORDER BY s.number,sh.sequence`,
     [job.project_id, job.payload.sceneId ?? null],
   );
   if (!assets.length) throw new Error("No completed shot assets are available for export.");
-  const clips = [] as Array<{ bytes: Uint8Array; extension: string; durationSeconds: number }>;
-  for (const asset of assets) {
-    const response = await fetch(await signedObjectUrl(asset.storage_key));
-    if (!response.ok) throw new Error(`Failed to download ${asset.shot_id} for assembly.`);
-    clips.push({ bytes: new Uint8Array(await response.arrayBuffer()), extension: "mp4", durationSeconds: Number(asset.duration_seconds) });
+  const clips = [] as Array<{ filePath: string; durationSeconds: number }>;
+  for (let index = 0; index < assets.length; index += 1) {
+    const asset = assets[index];
+    const filePath = join(tempRoot, `source-${index}.mp4`);
+    await getObjectToFile(asset.storage_key, filePath);
+    clips.push({ filePath, durationSeconds: Number(asset.duration_seconds) });
   }
-  const assembled = await assembleMovie({ clips, resolution: job.payload.resolution, outputFormat: job.payload.format });
-  const bytes = assembled.bytes;
+  const outputPath = join(tempRoot, `movie.${job.payload.format}`);
+  const assembledQc = await assembleMovieFiles({ clips, resolution: job.payload.resolution, outputFormat: job.payload.format, outputPath });
   const duplicateChecksums = assets.filter((asset, index) => assets.findIndex((candidate) => candidate.checksum === asset.checksum) !== index).map((asset) => asset.shot_id);
-  const qcReport = { ...assembled.qc, duplicateShotIds: [...new Set(duplicateChecksums)], passed: assembled.qc.passed && duplicateChecksums.length === 0 };
-  const checksum = createHash("sha256").update(bytes).digest("hex");
+  const qcReport = { ...assembledQc, duplicateShotIds: [...new Set(duplicateChecksums)], passed: assembledQc.passed && duplicateChecksums.length === 0 };
   const storageKey = `projects/${job.project_id}/exports/${job.payload.sceneId ? `scene-${job.payload.sceneId}-` : ""}${job.payload.exportId}.${job.payload.format}`;
-  await putObject(storageKey, bytes, job.payload.format === "mov" ? "video/quicktime" : "video/mp4");
+  const stored = await putFileObject(storageKey, outputPath, job.payload.format === "mov" ? "video/quicktime" : "video/mp4");
+  const checksum = stored.checksum;
   await transaction(async (db) => {
     await db.query("UPDATE exports SET state=$2::job_state,storage_key=$3,completed_at=now(),qc_report=$4 WHERE id=$1", [
       job.payload.exportId,
@@ -48,6 +62,11 @@ export async function processAssembly(databaseJobId: string) {
     }
     await db.query("INSERT INTO checkpoints (project_id,event_type,snapshot) VALUES ($1,$2,$3)", [job.project_id, qcReport.passed ? (job.payload.sceneId ? "scene-export-completed" : "export-completed") : "export-qc-failed", JSON.stringify({ storageKey, checksum, qcReport, sceneId: job.payload.sceneId ?? null })]);
   });
-  if (!qcReport.passed) throw new Error(`Final QC failed: ${qcReport.issues.join("; ") || "duplicate shot content"}`);
-  return { storageKey, checksum };
+  return qcReport.passed
+    ? { storageKey, checksum }
+    : { storageKey, checksum, failed: true, issues: qcReport.issues };
+  } finally {
+    clearInterval(heartbeat);
+    await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
+  }
 }

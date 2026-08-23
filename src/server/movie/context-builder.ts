@@ -31,7 +31,10 @@ export async function buildProjectContext(input: {
         [input.projectId],
       );
   const plan = await query<{ plan: { summary?: unknown } }>(
-    "SELECT plan FROM movie_plan_versions WHERE project_id=$1 ORDER BY version DESC LIMIT 1",
+    `SELECT plan FROM movie_plan_versions
+     WHERE project_id=$1
+     ORDER BY version=(SELECT current_plan_version FROM projects WHERE id=$1) DESC,version DESC
+     LIMIT 1`,
     [input.projectId],
   );
   return {

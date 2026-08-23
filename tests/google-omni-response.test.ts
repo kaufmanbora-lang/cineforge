@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
-import { extractOmniVideo, extractVeoVideo, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
+import { extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
 import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
@@ -9,12 +9,18 @@ import { character, location, scene, shot } from "./fixtures";
 describe("Google Omni response parsing", () => {
   it("never combines previous_interaction_id with a video task", () => {
     expect(googleOmniVideoTask({ previousInteractionId: "v1_previous", editInstruction: "Make the coat grey", references: [] })).toBeUndefined();
-    expect(googleOmniVideoTask({ previousInteractionId: undefined, editInstruction: undefined, references: [{ id: "previous-frame", data: "AAAA", mimeType: "image/jpeg", role: "first-frame" }] })).toBe("reference_to_video");
+    expect(googleOmniVideoTask({ previousInteractionId: undefined, editInstruction: undefined, references: [{ id: "previous-frame", data: "AAAA", mimeType: "image/jpeg", role: "first-frame" }] })).toBe("image_to_video");
+    expect(googleOmniVideoTask({ previousInteractionId: undefined, editInstruction: "Make the coat grey", references: [] })).toBe("text_to_video");
   });
   it("always stores URI-delivered Omni video, including fast drafts", () => {
     expect(googleOmniShouldStore({ fastMode: true })).toBe(true);
     expect(googleOmniShouldStore({ fastMode: false })).toBe(true);
     expect(googleOmniShouldStore({ fastMode: true, previousInteractionId: "v1", editInstruction: "Change the coat" })).toBe(true);
+  });
+  it("turns an Omni Files API resource URI into the official media download endpoint", () => {
+    expect(googleFileDownloadUrl("files/omni-output_123")).toBe("https://generativelanguage.googleapis.com/v1beta/files/omni-output_123:download?alt=media");
+    expect(googleFileDownloadUrl("https://generativelanguage.googleapis.com/v1beta/files/omni-output_123"))
+      .toBe("https://generativelanguage.googleapis.com/v1beta/files/omni-output_123:download?alt=media");
   });
   it("does not send the Enterprise-only seed parameter to Gemini Developer API", () => {
     const plannedShot = shot("shot-1");
@@ -34,7 +40,7 @@ describe("Google Omni response parsing", () => {
     })).not.toHaveProperty("seed");
   });
 
-  it("omits an unsupported single Veo reference image", () => {
+  it("keeps one or more officially supported Veo reference images", () => {
     const plannedShot = shot("shot-1");
     const request = {
       projectId: "project-1",
@@ -51,13 +57,14 @@ describe("Google Omni response parsing", () => {
       fastMode: true,
     };
     const oneReference = [{ id: "portrait", data: "AAAA", mimeType: "image/png", role: "subject" as const }];
-    expect(googleVeoConfig(request, undefined, oneReference).referenceImages).toBeUndefined();
+    expect(googleVeoConfig(request, undefined, oneReference).referenceImages).toHaveLength(1);
     expect(googleVeoConfig(request, undefined, [...oneReference, { ...oneReference[0], id: "wardrobe" }]).referenceImages).toHaveLength(2);
   });
 
   it("maps screenplay timing to durations accepted by each video model", () => {
     expect(providerDurationSeconds("veo-3.1-fast-generate-preview", "720p", 5)).toBe(6);
     expect(providerDurationSeconds("veo-3.1-fast-generate-preview", "720p", 7)).toBe(8);
+    expect(providerDurationSeconds("veo-3.1-fast-generate-preview", "720p", 4, true)).toBe(8);
     expect(providerDurationSeconds("gemini-omni-flash-preview", "720p", 5)).toBe(5);
     expect(providerDurationSeconds("gemini-omni-flash-preview", "1080p", 5)).toBe(5);
   });
@@ -75,6 +82,7 @@ describe("Google Omni response parsing", () => {
     expect(prompt).toContain("TOPOLOGY AND DOOR CONTRACT");
     expect(prompt).toContain("180-degree action axis");
     expect(prompt).toContain("exact final frame");
+    expect(prompt).toContain("<FIRST_FRAME>");
   });
 
   it("extracts the production Interactions API video content part", () => {
@@ -327,19 +335,54 @@ describe("Google Omni response parsing", () => {
     expect(generationAccountingCost(1, 0, false)).toBe(1);
   });
 
-  it("plans an exact ten-second Omni movie as linked five-second beats", () => {
-    const longShot = { ...shot("shot-1"), durationSeconds: 10 };
+  it.each([
+    ["gemini-omni-flash-preview", 10, 5],
+    ["gemini-omni-flash-preview", 30, 5],
+    ["gemini-omni-flash-preview", 60, 5],
+    ["veo-3.1-generate-preview", 10, 8],
+    ["veo-3.1-generate-preview", 30, 8],
+    ["veo-3.1-generate-preview", 60, 8],
+  ])("plans %s at an exact %i seconds as one linked timeline", (modelId, targetDuration, maximumBeat) => {
+    const longShot = { ...shot("shot-1"), durationSeconds: targetDuration };
     const sourceScene = scene([longShot]);
     const plan: MoviePlan = {
       id: "plan-1", projectId: "project-1", createdAt: new Date(0).toISOString(),
-      summary: { title: "Test", genre: "Drama", style: "realistic", mood: "calm", durationSeconds: 10, logline: "Test", synopsis: "Test" },
+      summary: { title: "Test", genre: "Drama", style: "realistic", mood: "calm", durationSeconds: targetDuration, logline: "Test", synopsis: "Test" },
       characters: [character()], locations: [location()], acts: [{ id: "act-1", number: 1, title: "Act", purpose: "Test", startSceneNumber: 1, endSceneNumber: 1 }], scenes: [sourceScene],
+    };
+    const normalized = normalizeMoviePlanRuntime(plan, modelId);
+    const shots = normalized.scenes.flatMap((item) => item.shots);
+    expect(shots.every((item) => item.durationSeconds <= maximumBeat)).toBe(true);
+    expect(shots.reduce((sum, item) => sum + item.durationSeconds, 0)).toBe(targetDuration);
+    for (let index = 1; index < shots.length; index += 1) {
+      expect(shots[index].continuity.previousShotId).toBe(shots[index - 1].id);
+      expect(shots[index].dependencies).toContain(shots[index - 1].id);
+    }
+  });
+
+  it("renders a hard cut at another location independently while retaining chronological memory", () => {
+    const firstShot = { ...shot("shot-1"), durationSeconds: 5 };
+    const secondShot = {
+      ...shot("shot-2", ["shot-1"]),
+      sceneId: "scene-2",
+      durationSeconds: 5,
+      continuity: {
+        ...shot("shot-2").continuity,
+        locationId: "location-office",
+        locationState: { ...shot("shot-2").continuity.locationState, timeOfDay: "day", weather: "clear" },
+      },
+    };
+    const firstScene = scene([firstShot]);
+    const secondScene = { ...scene([secondShot]), id: "scene-2", number: 2, locationId: "location-office", timeOfDay: "day", weather: "clear" };
+    const plan: MoviePlan = {
+      id: "plan-cut", projectId: "project-cut", createdAt: new Date(0).toISOString(),
+      summary: { title: "Cut", genre: "Drama", style: "realistic", mood: "calm", durationSeconds: 10, logline: "Cut", synopsis: "Cut" },
+      characters: [character()], locations: [location(), location({ id: "location-office", name: "Office", timeOfDay: "day", defaultWeather: "clear" })],
+      acts: [{ id: "act-1", number: 1, title: "Act", purpose: "Test", startSceneNumber: 1, endSceneNumber: 2 }], scenes: [firstScene, secondScene],
     };
     const normalized = normalizeMoviePlanRuntime(plan, "gemini-omni-flash-preview");
     const shots = normalized.scenes.flatMap((item) => item.shots);
-    expect(shots.map((item) => item.durationSeconds)).toEqual([5, 5]);
-    expect(shots.reduce((sum, item) => sum + item.durationSeconds, 0)).toBe(10);
     expect(shots[1].continuity.previousShotId).toBe(shots[0].id);
-    expect(shots[1].dependencies).toContain(shots[0].id);
+    expect(shots[1].dependencies).not.toContain(shots[0].id);
   });
 });

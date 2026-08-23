@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, VideoGenerationReferenceType } from "@google/genai";
 import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -23,7 +23,7 @@ export async function discoverGoogleModels(apiKey: string): Promise<GoogleModelR
     const url = new URL("https://generativelanguage.googleapis.com/v1beta/models");
     url.searchParams.set("pageSize", "1000");
     if (pageToken) url.searchParams.set("pageToken", pageToken);
-    const response = await fetch(url, { headers: { "x-goog-api-key": apiKey }, cache: "no-store" });
+    const response = await fetch(url, { headers: { "x-goog-api-key": apiKey }, cache: "no-store", signal: AbortSignal.timeout(30_000) });
     if (!response.ok) throw await googleHttpError(response);
     const payload = await response.json() as { models?: GoogleModelResource[]; nextPageToken?: string };
     all.push(...(payload.models ?? []));
@@ -101,10 +101,15 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
       const subjectReferences = request.references.filter((reference) => reference.role === "subject" || reference.role === "style");
       const operation = await ai.models.generateVideos({
         model: request.modelId,
-        prompt: request.prompt,
-        image: primaryImage ? imageValue(primaryImage) : undefined,
+        // @google/genai keeps the legacy top-level prompt/image fields for
+        // compatibility but now warns that they are deprecated. The official
+        // current request shape groups every input under source.
+        source: {
+          prompt: request.prompt,
+          image: primaryImage ? imageValue(primaryImage) : undefined,
+        },
         config: googleVeoConfig(request, lastFrame, subjectReferences),
-      } as never);
+      });
       const raw = operation as unknown as { name?: string; done?: boolean };
       return {
         provider: "google",
@@ -126,6 +131,7 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/${operationName}`, {
         headers: { "x-goog-api-key": apiKey },
         cache: "no-store",
+        signal: AbortSignal.timeout(60_000),
       });
       if (!response.ok) throw await googleHttpError(response);
       const raw = await readVeoOperationResponse(response) as {
@@ -353,8 +359,8 @@ export function googleVeoConfig(
   lastFrame?: VideoGenerationRequest["references"][number],
   subjectReferences: VideoGenerationRequest["references"] = [],
 ) {
-  const supportedReferenceImages = subjectReferences.length >= 2
-    ? subjectReferences.slice(0, 3).map((reference) => ({ image: imageValue(reference), referenceType: "asset" }))
+  const supportedReferenceImages = subjectReferences.length >= 1
+    ? subjectReferences.slice(0, 3).map((reference) => ({ image: imageValue(reference), referenceType: VideoGenerationReferenceType.ASSET }))
     : undefined;
   return {
     aspectRatio: request.aspectRatio,
@@ -373,13 +379,13 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
   async start(request: VideoGenerationRequest, apiKey: string): Promise<ProviderOperation> {
     const ai = new GoogleGenAI({ apiKey });
     try {
+      const statefulEdit = Boolean(request.previousInteractionId && request.editInstruction);
       const input: Array<Record<string, unknown>> = request.references.map((reference) => ({
         type: "image",
         data: reference.data,
         mime_type: reference.mimeType,
       }));
-      input.push({ type: "text", text: request.editInstruction ?? request.prompt });
-      const statefulEdit = Boolean(request.previousInteractionId && request.editInstruction);
+      input.push({ type: "text", text: statefulEdit ? request.editInstruction! : request.prompt });
       const videoTask = googleOmniVideoTask(request);
       const interaction = await ai.interactions.create({
         model: request.modelId,
@@ -424,7 +430,7 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
         operationId: raw.id ?? `omni-${Date.now()}`,
         state: "completed",
         progress: 100,
-        output: { bytes, mimeType: videoRecord.mime_type ?? videoRecord.mimeType ?? "video/mp4", providerUri: video.uri, interactionId: raw.id },
+        output: { bytes, mimeType: videoRecord.mime_type ?? videoRecord.mimeType ?? "video/mp4", providerUri: video.uri ? googleFileDownloadUrl(video.uri) : undefined, interactionId: raw.id },
       };
     } catch (error) {
       return failedOperation(request.modelId, error);
@@ -436,9 +442,9 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
   }
 }
 
-export function googleOmniVideoTask(request: Pick<VideoGenerationRequest, "previousInteractionId" | "editInstruction" | "references">): "edit" | "reference_to_video" | "text_to_video" | undefined {
+export function googleOmniVideoTask(request: Pick<VideoGenerationRequest, "previousInteractionId" | "editInstruction" | "references">): "image_to_video" | "reference_to_video" | "text_to_video" | undefined {
   if (request.previousInteractionId && request.editInstruction) return undefined;
-  if (request.editInstruction) return "edit";
+  if (request.references.length === 1 && request.references[0].role === "first-frame") return "image_to_video";
   return request.references.length ? "reference_to_video" : "text_to_video";
 }
 
@@ -472,6 +478,7 @@ async function waitForGoogleFileActive(uri: string, apiKey: string): Promise<voi
     const metadata = await fetch(`https://generativelanguage.googleapis.com/v1beta/${fileName}`, {
       headers: { "x-goog-api-key": apiKey },
       cache: "no-store",
+      signal: AbortSignal.timeout(30_000),
     });
     if (!metadata.ok) {
       if ([400, 404, 409, 425].includes(metadata.status)) {
@@ -492,6 +499,13 @@ async function waitForGoogleFileActive(uri: string, apiKey: string): Promise<voi
 function googleFileName(uri: string): string | null {
   const match = uri.match(/(?:\/v1beta\/)?(files\/[a-zA-Z0-9_-]+)/);
   return match?.[1] ?? null;
+}
+
+export function googleFileDownloadUrl(uri: string): string {
+  if (/:download(?:\?|$)/.test(uri) || /[?&]alt=media(?:&|$)/.test(uri)) return uri;
+  const fileName = googleFileName(uri);
+  if (!fileName) return uri;
+  return `https://generativelanguage.googleapis.com/v1beta/${fileName}:download?alt=media`;
 }
 
 async function googleHttpError(response: Response): Promise<Error> {

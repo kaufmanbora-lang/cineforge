@@ -46,6 +46,7 @@ export async function POST(request: Request) {
     assertRateLimit(request, "screenwriter", 30, 60_000);
     const body = Body.parse(await request.json());
     let conversationId = body.conversationId;
+    let previousResponseId: string | undefined;
     try {
       if (!conversationId) {
         const rows = await query<{ id: string }>(
@@ -53,9 +54,28 @@ export async function POST(request: Request) {
           [body.projectId ?? null, env().DEFAULT_WORKSPACE_ID, body.mode],
         );
         conversationId = rows[0].id;
+      } else {
+        const conversations = await query<{ project_id: string | null; workspace_id: string; last_response_id: string | null }>(
+          "SELECT project_id,workspace_id,last_response_id FROM conversations WHERE id=$1",
+          [conversationId],
+        );
+        const conversation = conversations[0];
+        if (!conversation || conversation.workspace_id !== env().DEFAULT_WORKSPACE_ID) {
+          throw Object.assign(new Error("Диалог ИИ-сценариста не найден."), { status: 404 });
+        }
+        if (conversation.project_id && body.projectId && conversation.project_id !== body.projectId) {
+          throw Object.assign(new Error("Диалог ИИ-сценариста принадлежит другому проекту."), { status: 409 });
+        }
+        if (!conversation.project_id && body.projectId) {
+          await query("UPDATE conversations SET project_id=$2 WHERE id=$1 AND project_id IS NULL", [conversationId, body.projectId]);
+        }
+        // The durable conversation is authoritative. Never accept an arbitrary
+        // response ID from a different browser tab/project as model context.
+        previousResponseId = conversation.last_response_id ?? undefined;
       }
       await query("INSERT INTO messages (conversation_id,role,content) VALUES ($1,'user',$2)", [conversationId, JSON.stringify({ text: body.message, attachmentCount: body.attachments.length })]);
-    } catch {
+    } catch (error) {
+      if (typeof error === "object" && error && "status" in error) throw error;
       // Streaming remains available when local infrastructure is temporarily offline.
     }
     const projectContext = await buildProjectContext({ projectId: body.projectId, selectedSceneId: body.selectedSceneId }).catch(() => ({
@@ -65,7 +85,7 @@ export async function POST(request: Request) {
     }));
     const stream = await createScreenwriterStream({
       message: body.message,
-      previousResponseId: body.previousResponseId,
+      previousResponseId,
       context: projectContext,
       mode: body.mode,
       modelId: body.modelId,
@@ -73,7 +93,7 @@ export async function POST(request: Request) {
     });
     const encoder = new TextEncoder();
     let fullText = "";
-    let responseId = body.previousResponseId ?? null;
+    let responseId = previousResponseId ?? null;
     let usage: unknown = null;
     const responseStream = new ReadableStream({
       async start(controller) {

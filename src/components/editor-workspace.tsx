@@ -123,6 +123,7 @@ export function EditorWorkspace() {
       if (!response.ok) throw new Error(payload.error ?? "Не удалось проверить экспорт.");
       if (payload.state === "completed" && payload.url) { window.location.assign(payload.url); return; }
       if (payload.state === "failed") throw new Error("Финальная проверка экспортируемого видео не пройдена.");
+      if (payload.state === "paused" || payload.state === "cancelled") throw new Error("Экспорт приостановлен. Продолжите его в разделе «Рендеры».");
       await new Promise((resolve) => window.setTimeout(resolve, 2_000));
     }
     throw new Error("Экспорт продолжается дольше ожидаемого. Он сохранён в разделе «Рендеры».");

@@ -14,7 +14,7 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
       `SELECT a.shot_id,a.scene_id,a.storage_key,a.duration_seconds,sv.continuity_score,sv.version
        FROM generation_assets a JOIN shot_versions sv ON sv.id=a.shot_version_id AND sv.active=true
        JOIN shots sh ON sh.id=a.shot_id JOIN scenes s ON s.id=sh.scene_id
-       WHERE a.project_id=$1 AND a.kind='video' ORDER BY s.number,sh.sequence`,
+       WHERE a.project_id=$1 AND a.kind='video' AND sh.state<>'cancelled' ORDER BY s.number,sh.sequence`,
       [id],
     );
     const clips = await Promise.all(assets.map(async (asset) => ({ ...asset, url: await signedObjectUrl(asset.storage_key) })));

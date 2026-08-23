@@ -25,6 +25,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     const shot = scene.shots.find((item) => item.id === target.shotId)!;
     const projectContext = await buildProjectContext({ projectId: id, selectedSceneId: scene.id });
     const projectRows = await query<{ model_id: string; resolution: string; aspect_ratio: string }>("SELECT model_id,resolution,aspect_ratio FROM projects WHERE id=$1", [id]);
+    if (!projectRows[0]) return NextResponse.json({ error: "Проект не найден." }, { status: 404 });
     const operationRows = await query<{ last_operation: { modelId?: string; output?: { interactionId?: string } } | null }>("SELECT last_operation FROM shots WHERE id=$1 AND project_id=$2", [shot.id, id]);
 
     if (impact.intent === "dialogue" && shot.audioContext.dialogue.length) {
@@ -46,14 +47,15 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         originalAssetId: assetRows[0].id,
         originalStorageKey: assetRows[0].storage_key,
       };
-      const jobId = await enqueueDialoguePatch({
+      const dialogueJob = await enqueueDialoguePatch({
         projectId: id,
         sceneId: scene.id,
         shotId: shot.id,
         payload,
         idempotencyKey: `dialogue-patch:${shot.id}:${contentHash(payload)}`,
       });
-      return NextResponse.json({ impact, jobId, revisedDialogue: revised, videoFramesPreserved: true }, { status: 202 });
+      const inProgress = ["queued", "generating", "validating", "retrying"].includes(dialogueJob.state);
+      return NextResponse.json({ impact, jobId: dialogueJob.jobId, queued: dialogueJob.queued, alreadyApplied: dialogueJob.state === "completed", revisedDialogue: revised, videoFramesPreserved: true }, { status: inProgress ? 202 : 200 });
     }
 
     const originalPrompt = shot.generationPrompt?.prompt ?? shot.action;
@@ -76,7 +78,15 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       aspectRatio: projectRows[0].aspect_ratio,
       references: shot.continuity.requiredReferences,
     });
+    const activeVersion = await query<{ content_hash: string }>(
+      "SELECT sv.content_hash FROM shot_versions sv WHERE sv.shot_id=$1 AND sv.active=true ORDER BY sv.created_at DESC LIMIT 1",
+      [shot.id],
+    );
+    if (activeVersion[0]?.content_hash === specHash) {
+      return NextResponse.json({ impact, queued: 0, alreadyApplied: true, prompt: enhanced, videoFramesPreserved: false });
+    }
     await query("UPDATE shots SET state='planned',generation_spec=$2,content_hash=$3 WHERE id=$1", [shot.id, JSON.stringify(nextShot), specHash]);
+    await query("UPDATE projects SET status='generating',last_error=NULL,updated_at=now() WHERE id=$1", [id]);
     const omniEditable = Boolean(operationRows[0]?.last_operation?.output?.interactionId) && operationRows[0]?.last_operation?.modelId?.startsWith("gemini-omni");
     const queued = await enqueueJobs([{
       projectId: id,

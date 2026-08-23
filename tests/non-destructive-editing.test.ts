@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { analyzeEdit } from "@/server/movie/impact-analysis";
+import { analyzeEdit, buildTimelineIndex } from "@/server/movie/impact-analysis";
+import { scene as fixtureScene, shot as fixtureShot } from "./fixtures";
 
 const timeline = [
   { sceneId: "scene-1", sceneNumber: 1, shotId: "shot-1", shotSequence: 1, startSeconds: 0, endSeconds: 500, dialogueIds: ["d1"] },
@@ -24,5 +25,22 @@ describe("non-destructive editing", () => {
     expect(result.requiresVideoRegeneration).toBe(true);
     expect(result.affected[0].shotId).toBe("shot-3");
     expect(result.unaffected.before).toEqual(["shot-1", "shot-2"]);
+  });
+  it("targets the exact dialogue line inside a shot", () => {
+    const base = fixtureShot("shot-detail");
+    const detailedShot = { ...base, durationSeconds: 10, audioContext: { ...base.audioContext, speakers: ["character-elias"], dialogue: [
+      { id: "first-line", characterId: "character-elias", characterName: "A", text: "First", startSeconds: 1, durationSeconds: 2, delivery: "calm" },
+      { id: "second-line", characterId: "character-elias", characterName: "A", text: "Second", startSeconds: 6, durationSeconds: 2, delivery: "calm" },
+    ] } };
+    const detailed = [{ ...fixtureScene([detailedShot]), id: "scene-detail", durationSeconds: 10, shots: [{ ...detailedShot, sceneId: "scene-detail" }] }];
+    const result = analyzeEdit("На 0:07 измени реплику", buildTimelineIndex(detailed));
+    expect(result.affected[0].dialogueIds).toEqual(["second-line"]);
+    expect(result.requiresVideoRegeneration).toBe(false);
+  });
+  it("does not claim that arbitrary provider-native audio can be changed without replacing the shot", () => {
+    const result = analyzeEdit("Добавь тихую музыку в сцене 2", timeline);
+    expect(result.intent).toBe("audio");
+    expect(result.requiresVideoRegeneration).toBe(true);
+    expect(result.affected[0].tracks).toEqual(["video", "audio"]);
   });
 });

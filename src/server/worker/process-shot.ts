@@ -5,18 +5,19 @@ import { isRetryableDatabaseConnectionError, query, transaction } from "@/server
 import { getProviderKey } from "@/server/provider-secrets";
 import { googleVideoAdapter } from "@/server/providers/video/google";
 import type { ProviderOperation, VideoGenerationRequest } from "@/server/providers/video/types";
-import { getObjectIfExists, putFileObject, putObject, putRemoteObject, signedObjectUrl } from "@/server/storage";
+import { deleteObject, getObjectIfExists, putFileObject, putObject, putRemoteObject, signedObjectUrl } from "@/server/storage";
 import { findCachedShot } from "@/server/movie/repository";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
 import { enqueueAutomaticAssemblyIfReady, enqueueDialoguePatch, enqueueReadyProjectJobs, pauseProjectJobs, requeueDatabaseJob } from "@/server/movie/queue";
 import { getAllowedDurations, getVideoModel, type Resolution } from "@/domain/video-models";
 import { env } from "@/server/env";
 import { contentHash } from "@/server/movie/content-hash";
-import { extractFinalFrame, extractRepresentativeFrame } from "@/server/movie/ffmpeg";
+import { extractFinalFrame, extractRepresentativeFrame, validateGeneratedShot } from "@/server/movie/ffmpeg";
 import { evaluateShot, type ShotQcReport } from "@/server/providers/openai";
 import type { ReferenceImage } from "@/server/providers/video/types";
-import type { AudioContext, ContinuityState, Shot } from "@/domain/movie";
+import type { AudioContext, ContinuityState, Shot, ShotArtifact } from "@/domain/movie";
 import { realismProductionProfile } from "@/server/providers/video/prompt-adapters";
+import type { PoolClient } from "pg";
 
 type PersistedProviderOperation = ProviderOperation & { specHash?: string; startedAt?: string };
 
@@ -83,19 +84,37 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     void query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state IN ('generating','validating')", [job.id]).catch(() => undefined);
   }, 10_000);
   heartbeat.unref();
+  let temporaryProviderFilePath: string | undefined;
   try {
   await query("UPDATE projects SET status='generating',updated_at=now() WHERE id=$1 AND status NOT IN ('completed','cancelled')", [job.project_id]);
-  const cached = await findCachedShot(job.project_id, job.shot_id, job.payload.specHash);
+  let cached = await findCachedShot(job.project_id, job.shot_id, job.payload.specHash);
   if (cached) {
-    await markCompleted(job, cached.storageKey, 0, true);
-    await enqueueReadyProjectJobs(job.project_id);
-    await enqueueAutomaticAssemblyIfReady(job.project_id);
-    return { cached: true, storageKey: cached.storageKey };
+    const cachedObject = await getObjectIfExists(cached.storageKey);
+    try {
+      if (!cachedObject) throw new Error("Cached object is missing from object storage.");
+      await validateGeneratedShot(cachedObject.bytes, job.payload.shot.durationSeconds);
+      await activateCachedShot(job, cached);
+      await enqueueReadyProjectJobs(job.project_id);
+      await enqueueAutomaticAssemblyIfReady(job.project_id);
+      return { cached: true, storageKey: cached.storageKey };
+    } catch {
+      // Metadata without valid media is not a checkpoint. Remove only that
+      // unusable cached version before the paid provider call so the same
+      // content hash can be persisted again without a uniqueness deadlock.
+      await purgeInvalidCachedShot(job, cached);
+      await deleteObject(cached.storageKey).catch(() => undefined);
+      cached = null;
+    }
   }
   const effectiveModelId = job.payload.providerModelId ?? job.model_id;
   const capabilities = getVideoModel(effectiveModelId);
   const price = capabilities.pricePerSecondUsd[job.resolution] ?? capabilities.pricePerSecondUsd["720p"] ?? 0;
-  const providerDuration = providerDurationSeconds(effectiveModelId, job.resolution, job.payload.shot.durationSeconds);
+  const providerDuration = providerDurationSeconds(
+    effectiveModelId,
+    job.resolution,
+    job.payload.shot.durationSeconds,
+    capabilities.family === "veo" && capabilities.referenceImages > 0 && job.payload.shot.continuity.requiredReferences.length > 0,
+  );
   const projectedCost = providerDuration * price;
   const storageKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/${job.payload.specHash}.mp4`;
   // Check the durable provider checkpoint before reserving more budget. A
@@ -187,6 +206,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     const cost = generationAccountingCost(projectedCost, Number(job.reserved_cost_usd), Boolean(staged));
     const inMemoryBytes = operation.output.bytes;
     const localFilePath = operation.output.localFilePath;
+    temporaryProviderFilePath = localFilePath;
     const stored = inMemoryBytes
       ? {
           checksum: createHash("sha256").update(inMemoryBytes).digest("hex"),
@@ -203,14 +223,31 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     // Object storage is independent of PostgreSQL. Stage the paid provider
     // result first so a database restart can never force another video call.
     if (inMemoryBytes) await putObject(storageKey, inMemoryBytes, operation.output.mimeType);
-    if (localFilePath) await rm(localFilePath, { force: true }).catch(() => undefined);
+    if (localFilePath) {
+      await rm(localFilePath, { force: true }).catch(() => undefined);
+      temporaryProviderFilePath = undefined;
+    }
+    const validationObject = inMemoryBytes
+      ? { bytes: inMemoryBytes, contentType: operation.output.mimeType }
+      : await getObjectIfExists(storageKey);
+    if (!validationObject) throw Object.assign(new Error("Invalid media: staged provider video disappeared before validation."), { code: "CORRUPTED_RESULT" });
+    try {
+      await validateGeneratedShot(validationObject.bytes, job.payload.shot.durationSeconds);
+    } catch (error) {
+      // A corrupt/short staged object must not be mistaken for a reusable
+      // checkpoint on the next retry, and a completed provider operation must
+      // not be polled forever for the same unusable bytes.
+      await deleteObject(storageKey).catch(() => undefined);
+      await query("UPDATE shots SET last_operation=NULL WHERE id=$1", [job.shot_id]).catch(() => undefined);
+      throw error;
+    }
     await query("UPDATE jobs SET state='validating' WHERE id=$1", [job.id]).catch(() => undefined);
     // Fast Draft is the interactive path: publish the provider result immediately.
     // Expensive vision QC remains enabled for Final; deterministic dialogue voices
     // are kept in both tiers so a character cannot change voice between shots.
     const qc = job.render_tier === "draft"
       ? null
-      : inMemoryBytes ? await runShotQc(job, inMemoryBytes, operation.output.mimeType, operation.operationId) : null;
+      : await runShotQc(job, validationObject.bytes, validationObject.contentType, operation.operationId);
     const engineSettings = await movieEngineSettings(job.project_id);
     if (qc && qc.overall < engineSettings.qcRetryThreshold && job.attempt < job.max_attempts) {
       const retryPrompt = `${prompt.prompt}\nQC CORRECTION FOR THIS SHOT ONLY: ${qc.retryInstruction ?? qc.issues.join("; ")}. Preserve all unaffected details and locked values.`;
@@ -220,7 +257,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       };
       nextPayload.specHash = contentHash({ shot: nextPayload.shot, qcCorrection: qc.retryInstruction ?? qc.issues });
       const rejectedKey = `projects/${job.project_id}/scenes/${job.scene_id}/shots/${job.shot_id}/qc-rejected-${job.attempt}-${checksum.slice(0, 12)}.mp4`;
-      await putObject(rejectedKey, inMemoryBytes!, operation.output.mimeType);
+      await putObject(rejectedKey, validationObject.bytes, validationObject.contentType);
       const delayMs = Math.min(60_000, 2_000 * 2 ** Math.max(0, job.attempt));
       await persistQcRetry(job, { storageKey: rejectedKey, checksum, byteSize: stored.byteSize, cost, qc, nextPayload, delayMs });
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs });
@@ -251,7 +288,8 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`Shot provider failure ${job.id}: ${failure}: ${message}\n`);
     await withDurableDatabaseRetry(() => settleFailedReservation(job.id, job.project_id, providerCompleted));
-    if (failure === "moderation"
+    const mayTryAnotherProviderVariant = job.attempt < job.max_attempts;
+    if (mayTryAnotherProviderVariant && failure === "moderation"
       && (job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni")
       && job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")) {
       const nextPayload = veoSafeBridgePayload(job.payload);
@@ -259,19 +297,19 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
-    if (failure === "moderation" && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE SAFETY RETRY")) {
+    if (mayTryAnotherProviderVariant && failure === "moderation" && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE SAFETY RETRY")) {
       const nextPayload = moderationRetryPayload(job.payload);
       await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message));
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
-    if (failure === "moderation" && !job.payload.providerModelId && !job.model_id.startsWith("gemini-omni")) {
+    if (mayTryAnotherProviderVariant && failure === "moderation" && !job.payload.providerModelId && !job.model_id.startsWith("gemini-omni")) {
       const nextPayload = omniFallbackPayload(job.payload);
       await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_OMNI_FALLBACK"));
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
-    if (failure === "moderation"
+    if (mayTryAnotherProviderVariant && failure === "moderation"
       && (job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni")
       && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")) {
       const nextPayload = omniNeutralRescuePayload(job.payload);
@@ -300,6 +338,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   }
   } finally {
     clearInterval(heartbeat);
+    if (temporaryProviderFilePath) await rm(temporaryProviderFilePath, { force: true }).catch(() => undefined);
   }
 }
 
@@ -432,7 +471,8 @@ function containsLegacySensitiveTerms(value: string): boolean {
   return /weapon|restraint|threat|agency|violence|оруж|наручник|задерж|угроз/i.test(value);
 }
 
-export function providerDurationSeconds(modelId: string, resolution: Resolution, plannedSeconds: number): number {
+export function providerDurationSeconds(modelId: string, resolution: Resolution, plannedSeconds: number, usesReferenceImages = false): number {
+  if (usesReferenceImages && getVideoModel(modelId).family === "veo") return 8;
   const allowed = getAllowedDurations(modelId, resolution).sort((left, right) => left - right);
   return allowed.find((seconds) => seconds >= plannedSeconds) ?? allowed.at(-1) ?? plannedSeconds;
 }
@@ -520,7 +560,7 @@ export function buildContinuityChainPrompt(
     realismProductionProfile(originalPrompt),
     "CINEFORGE STRICT CONTINUITY CONTRACT:",
     hasFirstFrame
-      ? "The supplied first-frame image is the exact final frame of the previous chronological shot. Begin on that exact composition and continue its physical movement. Do not reset, teleport, reverse or randomly reposition any person, vehicle, prop or camera."
+      ? "<FIRST_FRAME> The supplied first image is the exact final frame of the previous chronological shot. Use this image as the starting frame, begin on that exact composition and continue its physical movement. Do not reset, teleport, reverse or randomly reposition any person, vehicle, prop or camera."
       : "Preserve the canonical project state and locked references exactly; do not invent a visual reset.",
     `Canonical character state: ${JSON.stringify(characterState)}.`,
     `Canonical location state: ${JSON.stringify({ locationId: continuity.locationId, ...continuity.locationState })}.`,
@@ -559,14 +599,17 @@ async function loadShotReferences(job: JobRow, modelId: string): Promise<Referen
   const dependencyId = job.payload.shot.continuity && "previousShotId" in job.payload.shot.continuity
     ? String((job.payload.shot.continuity as { previousShotId?: string | null }).previousShotId ?? "")
     : "";
-  if (dependencyId && capabilities.firstFrame) {
+  // previousShotId is chronological memory. It becomes a visual first-frame
+  // reference only when the scheduler declared a continuous dependency; a hard
+  // cut to another place/time must never inherit the previous composition.
+  if (dependencyId && job.payload.shot.dependencies.includes(dependencyId) && capabilities.firstFrame) {
     const previous = await query<{ storage_key: string }>(
       `SELECT a.storage_key FROM generation_assets a JOIN shot_versions sv ON sv.id=a.shot_version_id AND sv.active=true
        WHERE a.project_id=$1 AND a.shot_id=$2 AND a.kind='video' ORDER BY a.created_at DESC LIMIT 1`,
       [job.project_id, dependencyId],
     );
     if (previous[0]) {
-      const response = await fetch(await signedObjectUrl(previous[0].storage_key));
+      const response = await fetch(await signedObjectUrl(previous[0].storage_key), { signal: AbortSignal.timeout(120_000) });
       if (!response.ok) throw new Error(`Unable to load previous-shot reference: ${response.status}`);
       const frame = await extractFinalFrame(new Uint8Array(await response.arrayBuffer()));
       references.push({ id: `${dependencyId}:final-frame`, data: Buffer.from(frame).toString("base64"), mimeType: "image/jpeg", role: "first-frame" });
@@ -579,7 +622,7 @@ async function loadShotReferences(job: JobRow, modelId: string): Promise<Referen
       [job.project_id, requiredIds],
     );
     for (const asset of assets) {
-      const response = await fetch(await signedObjectUrl(asset.storage_key));
+      const response = await fetch(await signedObjectUrl(asset.storage_key), { signal: AbortSignal.timeout(120_000) });
       if (!response.ok) throw new Error(`Unable to load reference asset ${asset.id}: ${response.status}`);
       references.push({ id: asset.id, data: Buffer.from(await response.arrayBuffer()).toString("base64"), mimeType: asset.mime_type, role: asset.metadata?.role ?? "subject" });
     }
@@ -609,8 +652,9 @@ async function runShotQc(job: JobRow, bytes: Uint8Array, mimeType: string, opera
 
 async function persistCompletedAsset(job: JobRow, storageKey: string, checksum: string, byteSize: number, operationId: string, cost: number, qc: (ShotQcReport & { decision?: "accept" | "flag" }) | null) {
   return transaction(async (client) => {
-    const versionResult = await client.query<{ current_version: number }>("SELECT current_version FROM shots WHERE id=$1 FOR UPDATE", [job.shot_id]);
-    const version = (versionResult.rows[0]?.current_version ?? 0) + 1;
+    await client.query("SELECT id FROM shots WHERE id=$1 FOR UPDATE", [job.shot_id]);
+    const versionResult = await client.query<{ version: number }>("SELECT COALESCE(max(version),0)::int version FROM shot_versions WHERE shot_id=$1", [job.shot_id]);
+    const version = (versionResult.rows[0]?.version ?? 0) + 1;
     await client.query("UPDATE shot_versions SET active=false WHERE shot_id=$1", [job.shot_id]);
     const shotVersion = await client.query<{ id: string }>(
       `INSERT INTO shot_versions (shot_id, version, reason, generation_spec, content_hash, provider_operation_id, continuity_score, qc_report, active)
@@ -625,9 +669,10 @@ async function persistCompletedAsset(job: JobRow, storageKey: string, checksum: 
     const asset = await client.query<{ id: string }>("SELECT id FROM generation_assets WHERE storage_key=$1", [storageKey]);
     await client.query("UPDATE timeline_clips SET asset_id=$2 WHERE shot_id=$1 AND track='video' AND enabled=true", [job.shot_id, asset.rows[0]?.id ?? null]);
     await client.query("UPDATE shots SET state='completed', current_version=$2, retry_count=$3, last_error=NULL WHERE id=$1", [job.shot_id, version, job.attempt]);
+    await advanceProjectMemory(client, job);
     await client.query("UPDATE jobs SET state='completed', completed_at=now(), result=$2,reserved_cost_usd=0 WHERE id=$1", [job.id, JSON.stringify({ storageKey, version })]);
     const count = await client.query<{ completed: number; total: number }>(
-      "SELECT count(*) FILTER (WHERE state='completed')::int completed, count(*)::int total FROM shots WHERE project_id=$1",
+      "SELECT count(*) FILTER (WHERE state='completed')::int completed, count(*) FILTER (WHERE state<>'cancelled')::int total FROM shots WHERE project_id=$1",
       [job.project_id],
     );
     const progress = count.rows[0].total ? (count.rows[0].completed / count.rows[0].total) * 100 : 0;
@@ -642,7 +687,7 @@ async function persistCompletedAsset(job: JobRow, storageKey: string, checksum: 
       [job.project_id,
         states.rows.filter((row) => row.state === "completed").map((row) => row.id),
         states.rows.filter((row) => row.state === "failed").map((row) => row.id),
-        states.rows.filter((row) => !["completed", "failed"].includes(row.state)).map((row) => row.id),
+        states.rows.filter((row) => !["completed", "failed", "cancelled"].includes(row.state)).map((row) => row.id),
         job.id,
         JSON.stringify({ shotId: job.shot_id, storageKey, version, spentDeltaUsd: cost, createdAt: new Date().toISOString() })],
     );
@@ -739,18 +784,57 @@ async function persistQcRetry(job: JobRow, input: {
   });
 }
 
-async function markCompleted(job: JobRow, storageKey: string, cost: number, cached: boolean) {
+async function activateCachedShot(job: JobRow, cached: ShotArtifact) {
   await transaction(async (client) => {
     const reservation = await client.query<{ reserved_cost_usd: string }>("SELECT reserved_cost_usd FROM jobs WHERE id=$1 FOR UPDATE", [job.id]);
     const reserved = Number(reservation.rows[0]?.reserved_cost_usd ?? 0);
-    await client.query("UPDATE shots SET state='completed' WHERE id=$1", [job.shot_id]);
-    await client.query("UPDATE jobs SET state='completed',completed_at=now(),result=$2,reserved_cost_usd=0 WHERE id=$1", [job.id, JSON.stringify({ storageKey, cached })]);
+    await client.query("UPDATE shot_versions SET active=(version=$2) WHERE shot_id=$1", [job.shot_id, cached.version]);
+    await client.query("UPDATE timeline_clips SET asset_id=$2 WHERE shot_id=$1 AND track='video' AND enabled=true", [job.shot_id, cached.id]);
+    await client.query("UPDATE shots SET state='completed',current_version=$2,last_error=NULL WHERE id=$1", [job.shot_id, cached.version]);
+    await advanceProjectMemory(client, job);
+    await client.query("UPDATE jobs SET state='completed',completed_at=now(),result=$2,reserved_cost_usd=0,last_error=NULL WHERE id=$1", [job.id, JSON.stringify({ storageKey: cached.storageKey, version: cached.version, cached: true })]);
     const count = await client.query<{ completed: number; total: number }>(
-      "SELECT count(*) FILTER (WHERE state='completed')::int completed, count(*)::int total FROM shots WHERE project_id=$1",
+      "SELECT count(*) FILTER (WHERE state='completed')::int completed, count(*) FILTER (WHERE state<>'cancelled')::int total FROM shots WHERE project_id=$1",
       [job.project_id],
     );
-    await client.query("UPDATE projects SET completed_shots=$2,total_shots=$3,progress=CASE WHEN $3=0 THEN 0 ELSE $2::numeric/$3*100 END,spent_usd=spent_usd+$4,reserved_usd=GREATEST(0,reserved_usd-$5) WHERE id=$1", [
-      job.project_id, count.rows[0].completed, count.rows[0].total, cost, reserved,
+    await client.query("UPDATE projects SET completed_shots=$2,total_shots=$3,progress=CASE WHEN $3=0 THEN 0 ELSE $2::numeric/$3*100 END,reserved_usd=GREATEST(0,reserved_usd-$4),last_error=NULL WHERE id=$1", [
+      job.project_id, count.rows[0].completed, count.rows[0].total, reserved,
     ]);
+    await client.query(
+      `INSERT INTO checkpoints (project_id,event_type,completed_shot_ids,current_job_id,snapshot)
+       VALUES ($1,'shot-cache-restored',ARRAY[$2]::text[],$3,$4)`,
+      [job.project_id, job.shot_id, job.id, JSON.stringify({ shotId: job.shot_id, storageKey: cached.storageKey, version: cached.version })],
+    );
   });
+}
+
+async function purgeInvalidCachedShot(job: JobRow, cached: ShotArtifact): Promise<void> {
+  await transaction(async (client) => {
+    await client.query("SELECT id FROM shots WHERE id=$1 FOR UPDATE", [job.shot_id]);
+    await client.query("UPDATE timeline_clips SET asset_id=NULL WHERE asset_id=$1", [cached.id]);
+    await client.query("DELETE FROM generation_assets WHERE id=$1 AND project_id=$2", [cached.id, job.project_id]);
+    await client.query("DELETE FROM shot_versions WHERE shot_id=$1 AND content_hash=$2", [job.shot_id, cached.contentHash]);
+    const remaining = await client.query<{ version: number }>("SELECT COALESCE(max(version),0)::int version FROM shot_versions WHERE shot_id=$1", [job.shot_id]);
+    await client.query("UPDATE shots SET state='planned',current_version=$2,last_error=NULL WHERE id=$1", [job.shot_id, remaining.rows[0]?.version ?? 0]);
+  });
+}
+
+async function advanceProjectMemory(client: PoolClient, job: JobRow): Promise<void> {
+  const sequence = job.payload.shot.sequence;
+  for (const [characterId, state] of Object.entries(job.payload.shot.continuity.characterStates)) {
+    await client.query(
+      `UPDATE characters SET
+         current_state=current_state || $3::jsonb || jsonb_build_object('_lastShotSequence',$4::int),updated_at=now()
+       WHERE id=$1 AND project_id=$2
+         AND COALESCE(NULLIF(current_state->>'_lastShotSequence','')::int,-1) <= $4`,
+      [characterId, job.project_id, JSON.stringify(state), sequence],
+    );
+  }
+  await client.query(
+    `UPDATE locations SET
+       current_state=current_state || $3::jsonb || jsonb_build_object('_lastShotSequence',$4::int),updated_at=now()
+     WHERE id=$1 AND project_id=$2
+       AND COALESCE(NULLIF(current_state->>'_lastShotSequence','')::int,-1) <= $4`,
+    [job.payload.shot.continuity.locationId, job.project_id, JSON.stringify(job.payload.shot.continuity.locationState), sequence],
+  );
 }

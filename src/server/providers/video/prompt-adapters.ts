@@ -1,4 +1,4 @@
-import type { AudioContext, ContinuityState, MoviePlan, Shot } from "@/domain/movie";
+import type { AudioContext, ContinuityState, MoviePlan, Scene, Shot } from "@/domain/movie";
 import type { PromptAdapter } from "./types";
 
 export interface ShotIntent {
@@ -215,30 +215,42 @@ export function normalizeMoviePlanRuntime(plan: MoviePlan, modelId: string): Mov
     }).filter((scene) => scene.shots.length > 0);
   }
 
-  // Canonical chronological chain: this is the source of truth for scheduling,
-  // previous-frame references and Project Memory across scene boundaries.
-  const timeline = scenes.flatMap((scene) => scene.shots);
-  const validIds = new Set(timeline.map((shot) => shot.id));
+  // The timeline always keeps chronological memory, but only visually
+  // continuous boundaries are hard scheduling dependencies. A real cut to a
+  // different location/time can render in parallel without losing story state.
+  const timeline = scenes.flatMap((scene) => scene.shots.map((shot) => ({ scene, shot })));
+  const validIds = new Set(timeline.map(({ shot }) => shot.id));
   let timelineIndex = 0;
   scenes = scenes.map((scene) => {
     const shots = scene.shots.map((shot) => {
       const previous = timeline[timelineIndex - 1];
       const next = timeline[timelineIndex + 1];
+      const continuousBoundary = previous ? visuallyContinuousBoundary(previous.scene, scene) : false;
       timelineIndex += 1;
       return {
         ...shot,
         sequence: timelineIndex,
         dependencies: [...new Set([
-          ...shot.dependencies.filter((id) => validIds.has(id) && id !== shot.id),
-          ...(previous ? [previous.id] : []),
+          ...shot.dependencies.filter((id) => validIds.has(id) && id !== shot.id && (id !== previous?.shot.id || continuousBoundary)),
+          ...(previous && continuousBoundary ? [previous.shot.id] : []),
         ])],
-        continuity: { ...shot.continuity, previousShotId: previous?.id ?? null, nextShotId: next?.id ?? null },
+        continuity: { ...shot.continuity, previousShotId: previous?.shot.id ?? null, nextShotId: next?.shot.id ?? null },
       };
     });
     return { ...scene, shots, durationSeconds: shots.reduce((sum, shot) => sum + shot.durationSeconds, 0) };
   });
 
   return { ...plan, summary: { ...plan.summary, durationSeconds: target }, scenes };
+}
+
+function visuallyContinuousBoundary(previous: Scene, current: Scene): boolean {
+  if (previous.id === current.id) return true;
+  // The same physical location at the same story moment remains continuous
+  // even when no actor appears in both shots: parked cars, doors, furniture and
+  // background objects still must not jump or disappear.
+  return previous.locationId === current.locationId
+    && previous.timeOfDay === current.timeOfDay
+    && previous.weather === current.weather;
 }
 
 function splitShotIntoBeats(shot: Shot, maxBeatSeconds: number): Shot[] {

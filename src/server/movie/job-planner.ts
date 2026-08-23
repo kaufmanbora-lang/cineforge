@@ -24,10 +24,11 @@ export function planGenerationJobs(projectId: string, scenes: Scene[], options: 
     // Fast Draft may skip expensive QC, but it must never break the story graph.
     // In particular, cross-scene dependencies are what make the previous final
     // frame, blocking and project state available to the next generation.
-    const dependencies = [...new Set([
-      ...shot.dependencies,
-      shot.continuity.previousShotId,
-    ].filter((id): id is string => Boolean(id)))]
+    // `previousShotId` records chronological memory, not necessarily a visual
+    // dependency. The runtime normalizer puts only continuous boundaries in
+    // `shot.dependencies`; treating every hard cut as dependent serializes a
+    // whole movie and makes independent locations unnecessarily slow.
+    const dependencies = [...new Set(shot.dependencies)]
       .filter((id) => id !== shot.id && shotIds.has(id));
     const specHash = contentHash({
       prompt: shot.generationPrompt,

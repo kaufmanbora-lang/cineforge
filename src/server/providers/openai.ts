@@ -35,8 +35,8 @@ export async function openAIClient(): Promise<OpenAI> {
   return new OpenAI({ apiKey });
 }
 
-export async function testOpenAIConnection(): Promise<{ connected: true; model: string }> {
-  const client = await openAIClient();
+export async function testOpenAIConnection(candidateApiKey?: string): Promise<{ connected: true; model: string }> {
+  const client = candidateApiKey ? new OpenAI({ apiKey: candidateApiKey }) : await openAIClient();
   await client.models.retrieve(env().OPENAI_SCREENWRITER_MODEL);
   return { connected: true, model: env().OPENAI_SCREENWRITER_MODEL };
 }
@@ -99,7 +99,7 @@ export async function generateStructuredMoviePlan(input: {
     const client = await openAIClient();
     const response = await client.responses.parse({
       model: input.screenwriterModelId ?? (await openAIModelRouting()).screenwriting,
-      reasoning: { effort: "high" },
+      reasoning: { effort: input.durationSeconds <= 60 ? "low" : input.durationSeconds <= 300 ? "medium" : "high" },
       instructions: SCREENWRITER_INSTRUCTIONS,
       input: [
         {
@@ -113,7 +113,7 @@ export async function generateStructuredMoviePlan(input: {
         },
       ],
       text: { format: zodTextFormat(MoviePlanStructuredOutputSchema, "movie_plan") },
-      max_output_tokens: 120_000,
+      max_output_tokens: Math.min(120_000, Math.max(12_000, 8_000 + Math.ceil(input.durationSeconds / 5) * 900)),
     });
     const parsed = (response as typeof response & { output_parsed?: unknown }).output_parsed;
     if (!parsed) throw new Error("OpenAI returned no structured MoviePlan.");
@@ -131,6 +131,7 @@ export async function generateStructuredMoviePlan(input: {
             generationConfig: {
               responseMimeType: "application/json",
               responseJsonSchema: z.toJSONSchema(MoviePlanStructuredOutputSchema),
+              maxOutputTokens: Math.min(65_536, Math.max(12_000, 8_000 + Math.ceil(input.durationSeconds / 5) * 900)),
             },
           });
           const parsed = MoviePlanStructuredOutputSchema.parse(JSON.parse(geminiText(payload)));
@@ -168,6 +169,7 @@ async function callGeminiGenerateContent(apiKey: string, model: string, body: Re
     method: "POST",
     headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5 * 60_000),
   });
   const text = await response.text();
   if (!response.ok) throw Object.assign(new Error(`Google Gemini ${model}: ${text.slice(0, 1_000)}`), { status: response.status });
@@ -317,7 +319,7 @@ Write every user-visible field in the language of the user's idea. If the langua
 The screenplay must have meaningful dramatic content for the full target runtime without repeated shots, artificial slow motion, filler, reused dialogue or padding.
 Every scene and shot requires stable IDs. Every shot must be short enough for the chosen Google video model (maximum 10 seconds).
 Build character, location, wardrobe, voice, audio and continuity state explicitly. Dialogue text is exact. Every audio context starts clean and forbids prior dialogue, prior music and prior sound effects unless the screenplay explicitly requests a continuous sound bridge.
-Link every chronologically adjacent shot with previousShotId, nextShotId and a matching shot dependency, including across scene boundaries. The next shot must begin from the exact end state of the previous shot: character and vehicle positions, movement direction, wardrobe, props, injuries, weather, time, lighting, location layout and unfinished dialogue. An intentional jump in time or place must still preserve character, wardrobe, voice and locked identity state and must be described explicitly in continuity requirements.
+Link every chronologically adjacent shot with previousShotId and nextShotId. Add a matching scheduling dependency only when the boundary is visually continuous at the same location and story moment. A true cut to another place or time keeps chronological memory but may render independently. A continuous next shot must begin from the exact end state of the previous shot: character and vehicle positions, movement direction, wardrobe, props, injuries, weather, time, lighting, location layout and unfinished dialogue. An intentional jump in time or place must still preserve character, wardrobe, voice and locked identity state and must be described explicitly in continuity requirements.
 Write every character position as a topological blocking state, including inside/outside, side of wall or doorway, foreground/background, facing direction and intended travel path. A position may change only through a visible physically reachable path. For door actions, explicitly identify who is on each side, who can reach which handle and in which direction the hinged door moves. Never script an impossible side change, passage through solid geometry or unexplained teleport. Use natural eyelines toward scene partners, props or travel direction; nobody looks into the camera unless direct address is explicitly requested.
 Treat every recurring vehicle, prop and background object as persistent state in locationState.objectPositions. Record vehicle count, convoy order, model/color, lane or curb offset, heading, wheel orientation, speed and stopped/moving state. Never remove or reposition an object between adjacent shots unless the screenplay visibly shows its continuous movement or removal. For continuous action, preserve screen direction and the 180-degree camera axis; do not invent a reverse angle or camera reset that changes geography.
 Locked values must never change without a direct user request. The total of shot durations should closely match the requested runtime.`;

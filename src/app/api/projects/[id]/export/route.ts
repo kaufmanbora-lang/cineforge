@@ -7,7 +7,7 @@ import { signedObjectUrl } from "@/server/storage";
 
 export const runtime = "nodejs";
 
-const Body = z.object({ format: z.enum(["mp4", "mov"]).default("mp4"), resolution: z.enum(["720p", "1080p", "4k"]), sceneId: z.string().optional() });
+const Body = z.object({ format: z.enum(["mp4", "mov"]).default("mp4"), resolution: z.enum(["720p", "1080p", "4k"]), sceneId: z.string().uuid().optional() });
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
@@ -29,7 +29,8 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   try {
     const { id } = await context.params;
     const body = Body.parse(await request.json());
-    return NextResponse.json({ queued: true, ...(await enqueueAssembly({ projectId: id, ...body })) }, { status: 202 });
+    const result = await enqueueAssembly({ projectId: id, ...body });
+    return NextResponse.json(result, { status: result.state === "completed" ? 200 : 202 });
   } catch (error) {
     return apiError(error, 400);
   }

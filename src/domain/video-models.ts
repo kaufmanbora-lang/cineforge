@@ -80,7 +80,7 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     conversationalEditing: false,
     pricePerSecondUsd: { preview: 0.4, "720p": 0.4, "1080p": 0.4, "4k": 0.6 },
     notes: ["1080p, 4K, reference images and extension require 8-second generations."],
-    sourceCheckedAt: "2026-08-22",
+    sourceCheckedAt: "2026-08-23",
   },
   "veo-3.1-fast-generate-preview": {
     id: "veo-3.1-fast-generate-preview",
@@ -102,7 +102,7 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     conversationalEditing: false,
     pricePerSecondUsd: { preview: 0.1, "720p": 0.1, "1080p": 0.12, "4k": 0.3 },
     notes: ["1080p, 4K, reference images and extension require 8-second generations."],
-    sourceCheckedAt: "2026-08-22",
+    sourceCheckedAt: "2026-08-23",
   },
   "veo-3.1-lite-generate-preview": {
     id: "veo-3.1-lite-generate-preview",
@@ -116,15 +116,15 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     aspectRatios: ["16:9", "9:16"],
     durationsSeconds: [4, 6, 8],
     nativeAudio: true,
-    referenceImages: 3,
+    referenceImages: 0,
     referenceVideo: false,
     firstFrame: true,
-    lastFrame: false,
+    lastFrame: true,
     extension: false,
     conversationalEditing: false,
     pricePerSecondUsd: { preview: 0.05, "720p": 0.05, "1080p": 0.08 },
-    notes: ["4K output is not supported.", "1080p and reference images require 8 seconds."],
-    sourceCheckedAt: "2026-08-22",
+    notes: ["4K output and reference images are not supported.", "1080p requires 8 seconds."],
+    sourceCheckedAt: "2026-08-23",
   },
 };
 

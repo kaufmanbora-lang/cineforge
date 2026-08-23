@@ -8,6 +8,14 @@ describe("API failure policy", () => {
     expect(classifyFailure(error)).toBe("quota");
     expect(retryDecision({ failure: "quota", attempt: 1, maxAttempts: 3 })).toEqual({ retry: false, pauseProject: true, delayMs: 0 });
   });
+  it("does not mistake a paid-tier 429 for inactive billing", () => {
+    const error = Object.assign(new Error("RESOURCE_EXHAUSTED: spend limit for billing tier 1"), { status: 429 });
+    expect(classifyFailure(error)).toBe("quota");
+  });
+  it("does not treat generic billing metadata as a payment failure", () => {
+    const error = Object.assign(new Error("Billing metadata failed a different precondition"), { status: 400 });
+    expect(classifyFailure(error)).toBe("fatal");
+  });
   it("pauses on billing and key failures so completed checkpoints stay intact", () => {
     const billing = Object.assign(new Error("Google billing failed_precondition"), { status: 400, code: "GOOGLE_BILLING_NOT_READY" });
     const authentication = Object.assign(new Error("invalid API key"), { status: 401, code: "GOOGLE_AUTHENTICATION" });

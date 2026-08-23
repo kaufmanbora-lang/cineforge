@@ -4,7 +4,7 @@ import { apiError } from "@/server/http";
 import { query } from "@/server/db";
 import { latestMoviePlan } from "@/server/movie/repository";
 import { planGenerationJobs } from "@/server/movie/job-planner";
-import { enqueueJobs } from "@/server/movie/queue";
+import { enqueueJobs, resumeProjectJobs } from "@/server/movie/queue";
 import { estimateGeneration } from "@/domain/estimation";
 import type { Resolution } from "@/domain/video-models";
 
@@ -28,9 +28,19 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
     const plan = await latestMoviePlan(id);
     if (!plan) return NextResponse.json({ error: "Создайте сценарий и план фильма перед запуском генерации." }, { status: 409 });
+    // Publish the authoritative project state before creating BullMQ envelopes.
+    // A fast worker may otherwise pause or complete the project and this route
+    // would overwrite that state a few milliseconds later with "queued".
+    await query(
+      "UPDATE projects SET status=CASE WHEN status IN ('completed','cancelled') THEN status ELSE 'queued'::project_status END,maximum_budget_usd=$2,estimated_cost_usd=$3,last_error=NULL,updated_at=now() WHERE id=$1",
+      [id, maximumBudget, estimate.estimatedTotalUsd],
+    );
     const added = await enqueueJobs(planGenerationJobs(id, plan.scenes, { fastDraft: rows[0].render_tier === "draft" }));
-    await query("UPDATE projects SET status=CASE WHEN status IN ('completed','cancelled') THEN status ELSE 'queued'::project_status END,maximum_budget_usd=$2,estimated_cost_usd=$3,last_error=NULL WHERE id=$1", [id, maximumBudget, estimate.estimatedTotalUsd]);
-    return NextResponse.json({ queued: added, estimate, projectId: id });
+    // Existing failed/paused jobs use the same idempotency keys, so enqueueJobs
+    // correctly inserts nothing. Explicitly resume them instead of returning a
+    // successful response that leaves the project motionless.
+    const resumed = added === 0 ? await resumeProjectJobs(id, { manual: true }) : 0;
+    return NextResponse.json({ queued: added + resumed, resumed, estimate, projectId: id });
   } catch (error) {
     return apiError(error, 400);
   }

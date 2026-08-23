@@ -8,6 +8,7 @@ export interface TimelineIndexEntry {
   startSeconds: number;
   endSeconds: number;
   dialogueIds: string[];
+  dialogueRanges?: Array<{ id: string; startSeconds: number; endSeconds: number }>;
 }
 
 export interface ImpactAnalysis {
@@ -41,25 +42,26 @@ export function analyzeEdit(command: string, timeline: TimelineIndexEntry[], sel
   const visual = VISUAL_TERMS.test(command);
   const intent: ImpactAnalysis["intent"] = dialogue && visual ? "mixed" : visual ? "visual" : dialogue ? "dialogue" : "audio";
   const onlyDialogue = dialogue && !visual;
+  const targetedDialogueIds = onlyDialogue ? dialogueIdsAtTimestamp(target, timestamp) : [];
   const targetIndex = timeline.indexOf(target);
   return {
     intent,
     affected: [{
       sceneId: target.sceneId,
       shotId: target.shotId,
-      dialogueIds: onlyDialogue ? target.dialogueIds : [],
-      tracks: onlyDialogue ? ["dialogue", "subtitles"] : visual ? ["video", "ambience", "sfx"] : ["audio"],
+      dialogueIds: targetedDialogueIds,
+      tracks: onlyDialogue ? ["dialogue", "subtitles"] : visual ? ["video", "ambience", "sfx"] : ["video", "audio"],
     }],
     unaffected: {
       before: timeline.slice(0, targetIndex).map((entry) => entry.shotId),
       after: timeline.slice(targetIndex + 1).map((entry) => entry.shotId),
     },
-    requiresVideoRegeneration: visual,
+    requiresVideoRegeneration: !onlyDialogue,
     reason: onlyDialogue
       ? "The request changes dialogue only; preserve the original video frames and rebuild dialogue/subtitle tracks."
       : visual
         ? "The request changes visible pixels; regenerate only the matched shot and replace its timeline clip."
-        : "The request affects only the selected shot audio context.",
+        : "The selected video provider supplies soundtrack and picture together; regenerate only the matched shot, while preserving every other shot.",
   };
 }
 
@@ -88,8 +90,24 @@ export function buildTimelineIndex(scenes: Scene[]): TimelineIndexEntry[] {
       startSeconds: cursor,
       endSeconds: cursor + shot.durationSeconds,
       dialogueIds: shot.audioContext.dialogue.map((dialogue) => dialogue.id),
+      dialogueRanges: shot.audioContext.dialogue.map((dialogue) => ({
+        id: dialogue.id,
+        startSeconds: cursor + dialogue.startSeconds,
+        endSeconds: cursor + dialogue.startSeconds + dialogue.durationSeconds,
+      })),
     };
     cursor = entry.endSeconds;
     return entry;
   }));
+}
+
+function dialogueIdsAtTimestamp(target: TimelineIndexEntry, timestamp: number | null): string[] {
+  if (timestamp === null || !target.dialogueRanges?.length) return target.dialogueIds;
+  const exact = target.dialogueRanges.filter((range) => timestamp >= range.startSeconds && timestamp < range.endSeconds);
+  if (exact.length) return exact.map((range) => range.id);
+  const nearest = target.dialogueRanges.reduce((best, range) => {
+    const distance = Math.abs(timestamp - (range.startSeconds + range.endSeconds) / 2);
+    return !best || distance < best.distance ? { id: range.id, distance } : best;
+  }, undefined as { id: string; distance: number } | undefined);
+  return nearest ? [nearest.id] : target.dialogueIds;
 }
