@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
+import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
@@ -169,6 +169,18 @@ describe("Google Omni response parsing", () => {
     expect(safe.dialogue).toEqual([]);
     expect(safe.speakers).toEqual([]);
     expect(audio.dialogue[0].text).toBe("ФБР! Руки вверх!");
+  });
+
+  it("uses one bounded neutral Omni rescue while preserving canonical post-production audio", () => {
+    const plannedShot = shot("shot-omni-neutral");
+    const audio = { ...plannedShot.audioContext, speakers: ["character-elias"], dialogue: [{ id: "d1", characterId: "character-elias", characterName: "Elias", text: "ФБР! Руки вверх!", delivery: "firm", startSeconds: 0, durationSeconds: 2 }] };
+    const rescued = omniNeutralRescuePayload({ shot: { ...plannedShot, audioContext: audio, generationPrompt: plannedShot.generationPrompt! }, specHash: "original" });
+    expect(rescued.providerModelId).toBe("gemini-omni-flash-preview");
+    expect(rescued.shot.generationPrompt?.prompt).toContain("CINEFORGE OMNI NEUTRAL RESCUE");
+    expect(rescued.shot.generationPrompt?.prompt).not.toMatch(/ФБР|наручник|задерж|оруж/i);
+    expect(providerAudioContext(rescued.shot.generationPrompt!.prompt, audio)?.dialogue).toEqual([]);
+    expect(audio.dialogue[0].text).toBe("ФБР! Руки вверх!");
+    expect(omniNeutralRescuePayload(rescued)).toBe(rescued);
   });
 
   it("switches only the repeatedly filtered shot to OmniFlash", () => {

@@ -61,6 +61,12 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     await query("UPDATE jobs SET payload=$2 WHERE id=$1", [job.id, JSON.stringify(job.payload)]);
     await query("UPDATE shots SET last_operation=NULL WHERE id=$1", [job.shot_id]);
   }
+  if (shouldUseNeutralOmniRescue(job)) {
+    job.payload = omniNeutralRescuePayload(job.payload);
+    job.shot_last_operation = null;
+    await query("UPDATE jobs SET payload=$2 WHERE id=$1", [job.id, JSON.stringify(job.payload)]);
+    await query("UPDATE shots SET last_operation=NULL WHERE id=$1", [job.shot_id]);
+  }
   const heartbeat = setInterval(() => {
     void query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state IN ('generating','validating')", [job.id]).catch(() => undefined);
   }, 10_000);
@@ -243,6 +249,14 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
+    if (failure === "moderation"
+      && (job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni")
+      && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")) {
+      const nextPayload = omniNeutralRescuePayload(job.payload);
+      await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_OMNI_NEUTRAL_RESCUE"));
+      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
+      return { cached: false, storageKey: "", retrying: true };
+    }
     if (failure === "billing" && job.payload.providerModelId === "gemini-omni-flash-preview" && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE")) {
       const nextPayload = veoNeutralRescuePayload(job.payload);
       await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_VEO_BILLING_FALLBACK"));
@@ -284,6 +298,20 @@ export function omniFallbackPayload(payload: JobRow["payload"]): JobRow["payload
   return { ...payload, providerModelId: "gemini-omni-flash-preview", shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview" }) };
 }
 
+export function omniNeutralRescuePayload(payload: JobRow["payload"]): JobRow["payload"] {
+  if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")) return payload;
+  const generationPrompt = payload.shot.generationPrompt;
+  if (!generationPrompt) return { ...payload, providerModelId: "gemini-omni-flash-preview" };
+  const seconds = payload.shot.durationSeconds;
+  const prompt = `Create one ${seconds}-second photorealistic live-action continuation of the supplied previous frame. Preserve the exact same adult characters, faces, wardrobe, location, weather, lighting, object positions and camera direction. Calm professional visitors move naturally through the already open doorway or across the room, then stop at their established positions for a quiet serious conversation. Everyone remains calm with empty relaxed hands. No physical contact, restraint, confrontation, threatening gesture, visible weapon, agency name, insignia, readable logo, private information or public figure. Solid realistic geometry, ordinary walking speed, no teleportation, no intersections with walls or furniture. Clean audio start with only subtle room ambience; no speech or audio carry-over. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE OMNI NEUTRAL RESCUE.`;
+  const shot = { ...payload.shot, generationPrompt: {
+    ...generationPrompt,
+    prompt,
+    negativeDirectives: [...new Set([...generationPrompt.negativeDirectives, "violence", "restraint", "weapons", "threats", "agency insignia", "readable logos"])],
+  } };
+  return { ...payload, providerModelId: "gemini-omni-flash-preview", shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview", neutralRescue: 1 }) };
+}
+
 export function veoNeutralRescuePayload(payload: JobRow["payload"]): JobRow["payload"] {
   if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE")) return payload;
   const generationPrompt = payload.shot.generationPrompt;
@@ -302,6 +330,14 @@ function shouldSwitchFilteredVeoToOmni(job: JobRow): boolean {
   return !job.model_id.startsWith("gemini-omni")
     && !job.payload.providerModelId
     && Boolean(job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE SAFETY RETRY"))
+    && job.shot_last_operation?.state === "failed"
+    && job.shot_last_operation.error?.code === "GOOGLE_MODERATION";
+}
+
+function shouldUseNeutralOmniRescue(job: JobRow): boolean {
+  return (job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni")
+    && Boolean(job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE SAFETY RETRY"))
+    && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")
     && job.shot_last_operation?.state === "failed"
     && job.shot_last_operation.error?.code === "GOOGLE_MODERATION";
 }
