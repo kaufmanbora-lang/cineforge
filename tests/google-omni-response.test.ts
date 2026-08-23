@@ -278,6 +278,20 @@ describe("Google Omni response parsing", () => {
     expect(persisted.output?.bytes).toBeUndefined();
   });
 
+  it("preserves a chunked Veo operation error instead of reporting missing media", async () => {
+    const body = JSON.stringify({ name: "models/veo/operations/failed", done: true, error: { code: 3, message: "Video generation failed." } });
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const bytes = new TextEncoder().encode(body);
+        controller.enqueue(bytes.slice(0, 37));
+        controller.enqueue(bytes.slice(37));
+        controller.close();
+      },
+    });
+    const parsed = await readVeoOperationResponse(new Response(stream, { headers: { "content-type": "application/json" } }));
+    expect(parsed).toEqual({ done: true, error: { code: 3, message: "Video generation failed." } });
+  });
+
   it("does not label every failed precondition as a billing failure", () => {
     expect(normalizeGoogleProviderError({ status: 400, message: "FAILED_PRECONDITION: another precondition" }).code)
       .toBe("GOOGLE_REQUEST_FAILED");

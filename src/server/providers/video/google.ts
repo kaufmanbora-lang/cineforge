@@ -204,6 +204,7 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
   let mimeType: string | undefined;
   let raiMediaFilteredCount = 0;
   let raiMediaFilteredReasons: string[] = [];
+  let providerError: { code?: number; message?: string } | undefined;
   let readingInlineVideo = false;
   let inlineFinished = false;
   let base64Carry = "";
@@ -229,6 +230,15 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
     if (filteredCountMatch) raiMediaFilteredCount = Number(filteredCountMatch[1]);
     if (filteredReasonsMatch) {
       try { raiMediaFilteredReasons = JSON.parse(filteredReasonsMatch[1]) as string[]; } catch { /* incomplete streaming window */ }
+    }
+    // Error-only operation responses are small, but Render/Google can deliver
+    // them with chunked transfer encoding. Preserve the real provider error
+    // instead of misreporting it as a completed operation without media.
+    if (/"error"\s*:/.test(value)) {
+      try {
+        const parsed = JSON.parse(value) as { error?: { code?: number; message?: string } };
+        if (parsed.error) providerError = parsed.error;
+      } catch { /* the next stream chunk may complete the JSON object */ }
     }
   };
   const writeBase64 = async (value: string, final = false) => {
@@ -264,6 +274,10 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
           continue;
         }
         inspectJson(window);
+        if (done && providerError) {
+          await reader.cancel();
+          return { done: true, error: providerError };
+        }
         if (done && uri) {
           await reader.cancel();
           return { done: true, response: { generateVideoResponse: { generatedSamples: [{ video: { uri, mimeType } }] } } };
@@ -288,6 +302,7 @@ export async function readVeoOperationResponse(response: Response): Promise<unkn
     inspectJson(window);
     if (readingInlineVideo) throw new Error("Google returned an incomplete inline video payload.");
     if (!done) return { done: false };
+    if (providerError) return { done: true, error: providerError };
     if (uri) return { done: true, response: { generateVideoResponse: { generatedSamples: [{ video: { uri, mimeType } }] } } };
     if (raiMediaFilteredCount > 0) {
       return { done: true, response: { generateVideoResponse: { generatedSamples: [], raiMediaFilteredCount, raiMediaFilteredReasons } } };
