@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { extractOmniVideo, extractVeoVideo, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
+import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
@@ -66,6 +66,15 @@ describe("Google Omni response parsing", () => {
     expect(realismProductionProfile("grounded winter detective drama")).toContain("PHOTOREALISTIC LIVE-ACTION DEFAULT");
     expect(realismProductionProfile("не мультяшное реалистичное кино")).toContain("PHOTOREALISTIC LIVE-ACTION DEFAULT");
     expect(realismProductionProfile("hand-drawn animation")).toContain("explicitly requested animated");
+  });
+
+  it("binds persistent objects, vehicle motion, door topology and camera axis across shots", () => {
+    const plannedShot = shot("shot-world-state");
+    const prompt = buildContinuityChainPrompt("A car stops beside the curb", plannedShot.continuity, plannedShot.audioContext, true);
+    expect(prompt).toContain("PERSISTENT OBJECT AND VEHICLE CONTRACT");
+    expect(prompt).toContain("TOPOLOGY AND DOOR CONTRACT");
+    expect(prompt).toContain("180-degree action axis");
+    expect(prompt).toContain("exact final frame");
   });
 
   it("extracts the production Interactions API video content part", () => {
