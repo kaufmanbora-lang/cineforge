@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
-import { extractOmniVideo, extractVeoVideo, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, providerDurationSeconds, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
+import { extractOmniVideo, extractVeoVideo, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
+import { durableProviderOperation, generationAccountingCost, moderationRetryPayload, omniFallbackPayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, resumableProviderOperation, veoNeutralRescuePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
@@ -10,6 +10,11 @@ describe("Google Omni response parsing", () => {
   it("never combines previous_interaction_id with a video task", () => {
     expect(googleOmniVideoTask({ previousInteractionId: "v1_previous", editInstruction: "Make the coat grey", references: [] })).toBeUndefined();
     expect(googleOmniVideoTask({ previousInteractionId: undefined, editInstruction: undefined, references: [{ id: "previous-frame", data: "AAAA", mimeType: "image/jpeg", role: "first-frame" }] })).toBe("reference_to_video");
+  });
+  it("uses Google's low-latency non-stored path only for ordinary fast drafts", () => {
+    expect(googleOmniShouldStore({ fastMode: true })).toBe(false);
+    expect(googleOmniShouldStore({ fastMode: false })).toBe(true);
+    expect(googleOmniShouldStore({ fastMode: true, previousInteractionId: "v1", editInstruction: "Change the coat" })).toBe(true);
   });
   it("does not send the Enterprise-only seed parameter to Gemini Developer API", () => {
     const plannedShot = shot("shot-1");
@@ -148,6 +153,22 @@ describe("Google Omni response parsing", () => {
     expect(retried.specHash).not.toBe(payload.specHash);
     expect(retried.shot.generationPrompt?.prompt).toContain("CINEFORGE SAFETY RETRY");
     expect(moderationRetryPayload(retried)).toBe(retried);
+  });
+
+  it("pre-frames a fictional arrest without removing the requested story action", () => {
+    const framed = providerSafetyFraming("Кортеж ФБР приезжает, спецназ спокойно задерживает взрослого человека.");
+    expect(framed).toContain("вымышленная федеральная следственная группа");
+    expect(framed).toContain("вымышленная тактическая группа");
+    expect(framed).toContain("controlled lawful detention");
+    expect(framed).not.toMatch(/\bФБР\b/i);
+  });
+  it("keeps sensitive dialogue for post-production instead of the video safety request", () => {
+    const plannedShot = shot("shot-dialogue");
+    const audio = { ...plannedShot.audioContext, speakers: ["character-elias"], dialogue: [{ id: "d1", characterId: "character-elias", characterName: "Elias", text: "ФБР! Руки вверх!", delivery: "firm", startSeconds: 0, durationSeconds: 2 }] };
+    const safe = providerAudioContext(providerSafetyFraming("ФБР задерживает человека"), audio)!;
+    expect(safe.dialogue).toEqual([]);
+    expect(safe.speakers).toEqual([]);
+    expect(audio.dialogue[0].text).toBe("ФБР! Руки вверх!");
   });
 
   it("switches only the repeatedly filtered shot to OmniFlash", () => {

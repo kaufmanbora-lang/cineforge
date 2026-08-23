@@ -23,8 +23,9 @@ export function movieQueue(): Queue {
   queue ??= new Queue(MOVIE_QUEUE, {
     connection: redisConnection(),
     defaultJobOptions: {
-      attempts: 5,
-      backoff: { type: "exponential", delay: 5_000 },
+      // Database job state owns the bounded retry policy. BullMQ retries here
+      // only duplicate an envelope; reconciliation restores lost envelopes.
+      attempts: 1,
       removeOnComplete: 500,
       removeOnFail: 1_000,
     },

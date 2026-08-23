@@ -7,7 +7,7 @@ import {
   Mic, Sparkles, Square, Subtitles, Volume2, Waves, X, Zap, ZoomIn, ZoomOut,
 } from "lucide-react";
 import { estimateGeneration, formatDuration } from "@/domain/estimation";
-import type { MoviePlan, ProjectRecord, Scene } from "@/domain/movie";
+import { preservePreviewUrls, type MoviePlan, type ProjectRecord, type Scene } from "@/domain/movie";
 import { GOOGLE_VIDEO_MODELS, isNativeResolution, normalizeResolution, type AspectRatio, type Resolution } from "@/domain/video-models";
 import { Button, Segmented, StatusDot } from "./ui";
 import { errorMessageRu, lockLabelRu, projectStatusRu } from "@/lib/ru";
@@ -45,6 +45,7 @@ export function StudioWorkspace() {
   const autoContinueRef = useRef(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const microphoneStreamRef = useRef<MediaStream | null>(null);
+  const projectLoadInFlightRef = useRef(false);
 
   const model = GOOGLE_VIDEO_MODELS[modelId];
   const estimate = useMemo(() => estimateGeneration({ durationSeconds: duration, modelId, resolution }), [duration, modelId, resolution]);
@@ -60,10 +61,12 @@ export function StudioWorkspace() {
 
   const loadProject = useCallback(async (id: string, quiet = false) => {
     if (!id) return;
+    if (quiet && projectLoadInFlightRef.current) return;
+    projectLoadInFlightRef.current = true;
     try {
       const [detailResponse, previewResponse] = await Promise.all([
-        fetch(`/api/projects?id=${encodeURIComponent(id)}`, { cache: "no-store" }),
-        fetch(`/api/projects/${id}/preview`, { cache: "no-store" }),
+        fetch(`/api/projects?id=${encodeURIComponent(id)}`, { cache: "no-store", signal: AbortSignal.timeout(20_000) }),
+        fetch(`/api/projects/${id}/preview`, { cache: "no-store", signal: AbortSignal.timeout(20_000) }),
       ]);
       const payload = await detailResponse.json();
       if (!detailResponse.ok || payload.infrastructure === "offline") throw new Error(errorMessageRu(payload.error, "Облачная инфраструктура проекта недоступна."));
@@ -74,7 +77,7 @@ export function StudioWorkspace() {
       setSelectedSceneId((current) => current && payload.plan?.scenes.some((scene: Scene) => scene.id === current) ? current : payload.plan?.scenes?.[0]?.id ?? "");
       if (previewResponse.ok) {
         const nextPreview = await previewResponse.json() as PreviewPayload;
-        setPreview(nextPreview);
+        setPreview((current) => ({ ...nextPreview, clips: preservePreviewUrls(current.clips, nextPreview.clips) }));
         setSelectedShotId((current) => nextPreview.clips.some((clip) => clip.shot_id === current) ? current : nextPreview.clips[0]?.shot_id ?? "");
       }
       if (payload.project.lastError?.message) {
@@ -87,6 +90,7 @@ export function StudioWorkspace() {
         setNotice(payload.plan ? `Из памяти проекта загружено сцен: ${payload.plan.scenes.length}.` : "У проекта ещё нет сценария. Можно повторить планирование без создания копии.");
       }
     } catch (error) { if (!quiet) setNotice(errorMessageRu(error, "Не удалось загрузить проект.")); }
+    finally { projectLoadInFlightRef.current = false; }
   }, []);
 
   useEffect(() => {
@@ -260,7 +264,7 @@ export function StudioWorkspace() {
     </section>
 
     <section className="preview-panel" aria-label="Предпросмотр фильма">
-      <div className="preview-frame">{selectedPreview ? <video controls key={selectedPreview.url} onEnded={continuePreview} ref={videoRef} src={selectedPreview.url}/> : <div className="preview-empty"><Film size={36}/><strong>{selectedScene ? "Кадр ещё не создан" : "Сцена не выбрана"}</strong><span>{selectedScene ? "Видео появится после успешной контрольной точки." : "Создайте план фильма, чтобы построить граф сцен."}</span></div>}{selectedScene ? <div className="preview-corner"><span>СЦЕНА {selectedScene.number}</span><strong>{selectedScene.title}</strong></div> : null}</div>
+      <div className="preview-frame">{selectedPreview ? <video controls key={`${selectedPreview.shot_id}:${selectedPreview.version}`} onEnded={continuePreview} ref={videoRef} src={selectedPreview.url}/> : <div className="preview-empty"><Film size={36}/><strong>{selectedScene ? "Кадр ещё не создан" : "Сцена не выбрана"}</strong><span>{selectedScene ? "Видео появится после успешной контрольной точки." : "Создайте план фильма, чтобы построить граф сцен."}</span></div>}{selectedScene ? <div className="preview-corner"><span>СЦЕНА {selectedScene.number}</span><strong>{selectedScene.title}</strong></div> : null}</div>
       <div className="transport"><strong>{selectedScene ? formatTimecode(sceneStart(scenes, selectedScene.id)) : "00:00:00"}</strong><span className="fit-control">{selectedPreview ? `Кадр ${selectedPreview.shot_id} · v${selectedPreview.version}` : "Нет видео"}</span><div className="transport-center"><button aria-label="Предыдущая сцена" disabled={!selectedScene || scenes[0]?.id === selectedScene.id} onClick={() => selectRelative(-1)} type="button"><Play size={17} style={{ transform: "rotate(180deg)" }}/></button>{selectedPreview ? <button aria-label="Воспроизвести или приостановить" className="play-control" onClick={() => void togglePreview()} type="button"><Play size={21} fill="currentColor"/></button> : null}<button aria-label="Следующая сцена" disabled={!selectedScene || scenes.at(-1)?.id === selectedScene.id} onClick={() => selectRelative(1)} type="button"><Play size={17}/></button></div><div className="transport-actions">{selectedPreview ? <button aria-label="Полноэкранный режим" onClick={() => void openFullscreen()} type="button"><Expand size={17}/></button> : null}</div></div>
       <div className="seek-line"><i style={{ width: `${progress}%` }}/><b style={{ left: `${progress}%` }}/></div>
     </section>

@@ -329,6 +329,19 @@ export interface ShotArtifact {
 }
 
 /**
+ * The preview endpoint renews signed storage URLs on every status poll. Keep
+ * the existing URL for the same immutable shot version so React does not
+ * reload/restart a playing video every few seconds.
+ */
+export function preservePreviewUrls<T extends { shot_id: string; scene_id: string; version: number; url: string }>(current: T[], incoming: T[]): T[] {
+  const existing = new Map(current.map((clip) => [`${clip.scene_id}:${clip.shot_id}:${clip.version}`, clip.url]));
+  return incoming.map((clip) => ({
+    ...clip,
+    url: existing.get(`${clip.scene_id}:${clip.shot_id}:${clip.version}`) ?? clip.url,
+  }));
+}
+
+/**
  * Closed models frequently reuse convenient IDs such as `scene-1`. The database
  * intentionally stores graph nodes by stable text ID, so every generated ID and
  * every internal reference is namespaced before persistence.

@@ -374,11 +374,11 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
         input: statefulEdit ? request.editInstruction! : request.references.length ? input : request.prompt,
         previous_interaction_id: statefulEdit ? request.previousInteractionId : undefined,
         // Unary generation is the lowest-latency official Interactions path.
-        // Keep storage enabled because targeted follow-up editing relies on the
-        // returned previous_interaction_id.
+        // Draft generation uses the official faster store=false path. Final
+        // renders and edit turns stay stored for conversational editing.
         background: false,
         stream: false,
-        store: true,
+        store: googleOmniShouldStore(request),
         response_format: {
           type: "video",
           aspect_ratio: request.aspectRatio,
@@ -426,6 +426,10 @@ export function googleOmniVideoTask(request: Pick<VideoGenerationRequest, "previ
   if (request.previousInteractionId && request.editInstruction) return undefined;
   if (request.editInstruction) return "edit";
   return request.references.length ? "reference_to_video" : "text_to_video";
+}
+
+export function googleOmniShouldStore(request: Pick<VideoGenerationRequest, "fastMode" | "previousInteractionId" | "editInstruction">): boolean {
+  return Boolean(request.previousInteractionId && request.editInstruction) || !request.fastMode;
 }
 
 export function extractOmniVideo(raw: {
