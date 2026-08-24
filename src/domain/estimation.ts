@@ -61,7 +61,9 @@ export function estimateRemainingGenerationSeconds(input: {
   }, 0);
 
   const waitingShots = Math.max(0, remainingShots - activeJobs.length);
-  const planningBuffer = input.status === "planning" ? 30 : 0;
+  // Ten-second productions use the local one-shot express plan, so the UI must
+  // not pretend a full screenplay pass is still ahead of the user.
+  const planningBuffer = input.status === "planning" && input.totalShots <= 1 ? 5 : input.status === "planning" ? 30 : 0;
   const assemblyBuffer = remainingShots === 0 || input.status === "assembling" ? 25 : 20;
   return Math.ceil(planningBuffer + activeRemainingSeconds + waitingShots * baselineSeconds + assemblyBuffer);
 }

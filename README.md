@@ -2,7 +2,7 @@
 
 CineForge превращает один замысел в восстанавливаемый Movie Project:
 
-`идея → MoviePlan → Character / Location Bible → Scene Graph → shots → Google video generation → AI Director QC → consistent TTS → timeline → FFmpeg → MP4/MOV`
+`идея → MoviePlan → Character / Location Bible → Scene Graph → shots → Google video generation с нативным звуком → AI Director QC → timeline → FFmpeg → MP4/MOV`
 
 Это не отправка «60 минут» одним запросом. Фильм разбивается на короткие shots с зависимостями, checkpoints, idempotency keys, версиями и отдельными media assets. Готовые части никогда не генерируются повторно без изменения их content hash.
 
@@ -52,7 +52,7 @@ Desktop-клиент и облачный Movie Engine разделены нам�
 - Checkpoint после каждого принятого shot; completed shots исключаются из resume.
 - Reference image loader и передача final frame предыдущего shot как first-frame reference, когда выбранная модель это поддерживает.
 - AI Director QC каждого shot по metadata и representative frame. Низкий score улучшает prompt и ставит только этот shot на ограниченный retry.
-- Стабильный TTS-контур на `gpt-4o-mini-tts`: один deterministic voice на персонажа, exact dialogue, clean shot-level audio context.
+- Нативная речь Google сохраняется вместе с мимикой, эмоцией и синхронизацией губ; Voice Bible повторяет тембр, возраст, акцент, ритм и манеру речи персонажа в каждом следующем запросе. `gpt-4o-mini-tts` используется только для точечного недеструктивного исправления уже готовой реплики.
 - Non-destructive editor: timestamp/scene impact analysis, dialogue-only patch без перекодирования video stream и отдельные shot versions.
 - FFmpeg normalisation: 24 fps, фиксированное разрешение, H.264, AAC 48 kHz, loudness `-16 LUFS`, `faststart`.
 - Final QC: ffprobe integrity, video/audio stream, resolution, FPS, sample rate, black-frame scan, maximum audio level и duplicate asset checks.
@@ -165,7 +165,7 @@ flowchart LR
 
 1. **ChatGPT Brain** — сценарий, dialogue, shot intent, targeted edits, prompt engineering и QC reasoning.
 2. **Video Generation Engine** — Google Veo / Gemini Omni adapters.
-3. **Movie Engine** — memory, continuity, queue, versions, checkpoints, TTS, FFmpeg, export и recovery.
+3. **Movie Engine** — memory, continuity, queue, versions, checkpoints, точечная коррекция аудио, FFmpeg, export и recovery.
 
 ## Надёжность
 
@@ -173,7 +173,7 @@ flowchart LR
 - `contentHash(prompt + references + audio + settings)` включает все generation inputs.
 - API operation ID сохраняется на shot; worker restart переводит interrupted jobs обратно в очередь.
 - Запрошенные 10/30/60 секунд разбиваются на допустимые для выбранной модели chunks: Omni использует документированный диапазон до 10 секунд за interaction, Veo — 4/6/8 секунд. Сборщик обрезает каждый источник по плану и проверяет точную длительность master-файла с допуском 0,5 секунды.
-- «Быстрый черновик» реально переключает выбранный Veo 3.1 на официальный `veo-3.1-fast-generate-preview`, использует быстрый сценарный routing и не перекодирует уже совместимые 24 FPS кадры при сборке.
+- «Быстрый черновик» реально переключает выбранный Veo 3.1 на официальный `veo-3.1-fast-generate-preview`, а для 10 секунд использует готовый однокадровый экспресс-план без ожидания длинного сценарного прохода. Короткий Omni-результат принимается напрямую без промежуточного ожидания Google Files, нативный звук не заменяется отдельным TTS, а совместимые 24 FPS кадры не перекодируются при сборке. Целевое время такого пути — до 3 минут, но фактическое время ответа внешней очереди Google приложение гарантировать не может.
 - Quota и maximum budget переводят проект в `paused`, а не `failed` и не удаляют assets; параллельные jobs сначала атомарно резервируют стоимость в PostgreSQL, поэтому вместе не могут превысить лимит.
 - Retry policy различает quota, rate limit, timeout, server, moderation, corrupted media, upload и fatal error.
 - Retry ограничен `MAX_AUTO_RETRIES`; бесконечных циклов нет.

@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
-import { MoviePlanStructuredOutputSchema, moviePlanFromStructuredOutput, type MoviePlan } from "@/domain/movie";
+import { MoviePlanSchema, MoviePlanStructuredOutputSchema, moviePlanFromStructuredOutput, type MoviePlan } from "@/domain/movie";
 import { env } from "@/server/env";
 import { getProviderKey } from "@/server/provider-secrets";
 import { query } from "@/server/db";
@@ -96,13 +96,18 @@ export async function generateStructuredMoviePlan(input: {
   videoModelId?: string;
   fastDraft?: boolean;
 }): Promise<MoviePlan> {
+  // A ten-second draft is exactly one provider shot. Expanding it through a
+  // long-form screenplay model adds latency without adding usable scene graph
+  // structure, so preserve the complete user prompt in a real one-shot plan
+  // and let the model-specific prompt adapter direct it immediately.
+  if (input.fastDraft && input.durationSeconds <= 10) return createExpressDraftMoviePlan(input);
   try {
     const client = await openAIClient();
     const routing = await openAIModelRouting();
     const response = await client.responses.parse({
       // A short Fast Draft needs the same strict schema but not the latency of
       // the flagship long-form dramaturgy model. Users can still override it.
-      model: input.screenwriterModelId ?? (input.fastDraft && input.durationSeconds <= 300 ? routing.prompts : routing.screenwriting),
+      model: input.screenwriterModelId ?? (input.fastDraft && input.durationSeconds <= 60 ? routing.qc : input.fastDraft && input.durationSeconds <= 300 ? routing.prompts : routing.screenwriting),
       reasoning: { effort: input.durationSeconds <= 60 ? "low" : input.durationSeconds <= 300 ? "medium" : "high" },
       instructions: SCREENWRITER_INSTRUCTIONS,
       input: [
@@ -118,7 +123,7 @@ export async function generateStructuredMoviePlan(input: {
       ],
       text: { format: zodTextFormat(MoviePlanStructuredOutputSchema, "movie_plan") },
       max_output_tokens: Math.min(120_000, Math.max(12_000, 8_000 + Math.ceil(input.durationSeconds / 5) * 900)),
-    });
+    }, input.fastDraft ? { timeout: 35_000, maxRetries: 0 } : undefined);
     const parsed = (response as typeof response & { output_parsed?: unknown }).output_parsed;
     if (!parsed) throw new Error("OpenAI returned no structured MoviePlan.");
     return moviePlanFromStructuredOutput(parsed);
@@ -147,6 +152,163 @@ export async function generateStructuredMoviePlan(input: {
       throw combinedProviderError("создание сценария", openAIError, geminiError);
     }
   }
+}
+
+export function createExpressDraftMoviePlan(input: {
+  projectId: string;
+  idea: string;
+  durationSeconds: number;
+}): MoviePlan {
+  const idea = input.idea.trim();
+  const durationSeconds = Math.max(1, Math.min(10, input.durationSeconds));
+  const sceneId = "express-scene-1";
+  const shotId = "express-shot-1";
+  const locationId = "express-location-1";
+  const characterId = "express-character-1";
+  const wardrobeId = "express-wardrobe-1";
+  const dialogueText = firstQuotedDialogue(idea);
+  const hasCharacter = Boolean(dialogueText) || /(?:человек|мужчин|женщин|девуш|парень|геро|персонаж|агент|полицей|солдат|реб[её]нок|man|woman|person|character|agent|officer|soldier|child)\w*/i.test(idea);
+  const characterIds = hasCharacter ? [characterId] : [];
+  const characterStates = hasCharacter ? {
+    [characterId]: {
+      locationId,
+      wardrobeId,
+      heldProps: [],
+      injuries: [],
+      appearanceChanges: [],
+      position: "в точной позиции, заданной пользователем; остаётся на той же физически достижимой стороне всех стен и дверей",
+      emotionalState: "точно по запросу пользователя",
+    },
+  } : {};
+  const dialogue = dialogueText && hasCharacter ? [{
+    id: "express-dialogue-1",
+    characterId,
+    characterName: "Главный персонаж",
+    text: dialogueText,
+    startSeconds: 0,
+    durationSeconds: Math.min(durationSeconds, Math.max(1, dialogueText.length / 12)),
+    delivery: "естественно, в соответствии с запросом",
+  }] : [];
+
+  return MoviePlanSchema.parse({
+    id: "express-plan-1",
+    projectId: input.projectId,
+    summary: {
+      title: idea.slice(0, 64) || "Новый фильм",
+      genre: "короткометражный фильм",
+      style: "фотореалистичная игровая киносъёмка",
+      mood: "в соответствии с запросом пользователя",
+      durationSeconds,
+      logline: idea,
+      synopsis: idea,
+    },
+    characters: hasCharacter ? [{
+      id: characterId,
+      name: "Главный персонаж",
+      age: 30,
+      gender: "как указано пользователем",
+      face: "точно соответствует описанию пользователя и остаётся неизменным",
+      hair: "точно соответствует описанию пользователя",
+      height: "естественный рост по запросу",
+      build: "естественное телосложение по запросу",
+      wardrobe: [{
+        id: wardrobeId,
+        label: "Образ из запроса",
+        clothing: ["точно указанная пользователем одежда без самовольных изменений"],
+        shoes: "соответствуют образу",
+        accessories: [],
+        validFromSceneId: sceneId,
+        validToSceneId: null,
+      }],
+      voice: {
+        description: "естественный постоянный голос по запросу",
+        speechPattern: "естественная речь",
+        provider: null,
+        providerVoiceId: null,
+      },
+      personality: "в соответствии с запросом пользователя",
+      backstory: "не добавлять факты, которых нет в запросе",
+      relationships: {},
+      referenceAssetIds: [],
+      locks: { appearance: true, voice: true, outfit: true },
+    }] : [],
+    locations: [{
+      id: locationId,
+      name: "Локация из запроса",
+      appearance: idea,
+      architecture: "точно по запросу; непрерывная реальная геометрия без смены места",
+      furniture: [],
+      objectLayout: { persistentWorld: "все появившиеся объекты сохраняют положение и не исчезают" },
+      defaultLighting: "естественное кинематографическое освещение по запросу",
+      defaultWeather: "погода из запроса без внезапной смены",
+      timeOfDay: "время суток из запроса без внезапной смены",
+      importantDetails: ["реальная физика", "никаких телепортаций", "никаких проходов сквозь твёрдые объекты"],
+      referenceAssetIds: [],
+      designLocked: true,
+    }],
+    acts: [{ id: "express-act-1", number: 1, title: "Единый кадр", purpose: idea, startSceneNumber: 1, endSceneNumber: 1 }],
+    scenes: [{
+      id: sceneId,
+      actId: "express-act-1",
+      sequenceId: "express-sequence-1",
+      number: 1,
+      title: "Единая сцена",
+      durationSeconds,
+      locationId,
+      characterIds,
+      action: `${idea}. Показать содержательное непрерывное действие с 00:00 до 00:${String(Math.ceil(durationSeconds)).padStart(2, "0")}; без монтажных склеек, повторов и пустого времени.`,
+      emotionalBeat: "точно по запросу пользователя",
+      lighting: "фотореалистичное естественное освещение",
+      sound: "чистый синхронный звук текущей сцены",
+      music: null,
+      timeOfDay: "как указано пользователем",
+      weather: "как указано пользователем",
+      continuityRequirements: ["один непрерывный кадр", "реальная физика", "сохранять внешность, одежду, объекты и пространство"],
+      shots: [{
+        id: shotId,
+        sceneId,
+        sequence: 1,
+        title: "Экспресс-кадр",
+        durationSeconds,
+        action: idea,
+        visualStyle: "photorealistic live-action cinema, natural real-world physics",
+        camera: { shotSize: "кинематографический общий или средний план по смыслу", angle: "естественная точка наблюдения", lens: "35mm", movement: "одно плавное мотивированное движение без скачков", framing: "естественная композиция, никто не смотрит в камеру", fps: 24 },
+        lighting: "естественное кинематографическое освещение без скачков экспозиции",
+        audioContext: {
+          cleanStart: true,
+          speakers: dialogue.length ? [characterId] : [],
+          silentCharacters: dialogue.length ? [] : characterIds,
+          dialogue,
+          ambience: ["естественная атмосфера локации текущего кадра"],
+          soundEffects: ["только синхронные звуки видимых действий"],
+          musicCue: null,
+          forbidCarryOver: ["любая речь из других кадров", "старая музыка", "посторонние голоса"],
+        },
+        continuity: {
+          characterStates,
+          locationId,
+          locationState: {
+            timeOfDay: "как указано пользователем",
+            weather: "как указано пользователем",
+            lighting: "стабильное естественное освещение",
+            objectPositions: { persistentWorld: "сохраняется на протяжении всего кадра" },
+          },
+          previousShotId: null,
+          nextShotId: null,
+          requiredReferences: [],
+          lockedValues: { realism: "photorealistic live action", physics: "ordinary real-world physics", userIntent: idea },
+        },
+        dependencies: [],
+        generationPrompt: null,
+      }],
+    }],
+    createdAt: new Date().toISOString(),
+  });
+}
+
+function firstQuotedDialogue(idea: string): string | null {
+  const match = idea.match(/«([^»]{1,240})»|[“"]([^”"]{1,240})[”"]/u);
+  return (match?.[1] ?? match?.[2] ?? "").trim() || null;
 }
 
 function moviePlanRequest(input: { projectId: string; idea: string; durationSeconds: number; videoModelId?: string }): string {
@@ -278,7 +440,7 @@ Score only from supplied evidence. If evidence is insufficient, add an issue but
       ]),
     ] }],
     text: { format: zodTextFormat(ShotQcSchema, "shot_qc") },
-  });
+  }, { timeout: 20_000, maxRetries: 0 });
   const parsed = (response as typeof response & { output_parsed?: ShotQcReport }).output_parsed;
   if (!parsed) throw new Error("OpenAI returned no QC report.");
   return parsed;

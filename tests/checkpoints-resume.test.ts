@@ -3,6 +3,7 @@ import { nextCheckpoint, resumeFromCheckpoint, type CheckpointSnapshot } from "@
 import { preservePreviewUrls } from "@/domain/movie";
 import { estimateRemainingGenerationSeconds, formatRemainingGenerationTime } from "@/domain/estimation";
 import { canStreamCopyVideo } from "@/server/movie/ffmpeg";
+import { createExpressDraftMoviePlan } from "@/server/providers/openai";
 
 const initial: CheckpointSnapshot = { projectId: "p", planVersion: 1, completedShotIds: ["s1"], failedShotIds: [], pendingShotIds: ["s2","s3"], currentJobId: "j2", spentUsd: 1, projectMemoryHash: "memory", createdAt: "2026-01-01" };
 
@@ -57,6 +58,26 @@ describe("dynamic generation ETA", () => {
 
   it("pauses the countdown when production is stopped", () => {
     expect(estimateRemainingGenerationSeconds({ jobs: [], completedShots: 1, totalShots: 3, status: "failed", modelId: "gemini-omni-flash-preview" })).toBeNull();
+  });
+
+  it("uses only a short planning allowance for a one-shot express render", () => {
+    expect(estimateRemainingGenerationSeconds({ jobs: [], completedShots: 0, totalShots: 1, status: "planning", modelId: "gemini-omni-flash-preview" })).toBe(100);
+  });
+});
+
+describe("ten-second express planning", () => {
+  it("creates one exact-duration production shot without waiting for an LLM", () => {
+    const plan = createExpressDraftMoviePlan({
+      projectId: "project-express",
+      idea: "Мужчина идёт по зимнему Нью-Йорку и говорит: «Привет, как дела?»",
+      durationSeconds: 10,
+    });
+    expect(plan.summary.durationSeconds).toBe(10);
+    expect(plan.scenes).toHaveLength(1);
+    expect(plan.scenes[0].shots).toHaveLength(1);
+    expect(plan.scenes[0].shots[0].durationSeconds).toBe(10);
+    expect(plan.scenes[0].shots[0].audioContext.dialogue[0].text).toBe("Привет, как дела?");
+    expect(plan.scenes[0].shots[0].action).toContain("зимнему Нью-Йорку");
   });
 });
 

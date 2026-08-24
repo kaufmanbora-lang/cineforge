@@ -142,6 +142,7 @@ export class OmniPromptAdapter implements PromptAdapter<ShotIntent> {
         `${refs} ${intent.subject}. ${intent.action}`,
         `${intent.environment}. ${intent.weather}. ${intent.lighting}.`,
         `Camera: ${intent.camera.shotSize}, ${intent.camera.angle}, ${intent.camera.lens}, ${intent.camera.movement}; ${intent.camera.framing}.`,
+        `Character and voice bible: ${intent.characterDetails.join("; ") || "use only the subjects described by the screenplay"}. Preserve the same natural voice identity, age, timbre, accent, rhythm and manner of speech in every later shot.`,
         `Keep character identity, wardrobe, prop positions and location design exactly consistent with the reference images.`,
         dialogue || "No dialogue.",
         `Sound design: ${intent.audio.ambience.join(", ") || "clean ambience"}; ${intent.audio.soundEffects.join(", ") || "no extra effects"}; music ${intent.audio.musicCue ?? "none"}.`,

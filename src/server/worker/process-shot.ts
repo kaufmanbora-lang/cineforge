@@ -8,7 +8,7 @@ import type { ProviderOperation, VideoGenerationRequest } from "@/server/provide
 import { deleteObject, getObjectIfExists, putFileObject, putObject, putRemoteObject, signedObjectUrl } from "@/server/storage";
 import { findCachedShot } from "@/server/movie/repository";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
-import { enqueueAutomaticAssemblyIfReady, enqueueDialoguePatch, enqueueReadyProjectJobs, pauseProjectJobs, requeueDatabaseJob } from "@/server/movie/queue";
+import { enqueueAutomaticAssemblyIfReady, enqueueReadyProjectJobs, pauseProjectJobs, requeueDatabaseJob } from "@/server/movie/queue";
 import { effectiveVideoModelId, getAllowedDurations, getVideoModel, type Resolution } from "@/domain/video-models";
 import { env } from "@/server/env";
 import { contentHash } from "@/server/movie/content-hash";
@@ -306,18 +306,10 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     const classifiedQc: (ShotQcReport & { decision: "accept" | "flag" }) | null = qc
       ? { ...qc, decision: qc.overall < engineSettings.qcFlagThreshold ? "flag" : "accept" }
       : null;
-    const assetId = await withDurableDatabaseRetry(() => persistCompletedAsset(job, storageKey, checksum, stored.byteSize, operation.operationId, cost, classifiedQc));
-    const dialogueSegments = job.payload.shot.audioContext?.dialogue ?? [];
-    if (dialogueSegments.length && await getProviderKey("openai")) {
-      const dialoguePayload = { dialogueSegments, originalAssetId: assetId, originalStorageKey: storageKey, bestEffort: job.render_tier === "draft" };
-      await enqueueDialoguePatch({
-        projectId: job.project_id,
-        sceneId: job.scene_id,
-        shotId: job.shot_id,
-        payload: dialoguePayload,
-        idempotencyKey: `dialogue-master:${job.shot_id}:${contentHash(dialoguePayload)}`,
-      });
-    }
+    // Google video models generate native synchronized speech and ambience.
+    // Keep that human performance intact; the separate TTS pipeline is reserved
+    // for explicit non-destructive dialogue edits requested after generation.
+    await withDurableDatabaseRetry(() => persistCompletedAsset(job, storageKey, checksum, stored.byteSize, operation.operationId, cost, classifiedQc));
     await withDurableDatabaseRetry(async () => {
       await enqueueReadyProjectJobs(job.project_id);
       await enqueueAutomaticAssemblyIfReady(job.project_id);

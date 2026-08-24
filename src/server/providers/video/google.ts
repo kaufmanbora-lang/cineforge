@@ -438,7 +438,10 @@ export function googleOmniInteractionRequest(request: VideoGenerationRequest): R
   const responseFormat = statefulEdit ? undefined : {
     type: "video",
     aspect_ratio: request.aspectRatio,
-    delivery: "uri",
+    // For a short Fast Draft, receive the completed MP4 directly. This skips
+    // the extra Google Files activation wait and download round trip. Longer
+    // and final renders keep URI delivery to protect the worker's memory.
+    delivery: request.fastMode && request.durationSeconds <= 10 ? undefined : "uri",
   };
   return {
     model: request.modelId,
@@ -553,8 +556,9 @@ export function googleOmniVideoTask(request: Pick<VideoGenerationRequest, "previ
 }
 
 export function googleOmniShouldStore(request: Pick<VideoGenerationRequest, "fastMode" | "previousInteractionId" | "editInstruction">): true {
-  // Google rejects delivery="uri" together with store=false. Keeping URI
-  // delivery avoids loading a large base64 MP4 into the 512 MB worker heap.
+  // Stateful edits require stored interaction history. Normal URI responses
+  // also require store=true; retaining it for short inline drafts preserves a
+  // durable interaction ID for later non-destructive edits.
   void request;
   return true;
 }

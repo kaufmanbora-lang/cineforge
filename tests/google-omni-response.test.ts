@@ -18,7 +18,7 @@ describe("Google Omni response parsing", () => {
     expect(googleOmniShouldStore({ fastMode: false })).toBe(true);
     expect(googleOmniShouldStore({ fastMode: true, previousInteractionId: "v1", editInstruction: "Change the coat" })).toBe(true);
   });
-  it("keeps store=true in every real Omni request shape that delivers video by URI", () => {
+  it("uses inline delivery for short fast drafts and keeps URI delivery for final renders", () => {
     const plannedShot = shot("shot-omni-request");
     const base = {
       projectId: "project-1",
@@ -36,7 +36,11 @@ describe("Google Omni response parsing", () => {
     };
     const textRequest = googleOmniInteractionRequest(base);
     expect(textRequest.store).toBe(true);
-    expect(textRequest.response_format).toMatchObject({ type: "video", delivery: "uri" });
+    expect(textRequest.response_format).toMatchObject({ type: "video" });
+    expect((textRequest.response_format as Record<string, unknown>).delivery).toBeUndefined();
+
+    const finalRequest = googleOmniInteractionRequest({ ...base, fastMode: false });
+    expect(finalRequest.response_format).toMatchObject({ type: "video", delivery: "uri" });
 
     const referenceRequest = googleOmniInteractionRequest({
       ...base,
@@ -69,7 +73,7 @@ describe("Google Omni response parsing", () => {
       projectId: "project-1", sceneId: plannedShot.sceneId, shotId: plannedShot.id,
       modelId: "gemini-omni-flash-preview", prompt: plannedShot.generationPrompt!.prompt,
       negativeDirectives: [], durationSeconds: 5, resolution: "720p", aspectRatio: "16:9",
-      seed: null, references: [], fastMode: true,
+      seed: null, references: [], fastMode: false,
     }, "server-only-test-key", fetchMock);
     expect(result.id).toBe("v1_ok");
     expect(bodies).toHaveLength(2);
