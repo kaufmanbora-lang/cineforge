@@ -99,7 +99,7 @@ describe("Google Omni response parsing", () => {
   it("classifies a policy rejection before a generic 403 permission error", () => {
     expect(normalizeGoogleProviderError({ status: 403, message: "Blocked by safety policy" }).code).toBe("GOOGLE_MODERATION");
   });
-  it("sends the officially supported Veo seed parameter", () => {
+  it("omits the Enterprise-only Veo seed from Gemini Developer API requests", () => {
     const plannedShot = shot("shot-1");
     expect(googleVeoConfig({
       projectId: "project-1",
@@ -114,7 +114,7 @@ describe("Google Omni response parsing", () => {
       seed: 42,
       references: [],
       fastMode: true,
-    })).toHaveProperty("seed", 42);
+    })).not.toHaveProperty("seed");
   });
 
   it("keeps one or more officially supported Veo reference images", () => {

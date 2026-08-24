@@ -377,7 +377,9 @@ export function googleVeoConfig(
     lastFrame: primaryImage && lastFrame ? imageValue(lastFrame) : undefined,
     referenceImages: supportedReferenceImages,
     personGeneration: hasImageInput ? "allow_adult" : "allow_all",
-    seed: request.seed ?? undefined,
+    // Gemini Developer API currently rejects `seed` for Veo as an
+    // Enterprise Agent Platform-only option. The value still participates in
+    // CineForge's content hash, but must not be sent by this API adapter.
   };
 }
 
