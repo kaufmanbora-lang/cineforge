@@ -1,4 +1,4 @@
-import { getAllowedDurations, getVideoModel, type Resolution } from "./video-models";
+import { effectiveVideoModelId, getAllowedDurations, getVideoModel, type Resolution } from "./video-models";
 
 export interface GenerationEstimate {
   shots: number;
@@ -76,10 +76,12 @@ export function estimateGeneration(input: {
   durationSeconds: number;
   modelId: string;
   resolution: Resolution;
+  renderTier?: "draft" | "final";
   retryReservePercent?: number;
 }): GenerationEstimate {
-  const model = getVideoModel(input.modelId);
-  const allowed = getAllowedDurations(input.modelId, input.resolution);
+  const modelId = effectiveVideoModelId(input.modelId, input.renderTier ?? "final");
+  const model = getVideoModel(modelId);
+  const allowed = getAllowedDurations(modelId, input.resolution);
   const clipSeconds = Math.max(...allowed);
   const shots = Math.ceil(input.durationSeconds / clipSeconds);
   const billableSeconds = shots * clipSeconds;

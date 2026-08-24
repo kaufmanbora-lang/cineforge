@@ -94,11 +94,15 @@ export async function generateStructuredMoviePlan(input: {
   durationSeconds: number;
   screenwriterModelId?: string;
   videoModelId?: string;
+  fastDraft?: boolean;
 }): Promise<MoviePlan> {
   try {
     const client = await openAIClient();
+    const routing = await openAIModelRouting();
     const response = await client.responses.parse({
-      model: input.screenwriterModelId ?? (await openAIModelRouting()).screenwriting,
+      // A short Fast Draft needs the same strict schema but not the latency of
+      // the flagship long-form dramaturgy model. Users can still override it.
+      model: input.screenwriterModelId ?? (input.fastDraft && input.durationSeconds <= 300 ? routing.prompts : routing.screenwriting),
       reasoning: { effort: input.durationSeconds <= 60 ? "low" : input.durationSeconds <= 300 ? "medium" : "high" },
       instructions: SCREENWRITER_INSTRUCTIONS,
       input: [
@@ -147,7 +151,7 @@ export async function generateStructuredMoviePlan(input: {
 
 function moviePlanRequest(input: { projectId: string; idea: string; durationSeconds: number; videoModelId?: string }): string {
   const shotLimit = input.videoModelId?.startsWith("gemini-omni")
-    ? "For Gemini Omni Flash, make every shot at most 5 seconds so the Movie Engine can guarantee the requested total runtime."
+    ? "For Gemini Omni Flash, make every shot at most 10 seconds and include exact 00:00-00:SS action timing so the Movie Engine can guarantee the requested total runtime with fewer provider calls."
     : "Make every shot at most 8 seconds and use only 4, 6 or 8 second provider beats where practical.";
   return `Create a production-ready MoviePlan for project ${input.projectId}. Exact target runtime: ${input.durationSeconds} seconds. The sum of all shot durationSeconds must equal exactly ${input.durationSeconds}; never return a shorter plan. ${shotLimit} User idea: ${input.idea}`;
 }

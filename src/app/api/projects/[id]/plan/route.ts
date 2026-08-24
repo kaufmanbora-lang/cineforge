@@ -35,7 +35,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     );
     if (!rows[0]) return NextResponse.json({ error: "Проект не найден." }, { status: 404 });
     const maximumBudget = body.maximumBudgetUsd ?? Number(rows[0].maximum_budget_usd);
-    const estimate = estimateGeneration({ durationSeconds: rows[0].duration_seconds, modelId: rows[0].model_id, resolution: rows[0].resolution });
+    const estimate = estimateGeneration({ durationSeconds: rows[0].duration_seconds, modelId: rows[0].model_id, resolution: rows[0].resolution, renderTier: rows[0].render_tier });
     if (body.startGeneration && estimate.estimatedTotalUsd > maximumBudget) {
       return NextResponse.json({ error: "Расчётная стоимость генерации превышает бюджет проекта.", estimate, maximumBudget }, { status: 409 });
     }
@@ -61,7 +61,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
     if (!plan) {
       await query("UPDATE projects SET status='planning',last_error=NULL,updated_at=now() WHERE id=$1", [id]);
-      const rawPlan = await generateStructuredMoviePlan({ projectId: id, idea: rows[0].prompt, durationSeconds: rows[0].duration_seconds, videoModelId: rows[0].model_id });
+      const rawPlan = await generateStructuredMoviePlan({ projectId: id, idea: rows[0].prompt, durationSeconds: rows[0].duration_seconds, videoModelId: rows[0].model_id, fastDraft: rows[0].render_tier === "draft" });
       const adaptedPlan = adaptMoviePlanPrompts(rawPlan, rows[0].model_id);
       await persistMoviePlan(adaptedPlan);
       // Persistence scopes every graph ID to the project. Queue only the stored

@@ -52,7 +52,7 @@ export function StudioWorkspace() {
   const projectLoadInFlightRef = useRef(false);
 
   const model = GOOGLE_VIDEO_MODELS[modelId];
-  const estimate = useMemo(() => estimateGeneration({ durationSeconds: duration, modelId, resolution }), [duration, modelId, resolution]);
+  const estimate = useMemo(() => estimateGeneration({ durationSeconds: duration, modelId, resolution, renderTier: draft ? "draft" : "final" }), [duration, modelId, resolution, draft]);
   const plan = detail?.plan;
   const scenes = plan?.scenes ?? [];
   const selectedScene = scenes.find((scene) => scene.id === selectedSceneId) ?? scenes[0];
@@ -369,7 +369,7 @@ export function StudioWorkspace() {
       <div className="estimate-lines"><div><span>Примерно кадров</span><strong>{estimate.shots}</strong></div><div><span>Генерация видео</span><strong>${estimate.videoUsd.toFixed(2)}</strong></div><div><span>Звук</span><strong>${estimate.audioUsd.toFixed(2)}</strong></div><div><span>Резерв на повторы</span><strong>${estimate.retriesReserveUsd.toFixed(2)}</strong></div><div className="budget-line"><span>Максимальный бюджет</span><label>$<input aria-label="Максимальный бюджет генерации" min="0" onChange={(event) => setBudget(Math.max(0, Number(event.target.value) || 0))} type="number" value={budget}/></label></div></div>
       <Button className="plan-button" disabled={prompt.trim().length < 10 || busy !== null || productionActive || productionComplete} loading={busy !== null} onClick={openProductionConfirmation} variant="primary">{productionComplete ? "Фильм готов" : detail?.project.status === "planning" ? "Сценарий создаётся в фоне" : productionActive ? "Производство запущено" : allShotsReady ? "Собрать готовые кадры" : detail?.project.status === "paused" ? "Продолжить с остановленного кадра" : detail?.project.status === "failed" ? "Повторить без потери готовых кадров" : plan ? "Продолжить и создать фильм" : "Создать фильм"}<Clapperboard size={16}/></Button>
       <div className={`production-notice ${detail?.project.status === "paused" || detail?.project.status === "failed" ? "warning" : productionActive ? "active" : ""}`} role="status"><StatusDot tone={detail?.project.status === "failed" ? "red" : detail?.project.status === "paused" ? "amber" : productionActive ? "teal" : "green"}/><span>{notice}</span></div>
-      <p className="approx-note">Одно подтверждение запускает весь цикл. Быстрый черновик использует ускоренную модель и публикует кадры сразу после ответа Google.</p>
+      <p className="approx-note">Одно подтверждение запускает весь цикл. Быстрый черновик автоматически переключает Veo 3.1 на Veo 3.1 Fast; Omni создаёт до 10 секунд за один запрос. Кадры публикуются сразу после ответа Google.</p>
     </section>
 
     <section className="preview-panel" aria-label="Предпросмотр фильма">

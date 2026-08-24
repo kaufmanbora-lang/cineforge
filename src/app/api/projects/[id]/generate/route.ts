@@ -22,7 +22,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     );
     if (!rows[0]) return NextResponse.json({ error: "Проект не найден." }, { status: 404 });
     const maximumBudget = body.maximumBudgetUsd ?? Number(rows[0].maximum_budget_usd);
-    const estimate = estimateGeneration({ durationSeconds: rows[0].duration_seconds, modelId: rows[0].model_id, resolution: rows[0].resolution });
+    const estimate = estimateGeneration({ durationSeconds: rows[0].duration_seconds, modelId: rows[0].model_id, resolution: rows[0].resolution, renderTier: rows[0].render_tier });
     if (estimate.estimatedTotalUsd > maximumBudget) {
       return NextResponse.json({ error: "Расчётная стоимость генерации превышает бюджет проекта.", estimate, maximumBudget }, { status: 409 });
     }

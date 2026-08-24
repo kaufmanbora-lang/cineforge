@@ -28,6 +28,11 @@ export interface FinalMediaQc {
   issues: string[];
 }
 
+export function canStreamCopyVideo(probe: Pick<MediaProbe, "width" | "height" | "frameRate">, resolution: "720p" | "1080p" | "4k"): boolean {
+  const [targetWidth, targetHeight] = (resolution === "4k" ? "3840:2160" : resolution === "1080p" ? "1920:1080" : "1280:720").split(":").map(Number);
+  return probe.width === targetWidth && probe.height === targetHeight && Math.abs(probe.frameRate - 24) <= 0.01;
+}
+
 export async function probeMedia(filePath: string): Promise<MediaProbe> {
   const { stdout } = await execFileAsync(env().FFPROBE_PATH, [
     "-v", "error", "-show_streams", "-show_format", "-of", "json", filePath,
@@ -118,6 +123,7 @@ export async function assembleMovieFiles(input: {
       const sourceProbe = await probeMedia(source);
       if (!sourceProbe.hasVideo) throw new Error(`Invalid media: source clip ${index + 1} has no video stream.`);
       const clipDuration = input.clips[index].durationSeconds;
+      const canCopyVideo = canStreamCopyVideo(sourceProbe, input.resolution);
       const audioBoundaryFilter = clipDuration
         ? `atrim=start=0:end=${clipDuration.toFixed(3)},asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,afade=t=in:st=0:d=0.04,afade=t=out:st=${Math.max(0, clipDuration - 0.06).toFixed(3)}:d=0.06,loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur=${clipDuration.toFixed(3)},atrim=end=${clipDuration.toFixed(3)}`
         : "aresample=48000:async=1:first_pts=0,loudnorm=I=-16:TP=-1.5:LRA=11";
@@ -126,12 +132,12 @@ export async function assembleMovieFiles(input: {
         ...(!sourceProbe.hasAudio ? ["-f", "lavfi", "-t", (clipDuration ?? sourceProbe.duration).toFixed(3), "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"] : []),
         ...(clipDuration ? ["-t", clipDuration.toFixed(3)] : []),
         "-map", "0:v:0", "-map", sourceProbe.hasAudio ? "0:a:0" : "1:a:0",
-        "-vf", `scale=${dimensions}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${dimensions}:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p`,
+        ...(!canCopyVideo ? ["-vf", `scale=${dimensions}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${dimensions}:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p`] : []),
         // Every generated shot is an isolated audio context. Trimming, resetting
         // timestamps and fading the few boundary milliseconds prevents packets,
         // old speech or a finished music cue from leaking into the next shot.
         "-af", audioBoundaryFilter,
-        "-c:v", "libx264", "-threads:v", "2", "-preset", "veryfast", "-crf", "18",
+        ...(canCopyVideo ? ["-c:v", "copy"] : ["-c:v", "libx264", "-threads:v", "2", "-preset", "veryfast", "-crf", "18"]),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart", target,
       ], { maxBuffer: 16 * 1024 * 1024 });

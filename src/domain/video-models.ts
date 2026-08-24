@@ -39,10 +39,10 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     resolutions: ["preview", "720p", "1080p", "4k"],
     nativeResolutions: ["preview", "720p"],
     aspectRatios: ["16:9", "9:16"],
-    // Omni does not currently expose a durationSeconds API field. Five-second
-    // production beats keep requested runtimes accurate when it returns its
-    // common short clip; the exact total is enforced by the Movie Engine.
-    durationsSeconds: [5],
+    // Omni has no durationSeconds request field, but the current official API
+    // documents 3-10 second output. The prompt carries exact timing; using a
+    // ten-second beat halves provider calls for the common 10/30/60s projects.
+    durationsSeconds: [5, 10],
     nativeAudio: true,
     referenceImages: 6,
     referenceVideo: false,
@@ -55,10 +55,10 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
       "Preview model; availability depends on the Google project.",
       "Uploaded-video editing is unavailable in the EEA, Switzerland and the UK.",
       "Voice editing, interpolation and extension are not supported.",
-      "Clip duration is guided by prompt timecodes; the API has no explicit duration parameter.",
+      "Clip duration (3-10 seconds) is guided by prompt timecodes; the API has no explicit duration parameter.",
       "1080p and 4K are Movie Engine export resolutions; Omni does not expose a native resolution parameter.",
     ],
-    sourceCheckedAt: "2026-08-23",
+    sourceCheckedAt: "2026-08-24",
   },
   "veo-3.1-generate-preview": {
     id: "veo-3.1-generate-preview",
@@ -80,7 +80,7 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     conversationalEditing: false,
     pricePerSecondUsd: { preview: 0.4, "720p": 0.4, "1080p": 0.4, "4k": 0.6 },
     notes: ["1080p, 4K, reference images and extension require 8-second generations."],
-    sourceCheckedAt: "2026-08-23",
+    sourceCheckedAt: "2026-08-24",
   },
   "veo-3.1-fast-generate-preview": {
     id: "veo-3.1-fast-generate-preview",
@@ -102,7 +102,7 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     conversationalEditing: false,
     pricePerSecondUsd: { preview: 0.1, "720p": 0.1, "1080p": 0.12, "4k": 0.3 },
     notes: ["1080p, 4K, reference images and extension require 8-second generations."],
-    sourceCheckedAt: "2026-08-23",
+    sourceCheckedAt: "2026-08-24",
   },
   "veo-3.1-lite-generate-preview": {
     id: "veo-3.1-lite-generate-preview",
@@ -124,7 +124,7 @@ export const GOOGLE_VIDEO_MODELS: Readonly<Record<string, VideoModelCapabilities
     conversationalEditing: false,
     pricePerSecondUsd: { preview: 0.05, "720p": 0.05, "1080p": 0.08 },
     notes: ["4K output and reference images are not supported.", "1080p requires 8 seconds."],
-    sourceCheckedAt: "2026-08-23",
+    sourceCheckedAt: "2026-08-24",
   },
 };
 
@@ -132,6 +132,12 @@ export function getVideoModel(modelId: string): VideoModelCapabilities {
   const model = GOOGLE_VIDEO_MODELS[modelId];
   if (!model) throw new Error(`Unsupported video model: ${modelId}`);
   return model;
+}
+
+/** Fast Draft must change the provider model, not merely the UI label. */
+export function effectiveVideoModelId(modelId: string, renderTier: "draft" | "final"): string {
+  if (renderTier === "draft" && modelId === "veo-3.1-generate-preview") return "veo-3.1-fast-generate-preview";
+  return modelId;
 }
 
 export function getAllowedDurations(modelId: string, resolution: Resolution): number[] {

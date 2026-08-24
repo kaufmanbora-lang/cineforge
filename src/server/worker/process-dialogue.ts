@@ -23,6 +23,7 @@ interface DialogueJobRow {
     dialogueSegments?: Array<{ id: string; characterId: string; text: string; delivery: string; startSeconds: number; durationSeconds: number }>;
     originalAssetId: string;
     originalStorageKey: string;
+    bestEffort?: boolean;
   };
 }
 
@@ -67,7 +68,7 @@ export async function processDialoguePatch(databaseJobId: string) {
         input: segment.text,
         instructions: `${characters[0]?.bible.voice?.description ?? "Natural cinematic dialogue"}. Delivery: ${segment.delivery}. Maintain the same character voice identity.`,
         response_format: "mp3",
-      });
+      }, { timeout: 45_000, maxRetries: 0 });
       patched = await patchDialogueAudio({
         video: patched,
         speech: new Uint8Array(await speechResponse.arrayBuffer()),

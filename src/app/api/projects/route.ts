@@ -87,7 +87,7 @@ export async function POST(request: Request) {
     if (!model.resolutions.includes(body.resolution as Resolution)) {
       return NextResponse.json({ error: `Модель ${model.displayName} не поддерживает разрешение ${body.resolution}.` }, { status: 400 });
     }
-    const estimate = estimateGeneration({ durationSeconds: body.durationSeconds, modelId: body.modelId, resolution: body.resolution });
+    const estimate = estimateGeneration({ durationSeconds: body.durationSeconds, modelId: body.modelId, resolution: body.resolution, renderTier: body.renderTier });
     const rows = await query<{ id: string }>(
       `INSERT INTO projects (workspace_id,title,prompt,duration_seconds,model_id,resolution,aspect_ratio,mode,render_tier,maximum_budget_usd,estimated_cost_usd,total_shots)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,

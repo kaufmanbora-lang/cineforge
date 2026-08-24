@@ -90,14 +90,14 @@ async function processProjectPlan(databaseJobId: string) {
   heartbeat.unref();
   try {
     const maximumBudget = Number(job.payload.maximumBudgetUsd ?? job.maximum_budget_usd);
-    const estimate = estimateGeneration({ durationSeconds: job.duration_seconds, modelId: job.model_id, resolution: job.resolution });
+    const estimate = estimateGeneration({ durationSeconds: job.duration_seconds, modelId: job.model_id, resolution: job.resolution, renderTier: job.render_tier });
     if (estimate.estimatedTotalUsd > maximumBudget) {
       throw Object.assign(new Error("Расчётная стоимость генерации превышает максимальный бюджет проекта."), { status: 409, code: "BUDGET_REACHED" });
     }
     await query("UPDATE projects SET status='planning',last_error=NULL,updated_at=now() WHERE id=$1", [job.project_id]);
     let plan = await latestMoviePlan(job.project_id);
     if (!plan) {
-      const rawPlan = await generateStructuredMoviePlan({ projectId: job.project_id, idea: job.prompt, durationSeconds: job.duration_seconds, videoModelId: job.model_id });
+      const rawPlan = await generateStructuredMoviePlan({ projectId: job.project_id, idea: job.prompt, durationSeconds: job.duration_seconds, videoModelId: job.model_id, fastDraft: job.render_tier === "draft" });
       await persistMoviePlan(adaptMoviePlanPrompts(rawPlan, job.model_id));
       plan = await latestMoviePlan(job.project_id);
       if (!plan) throw new Error("Сохранённый план фильма не найден после записи.");
@@ -119,7 +119,7 @@ async function processProjectPlan(databaseJobId: string) {
 }
 
 async function handleBackgroundFailure(databaseJobId: string, type: string, error: unknown) {
-  const rows = await query<{ id: string; project_id: string; attempt: number; max_attempts: number; state: string; payload: { exportId?: string; sceneId?: string } }>("SELECT id,project_id,attempt,max_attempts,state,payload FROM jobs WHERE id=$1", [databaseJobId]);
+  const rows = await query<{ id: string; project_id: string; attempt: number; max_attempts: number; state: string; payload: { exportId?: string; sceneId?: string; bestEffort?: boolean } }>("SELECT id,project_id,attempt,max_attempts,state,payload FROM jobs WHERE id=$1", [databaseJobId]);
   const job = rows[0];
   if (!job || job.state === "failed" || job.state === "paused" || job.state === "completed" || (type === "generate-shot" && ["queued", "retrying"].includes(job.state))) return;
   const failure = classifyFailure(error);
@@ -130,7 +130,7 @@ async function handleBackgroundFailure(databaseJobId: string, type: string, erro
     // video/audio. A missing OpenAI balance or TTS outage must never convert a
     // fully generated movie into a failed/paused project. Retry when useful;
     // otherwise preserve the original shot and continue to local assembly.
-    const retry = decision.retry && !decision.pauseProject;
+    const retry = !job.payload.bestEffort && decision.retry && !decision.pauseProject;
     await query(
       "UPDATE jobs SET state=$2,last_error=$3,available_at=now()+($4::text || ' milliseconds')::interval,completed_at=CASE WHEN $2='failed' THEN now() ELSE NULL END WHERE id=$1",
       [job.id, retry ? "queued" : "failed", JSON.stringify({ ...details, videoFramesPreserved: true, providerAudioPreserved: true }), decision.delayMs],

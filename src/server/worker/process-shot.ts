@@ -9,7 +9,7 @@ import { deleteObject, getObjectIfExists, putFileObject, putObject, putRemoteObj
 import { findCachedShot } from "@/server/movie/repository";
 import { classifyFailure, retryDecision } from "@/server/movie/retry";
 import { enqueueAutomaticAssemblyIfReady, enqueueDialoguePatch, enqueueReadyProjectJobs, pauseProjectJobs, requeueDatabaseJob } from "@/server/movie/queue";
-import { getAllowedDurations, getVideoModel, type Resolution } from "@/domain/video-models";
+import { effectiveVideoModelId, getAllowedDurations, getVideoModel, type Resolution } from "@/domain/video-models";
 import { env } from "@/server/env";
 import { contentHash } from "@/server/movie/content-hash";
 import { extractFinalFrame, extractShotQcFrames, validateGeneratedShot } from "@/server/movie/ffmpeg";
@@ -115,7 +115,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       cached = null;
     }
   }
-  const effectiveModelId = job.payload.providerModelId ?? job.model_id;
+  const effectiveModelId = effectiveVideoModelId(job.payload.providerModelId ?? job.model_id, job.render_tier);
   const capabilities = getVideoModel(effectiveModelId);
   const price = capabilities.pricePerSecondUsd[job.resolution] ?? capabilities.pricePerSecondUsd["720p"] ?? 0;
   const providerDuration = providerDurationSeconds(
@@ -309,7 +309,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     const assetId = await withDurableDatabaseRetry(() => persistCompletedAsset(job, storageKey, checksum, stored.byteSize, operation.operationId, cost, classifiedQc));
     const dialogueSegments = job.payload.shot.audioContext?.dialogue ?? [];
     if (dialogueSegments.length && await getProviderKey("openai")) {
-      const dialoguePayload = { dialogueSegments, originalAssetId: assetId, originalStorageKey: storageKey };
+      const dialoguePayload = { dialogueSegments, originalAssetId: assetId, originalStorageKey: storageKey, bestEffort: job.render_tier === "draft" };
       await enqueueDialoguePatch({
         projectId: job.project_id,
         sceneId: job.scene_id,

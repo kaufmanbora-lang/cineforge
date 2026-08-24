@@ -3,6 +3,7 @@ import { readFile, rm } from "node:fs/promises";
 import { createGoogleOmniInteraction, extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniInteractionRequest, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
 import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { carryPhysicalWorldForward, normalizeMoviePlanRuntime, physicalTransitionContract, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
+import { effectiveVideoModelId } from "@/domain/video-models";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
 
@@ -146,6 +147,13 @@ describe("Google Omni response parsing", () => {
     expect(providerDurationSeconds("veo-3.1-fast-generate-preview", "720p", 4, true)).toBe(8);
     expect(providerDurationSeconds("gemini-omni-flash-preview", "720p", 5)).toBe(5);
     expect(providerDurationSeconds("gemini-omni-flash-preview", "1080p", 5)).toBe(5);
+    expect(providerDurationSeconds("gemini-omni-flash-preview", "720p", 10)).toBe(10);
+  });
+
+  it("routes a Veo 3.1 draft to the official Fast model without changing final renders", () => {
+    expect(effectiveVideoModelId("veo-3.1-generate-preview", "draft")).toBe("veo-3.1-fast-generate-preview");
+    expect(effectiveVideoModelId("veo-3.1-generate-preview", "final")).toBe("veo-3.1-generate-preview");
+    expect(effectiveVideoModelId("gemini-omni-flash-preview", "draft")).toBe("gemini-omni-flash-preview");
   });
 
   it("defaults ordinary film prompts to photorealistic live action", () => {
@@ -455,9 +463,9 @@ describe("Google Omni response parsing", () => {
   });
 
   it.each([
-    ["gemini-omni-flash-preview", 10, 5],
-    ["gemini-omni-flash-preview", 30, 5],
-    ["gemini-omni-flash-preview", 60, 5],
+    ["gemini-omni-flash-preview", 10, 10],
+    ["gemini-omni-flash-preview", 30, 10],
+    ["gemini-omni-flash-preview", 60, 10],
     ["veo-3.1-generate-preview", 10, 8],
     ["veo-3.1-generate-preview", 30, 8],
     ["veo-3.1-generate-preview", 60, 8],

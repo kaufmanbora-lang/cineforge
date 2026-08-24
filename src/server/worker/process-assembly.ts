@@ -35,13 +35,11 @@ export async function processAssembly(databaseJobId: string) {
     [job.project_id, job.payload.sceneId ?? null],
   );
   if (!assets.length) throw new Error("No completed shot assets are available for export.");
-  const clips = [] as Array<{ filePath: string; durationSeconds: number }>;
-  for (let index = 0; index < assets.length; index += 1) {
-    const asset = assets[index];
+  const clips = await Promise.all(assets.map(async (asset, index) => {
     const filePath = join(tempRoot, `source-${index}.mp4`);
     await getObjectToFile(asset.storage_key, filePath);
-    clips.push({ filePath, durationSeconds: Number(asset.duration_seconds) });
-  }
+    return { filePath, durationSeconds: Number(asset.duration_seconds) };
+  }));
   const outputPath = join(tempRoot, `movie.${job.payload.format}`);
   const assembledQc = await assembleMovieFiles({ clips, resolution: job.payload.resolution, outputFormat: job.payload.format, outputPath });
   const duplicateChecksums = assets.filter((asset, index) => assets.findIndex((candidate) => candidate.checksum === asset.checksum) !== index).map((asset) => asset.shot_id);

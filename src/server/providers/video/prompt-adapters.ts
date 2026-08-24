@@ -217,12 +217,13 @@ export function adaptMoviePlanPrompts(plan: MoviePlan, modelId: string): MoviePl
 
 /**
  * Turns an approximate screenplay timeline into an exact production timeline.
- * Omni currently has no durationSeconds request field, so short five-second
- * beats are considerably more reliable than asking one interaction for a long
- * clip. Every beat is newly generated; no frame repetition or slow-down is used.
+ * Omni currently has no durationSeconds request field, but its documented
+ * output range reaches ten seconds. Exact prompt timecodes let common 10/30/60s
+ * projects use half as many paid interactions. Every beat is newly generated;
+ * no frame repetition or slow-down is used.
  */
 export function normalizeMoviePlanRuntime(plan: MoviePlan, modelId: string): MoviePlan {
-  const maxBeatSeconds = modelId.startsWith("gemini-omni") ? 5 : 8;
+  const maxBeatSeconds = modelId.startsWith("gemini-omni") ? 10 : 8;
   let scenes = plan.scenes.map((scene) => ({
     ...scene,
     shots: scene.shots.flatMap((shot) => splitShotIntoBeats(shot, maxBeatSeconds)),

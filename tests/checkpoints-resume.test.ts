@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { nextCheckpoint, resumeFromCheckpoint, type CheckpointSnapshot } from "@/server/movie/checkpoints";
 import { preservePreviewUrls } from "@/domain/movie";
 import { estimateRemainingGenerationSeconds, formatRemainingGenerationTime } from "@/domain/estimation";
+import { canStreamCopyVideo } from "@/server/movie/ffmpeg";
 
 const initial: CheckpointSnapshot = { projectId: "p", planVersion: 1, completedShotIds: ["s1"], failedShotIds: [], pendingShotIds: ["s2","s3"], currentJobId: "j2", spentUsd: 1, projectMemoryHash: "memory", createdAt: "2026-01-01" };
 
@@ -56,5 +57,13 @@ describe("dynamic generation ETA", () => {
 
   it("pauses the countdown when production is stopped", () => {
     expect(estimateRemainingGenerationSeconds({ jobs: [], completedShots: 1, totalShots: 3, status: "failed", modelId: "gemini-omni-flash-preview" })).toBeNull();
+  });
+});
+
+describe("fast assembly path", () => {
+  it("preserves compatible provider frames without an unnecessary H.264 re-encode", () => {
+    expect(canStreamCopyVideo({ width: 1280, height: 720, frameRate: 24 }, "720p")).toBe(true);
+    expect(canStreamCopyVideo({ width: 1280, height: 720, frameRate: 23.976 }, "720p")).toBe(false);
+    expect(canStreamCopyVideo({ width: 1280, height: 720, frameRate: 24 }, "1080p")).toBe(false);
   });
 });

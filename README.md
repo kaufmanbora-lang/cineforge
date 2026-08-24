@@ -172,7 +172,8 @@ flowchart LR
 - `jobs.idempotency_key` и Bull job IDs предотвращают двойную генерацию.
 - `contentHash(prompt + references + audio + settings)` включает все generation inputs.
 - API operation ID сохраняется на shot; worker restart переводит interrupted jobs обратно в очередь.
-- Запрошенные 10/30/60 секунд разбиваются на допустимые для выбранной модели chunks, а сборщик обрезает каждый источник по плану и проверяет точную длительность master-файла с допуском 0,5 секунды.
+- Запрошенные 10/30/60 секунд разбиваются на допустимые для выбранной модели chunks: Omni использует документированный диапазон до 10 секунд за interaction, Veo — 4/6/8 секунд. Сборщик обрезает каждый источник по плану и проверяет точную длительность master-файла с допуском 0,5 секунды.
+- «Быстрый черновик» реально переключает выбранный Veo 3.1 на официальный `veo-3.1-fast-generate-preview`, использует быстрый сценарный routing и не перекодирует уже совместимые 24 FPS кадры при сборке.
 - Quota и maximum budget переводят проект в `paused`, а не `failed` и не удаляют assets; параллельные jobs сначала атомарно резервируют стоимость в PostgreSQL, поэтому вместе не могут превысить лимит.
 - Retry policy различает quota, rate limit, timeout, server, moderation, corrupted media, upload и fatal error.
 - Retry ограничен `MAX_AUTO_RETRIES`; бесконечных циклов нет.
