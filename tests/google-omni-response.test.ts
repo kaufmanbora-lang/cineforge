@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readFile, rm } from "node:fs/promises";
-import { extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniInteractionRequest, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
+import { createGoogleOmniInteraction, extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniInteractionRequest, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
 import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
@@ -52,6 +52,40 @@ describe("Google Omni response parsing", () => {
     expect(editRequest.store).toBe(true);
     expect(editRequest.previous_interaction_id).toBe("interaction-1");
     expect(editRequest.generation_config).toBeUndefined();
+    expect(editRequest.response_format).toBeUndefined();
+  });
+  it("falls back from URI delivery to the documented inline video response for the specific store compatibility 400", async () => {
+    const plannedShot = shot("shot-omni-inline-fallback");
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (bodies.length === 1) {
+        return new Response(JSON.stringify({ error: { code: 400, message: "store=true is required when response format has video delivery set to URI" } }), { status: 400 });
+      }
+      return new Response(JSON.stringify({ id: "v1_ok", steps: [{ type: "model_output", content: [{ type: "video", data: "AAAA", mime_type: "video/mp4" }] }] }), { status: 200 });
+    });
+    const result = await createGoogleOmniInteraction({
+      projectId: "project-1", sceneId: plannedShot.sceneId, shotId: plannedShot.id,
+      modelId: "gemini-omni-flash-preview", prompt: plannedShot.generationPrompt!.prompt,
+      negativeDirectives: [], durationSeconds: 5, resolution: "720p", aspectRatio: "16:9",
+      seed: null, references: [], fastMode: true,
+    }, "server-only-test-key", fetchMock);
+    expect(result.id).toBe("v1_ok");
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({ store: true, response_format: { type: "video", delivery: "uri" } });
+    expect(bodies[1]).toMatchObject({ store: true, response_format: { type: "video" } });
+    expect((bodies[1].response_format as Record<string, unknown>).delivery).toBeUndefined();
+  });
+  it("does not retry an unrelated Omni HTTP 400", async () => {
+    const plannedShot = shot("shot-omni-fatal-400");
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: { code: 400, message: "Invalid prompt field" } }), { status: 400 }));
+    await expect(createGoogleOmniInteraction({
+      projectId: "project-1", sceneId: plannedShot.sceneId, shotId: plannedShot.id,
+      modelId: "gemini-omni-flash-preview", prompt: plannedShot.generationPrompt!.prompt,
+      negativeDirectives: [], durationSeconds: 5, resolution: "720p", aspectRatio: "16:9",
+      seed: null, references: [], fastMode: true,
+    }, "server-only-test-key", fetchMock)).rejects.toThrow("Invalid prompt field");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
   it("turns an Omni Files API resource URI into the official media download endpoint", () => {
     expect(googleFileDownloadUrl("files/omni-output_123")).toBe("https://generativelanguage.googleapis.com/v1beta/files/omni-output_123:download?alt=media");
@@ -65,7 +99,7 @@ describe("Google Omni response parsing", () => {
   it("classifies a policy rejection before a generic 403 permission error", () => {
     expect(normalizeGoogleProviderError({ status: 403, message: "Blocked by safety policy" }).code).toBe("GOOGLE_MODERATION");
   });
-  it("does not send the Enterprise-only seed parameter to Gemini Developer API", () => {
+  it("sends the officially supported Veo seed parameter", () => {
     const plannedShot = shot("shot-1");
     expect(googleVeoConfig({
       projectId: "project-1",
@@ -80,7 +114,7 @@ describe("Google Omni response parsing", () => {
       seed: 42,
       references: [],
       fastMode: true,
-    })).not.toHaveProperty("seed");
+    })).toHaveProperty("seed", 42);
   });
 
   it("keeps one or more officially supported Veo reference images", () => {
@@ -102,6 +136,8 @@ describe("Google Omni response parsing", () => {
     const oneReference = [{ id: "portrait", data: "AAAA", mimeType: "image/png", role: "subject" as const }];
     expect(googleVeoConfig(request, undefined, oneReference).referenceImages).toHaveLength(1);
     expect(googleVeoConfig(request, undefined, [...oneReference, { ...oneReference[0], id: "wardrobe" }]).referenceImages).toHaveLength(2);
+    expect(googleVeoConfig({ ...request, aspectRatio: "9:16" }, undefined, oneReference).referenceImages).toBeUndefined();
+    expect(googleVeoConfig(request, undefined, oneReference, { id: "first", data: "AAAA", mimeType: "image/jpeg", role: "first-frame" }).referenceImages).toBeUndefined();
   });
 
   it("maps screenplay timing to durations accepted by each video model", () => {

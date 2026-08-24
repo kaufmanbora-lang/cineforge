@@ -108,7 +108,7 @@ export class GoogleVeoAdapter implements VideoModelAdapter {
           prompt: request.prompt,
           image: primaryImage ? imageValue(primaryImage) : undefined,
         },
-        config: googleVeoConfig(request, lastFrame, subjectReferences),
+        config: googleVeoConfig(request, lastFrame, subjectReferences, primaryImage),
       });
       const raw = operation as unknown as { name?: string; done?: boolean };
       return {
@@ -358,18 +358,26 @@ export function googleVeoConfig(
   request: VideoGenerationRequest,
   lastFrame?: VideoGenerationRequest["references"][number],
   subjectReferences: VideoGenerationRequest["references"] = [],
+  primaryImage?: VideoGenerationRequest["references"][number],
 ) {
-  const supportedReferenceImages = subjectReferences.length >= 1
+  // The Gemini Developer API accepts subject/style references only for 16:9,
+  // eight-second Veo generations. Do not combine that mode with image-to-video
+  // or interpolation; those are separate source modes and Google rejects some
+  // mixed combinations with HTTP 400.
+  const supportedReferenceImages = !primaryImage && request.aspectRatio === "16:9" && subjectReferences.length >= 1
     ? subjectReferences.slice(0, 3).map((reference) => ({ image: imageValue(reference), referenceType: VideoGenerationReferenceType.ASSET }))
     : undefined;
+  const hasImageInput = Boolean(primaryImage || lastFrame || supportedReferenceImages?.length);
   return {
     aspectRatio: request.aspectRatio,
     resolution: request.resolution === "preview" ? "720p" : request.resolution,
     durationSeconds: request.durationSeconds,
     negativePrompt: request.negativeDirectives.join(", "),
     numberOfVideos: 1,
-    lastFrame: lastFrame ? imageValue(lastFrame) : undefined,
+    lastFrame: primaryImage && lastFrame ? imageValue(lastFrame) : undefined,
     referenceImages: supportedReferenceImages,
+    personGeneration: hasImageInput ? "allow_adult" : "allow_all",
+    seed: request.seed ?? undefined,
   };
 }
 
@@ -377,21 +385,11 @@ export class GoogleOmniAdapter implements VideoModelAdapter {
   readonly capabilities = getVideoModel("gemini-omni-flash-preview");
 
   async start(request: VideoGenerationRequest, apiKey: string): Promise<ProviderOperation> {
-    const ai = new GoogleGenAI({ apiKey });
     try {
-      const interaction = await ai.interactions.create(
-        googleOmniInteractionRequest(request) as never,
-        {
-          // CineForge owns the durable, bounded retry policy. The SDK defaults
-          // to four additional retries for 429/5xx responses; stacking those
-          // retries multiplied requests and prolonged account rate limits.
-          maxRetries: 0,
-          // Omni is a unary video request. Give the official service enough
-          // time for its documented long generation latency, but never allow a
-          // lost HTTP response to hold a worker slot forever.
-          timeout: 15 * 60_000,
-        },
-      );
+      // Use the documented REST endpoint for Omni rather than an SDK bridge.
+      // This guarantees that `store`, `response_format` and snake_case fields
+      // reach Google exactly as validated by the request builder below.
+      const interaction = await createGoogleOmniInteraction(request, apiKey);
       const raw = interaction as unknown as {
         id?: string;
         output_video?: { data?: string; uri?: string; mime_type?: string };
@@ -435,6 +433,11 @@ export function googleOmniInteractionRequest(request: VideoGenerationRequest): R
   }));
   input.push({ type: "text", text: statefulEdit ? request.editInstruction! : request.prompt });
   const videoTask = googleOmniVideoTask(request);
+  const responseFormat = statefulEdit ? undefined : {
+    type: "video",
+    aspect_ratio: request.aspectRatio,
+    delivery: "uri",
+  };
   return {
     model: request.modelId,
     // A stateful edit already has the original generated video in its
@@ -447,13 +450,98 @@ export function googleOmniInteractionRequest(request: VideoGenerationRequest): R
     // URI delivery is invalid unless store=true. Keep this invariant in the
     // single request builder used by normal, retry, rescue and edit flows.
     store: googleOmniShouldStore(request),
-    response_format: {
-      type: "video",
-      aspect_ratio: request.aspectRatio,
-      delivery: "uri",
-    },
+    // Google's documented stateful-edit request needs only the previous
+    // interaction and a short edit instruction. Re-sending a fresh video
+    // response format can be rejected during staged API rollouts.
+    response_format: responseFormat,
     generation_config: videoTask ? { video_config: { task: videoTask } } : undefined,
   };
+}
+
+type OmniInteractionResponse = {
+  id?: string;
+  output_video?: { data?: string; uri?: string; mime_type?: string };
+  outputVideo?: { data?: string; uri?: string; mimeType?: string };
+  steps?: Array<{ content?: Array<{ type?: string; data?: string; uri?: string; mime_type?: string; mimeType?: string }> }>;
+  outputs?: Array<{ content?: Array<{ type?: string; data?: string; uri?: string; mime_type?: string; mimeType?: string }> }>;
+};
+
+type GoogleFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+/**
+ * Sends one logical Omni request. Compatibility fallbacks are limited to
+ * schema-level HTTP 400 responses, which Google rejects before generation and
+ * billing. Provider rate limits and generation failures are never duplicated
+ * here; the durable job queue owns those retries.
+ */
+export async function createGoogleOmniInteraction(
+  request: VideoGenerationRequest,
+  apiKey: string,
+  fetchImpl: GoogleFetch = fetch,
+): Promise<OmniInteractionResponse> {
+  let body = googleOmniInteractionRequest(request);
+  const attemptedBodies = new Set<string>();
+  for (let compatibilityAttempt = 0; compatibilityAttempt < 3; compatibilityAttempt += 1) {
+    const fingerprint = omniRequestShapeFingerprint(body);
+    if (attemptedBodies.has(fingerprint)) break;
+    attemptedBodies.add(fingerprint);
+    try {
+      return await postGoogleOmniInteraction(body, apiKey, fetchImpl);
+    } catch (error) {
+      const fallback = googleOmniCompatibilityFallback(body, error);
+      if (!fallback) throw error;
+      body = fallback;
+      process.stderr.write(`[google-omni] Retrying rejected request with compatible schema: ${omniRequestShapeFingerprint(body)}\n`);
+    }
+  }
+  throw new Error("Google Omni request compatibility fallback did not produce a distinct request.");
+}
+
+async function postGoogleOmniInteraction(body: Record<string, unknown>, apiKey: string, fetchImpl: GoogleFetch): Promise<OmniInteractionResponse> {
+  const response = await fetchImpl("https://generativelanguage.googleapis.com/v1beta/interactions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    body: JSON.stringify(body),
+    cache: "no-store",
+    signal: AbortSignal.timeout(15 * 60_000),
+  });
+  if (!response.ok) throw await googleHttpError(response);
+  return await response.json() as OmniInteractionResponse;
+}
+
+export function googleOmniCompatibilityFallback(body: Record<string, unknown>, error: unknown): Record<string, unknown> | null {
+  const record = typeof error === "object" && error ? error as Record<string, unknown> : {};
+  const status = Number(record.status ?? 0);
+  const probe = `${error instanceof Error ? error.message : ""} ${String(record.providerMessage ?? "")}`.toLowerCase();
+  if (status !== 400) return null;
+
+  const responseFormat = body.response_format && typeof body.response_format === "object"
+    ? body.response_format as Record<string, unknown>
+    : undefined;
+  if (responseFormat?.delivery === "uri" && /store\s*=\s*true.*video delivery|delivery.*uri.*store|store=true is required/.test(probe)) {
+    const inlineFormat = { ...responseFormat };
+    delete inlineFormat.delivery;
+    return { ...body, store: true, response_format: inlineFormat };
+  }
+  if (body.generation_config && /previous_interaction_id.*video task|video task.*previous_interaction_id|generation[_ ]config|video[_ -]?config|unknown.*task/.test(probe)) {
+    return { ...body, generation_config: undefined };
+  }
+  return null;
+}
+
+export function omniRequestShapeFingerprint(body: Record<string, unknown>): string {
+  const responseFormat = body.response_format && typeof body.response_format === "object" ? body.response_format as Record<string, unknown> : {};
+  const generationConfig = body.generation_config && typeof body.generation_config === "object" ? body.generation_config as Record<string, unknown> : {};
+  const videoConfig = generationConfig.video_config && typeof generationConfig.video_config === "object" ? generationConfig.video_config as Record<string, unknown> : {};
+  return JSON.stringify({
+    model: body.model,
+    input: Array.isArray(body.input) ? `parts:${body.input.length}` : typeof body.input,
+    previousInteraction: Boolean(body.previous_interaction_id),
+    store: body.store,
+    delivery: responseFormat.delivery ?? "inline-or-default",
+    aspectRatio: responseFormat.aspect_ratio ?? "model-default",
+    task: videoConfig.task ?? "inferred",
+  });
 }
 
 export function googleOmniVideoTask(request: Pick<VideoGenerationRequest, "previousInteractionId" | "editInstruction" | "references">): "image_to_video" | "reference_to_video" | "text_to_video" | undefined {
