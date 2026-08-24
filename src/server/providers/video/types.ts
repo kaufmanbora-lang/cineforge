@@ -39,7 +39,7 @@ export interface ProviderOperation {
     providerUri?: string;
     interactionId?: string;
   };
-  error?: { code: string; message: string; retryable: boolean; status?: number };
+  error?: { code: string; message: string; retryable: boolean; status?: number; retryAfterMs?: number };
 }
 
 export interface VideoModelAdapter {

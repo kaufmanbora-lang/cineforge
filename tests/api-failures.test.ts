@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { classifyFailure, retryDecision } from "@/server/movie/retry";
+import { classifyFailure, rateLimitRecoveryDecision, retryDecision } from "@/server/movie/retry";
+import { parseGoogleRetryAfter } from "@/server/providers/video/google";
 import { isRetryableDatabaseConnectionError } from "@/server/db";
 
 describe("API failure policy", () => {
@@ -8,15 +9,26 @@ describe("API failure policy", () => {
     expect(classifyFailure(error)).toBe("quota");
     expect(retryDecision({ failure: "quota", attempt: 1, maxAttempts: 3 })).toEqual({ retry: false, pauseProject: true, delayMs: 0 });
   });
-  it("does not mistake a paid-tier 429 for inactive billing", () => {
+  it("treats a paid-tier rolling spend window as a retryable rate limit", () => {
     const error = Object.assign(new Error("RESOURCE_EXHAUSTED: spend limit for billing tier 1"), { status: 429 });
+    expect(classifyFailure(error)).toBe("rate-limit");
+  });
+  it("still pauses an explicit daily quota ceiling", () => {
+    const error = Object.assign(new Error("RESOURCE_EXHAUSTED: requests per day quota exhausted"), { status: 429 });
     expect(classifyFailure(error)).toBe("quota");
   });
-  it("retries a short RESOURCE_EXHAUSTED window and pauses only after bounded attempts", () => {
+  it("continues a short RESOURCE_EXHAUSTED window through bounded cooldown cycles", () => {
     const error = Object.assign(new Error("RESOURCE_EXHAUSTED: requests per minute"), { status: 429, code: "GOOGLE_RATE_LIMIT" });
     expect(classifyFailure(error)).toBe("rate-limit");
     expect(retryDecision({ failure: "rate-limit", attempt: 1, maxAttempts: 3, baseMs: 15_000 })).toEqual({ retry: true, pauseProject: false, delayMs: 34_500 });
-    expect(retryDecision({ failure: "rate-limit", attempt: 3, maxAttempts: 3, baseMs: 15_000 })).toEqual({ retry: false, pauseProject: true, delayMs: 0 });
+    expect(rateLimitRecoveryDecision({ attempt: 1, maxAttempts: 3 })).toEqual({ retry: true, pauseProject: false, delayMs: 34_500, resetAttempts: false, nextCooldownCount: 0 });
+    expect(rateLimitRecoveryDecision({ attempt: 3, maxAttempts: 3 })).toEqual({ retry: true, pauseProject: false, delayMs: 60_000, resetAttempts: true, nextCooldownCount: 1 });
+    expect(rateLimitRecoveryDecision({ attempt: 3, maxAttempts: 3, cooldownCount: 4 })).toEqual({ retry: false, pauseProject: true, delayMs: 0, resetAttempts: false, nextCooldownCount: 4 });
+  });
+  it("honors Google's Retry-After header when it is longer than the local cooldown", () => {
+    expect(parseGoogleRetryAfter("90")).toBe(90_000);
+    expect(parseGoogleRetryAfter("Thu, 01 Jan 2026 00:01:30 GMT", Date.parse("Thu, 01 Jan 2026 00:00:00 GMT"))).toBe(90_000);
+    expect(rateLimitRecoveryDecision({ attempt: 3, maxAttempts: 3, retryAfterMs: 90_000 })).toMatchObject({ retry: true, delayMs: 90_000, resetAttempts: true });
   });
   it("recognizes a numeric 429 when the Google SDK status field is symbolic", () => {
     const error = Object.assign(new Error("RESOURCE_EXHAUSTED"), { status: "RESOURCE_EXHAUSTED", code: 429 });

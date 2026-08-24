@@ -7,7 +7,7 @@ import { googleVideoAdapter } from "@/server/providers/video/google";
 import type { ProviderOperation, VideoGenerationRequest } from "@/server/providers/video/types";
 import { deleteObject, getObjectIfExists, putFileObject, putObject, putRemoteObject, signedObjectUrl } from "@/server/storage";
 import { findCachedShot } from "@/server/movie/repository";
-import { classifyFailure, retryDecision } from "@/server/movie/retry";
+import { classifyFailure, rateLimitRecoveryDecision, retryDecision } from "@/server/movie/retry";
 import { enqueueAutomaticAssemblyIfReady, enqueueReadyProjectJobs, pauseProjectJobs, requeueDatabaseJob } from "@/server/movie/queue";
 import { effectiveVideoModelId, getAllowedDurations, getVideoModel, type Resolution } from "@/domain/video-models";
 import { env } from "@/server/env";
@@ -35,7 +35,7 @@ interface JobRow {
   shot_id: string;
   attempt: number;
   max_attempts: number;
-  payload: { providerModelId?: string; omitProviderReferences?: boolean; omitSubjectReferences?: boolean; editCommand?: string; shot: Shot; specHash: string };
+  payload: { providerModelId?: string; omitProviderReferences?: boolean; omitSubjectReferences?: boolean; editCommand?: string; rateLimitCooldowns?: number; shot: Shot; specHash: string };
   model_id: string;
   resolution: Resolution;
   aspect_ratio: "16:9" | "9:16";
@@ -233,7 +233,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     }
     if (operation.state === "failed" || !operation.output) {
       const error = new Error(operation.error?.message ?? "Video generation failed.");
-      Object.assign(error, { status: operation.error?.status, code: operation.error?.code });
+      Object.assign(error, { status: operation.error?.status, code: operation.error?.code, retryAfterMs: operation.error?.retryAfterMs });
       throw error;
     }
     providerCompleted = true;
@@ -349,12 +349,16 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
-    const decision = retryDecision({
-      failure,
-      attempt: job.attempt,
-      maxAttempts: job.max_attempts,
-      baseMs: failure === "rate-limit" ? 15_000 : undefined,
-    });
+    const errorRecord = typeof error === "object" && error ? error as Record<string, unknown> : {};
+    const rateLimitDecision = failure === "rate-limit"
+      ? rateLimitRecoveryDecision({
+          attempt: job.attempt,
+          maxAttempts: job.max_attempts,
+          cooldownCount: job.payload.rateLimitCooldowns,
+          retryAfterMs: typeof errorRecord.retryAfterMs === "number" ? errorRecord.retryAfterMs : undefined,
+        })
+      : null;
+    const decision = rateLimitDecision ?? retryDecision({ failure, attempt: job.attempt, maxAttempts: job.max_attempts });
     if (failure === "rate-limit") {
       omniProviderNotBeforeMs = Math.max(omniProviderNotBeforeMs, Date.now() + Math.max(15_000, decision.delayMs));
     }
@@ -365,6 +369,35 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         [job.id, JSON.stringify({ failure, message })],
       ));
       return { cached: false, storageKey: "", paused: true };
+    }
+    if (rateLimitDecision?.retry) {
+      const resumeAt = new Date(Date.now() + rateLimitDecision.delayMs).toISOString();
+      const retryState = {
+        code: "RATE_LIMIT_COOLDOWN",
+        message: `Google временно ограничил скорость. CineForge автоматически продолжит только с кадра ${job.payload.shot.sequence} через ${Math.max(1, Math.ceil(rateLimitDecision.delayMs / 60_000))} мин.; готовые кадры сохранены.`,
+        shotId: job.shot_id,
+        resumeAt,
+      };
+      const nextPayload = {
+        ...job.payload,
+        rateLimitCooldowns: rateLimitDecision.nextCooldownCount,
+      };
+      await withDurableDatabaseRetry(() => transaction(async (client) => {
+        await client.query(
+          `UPDATE jobs SET state='queued', attempt=$2, payload=$3, last_error=$4,
+             available_at=now()+($5::text || ' milliseconds')::interval, reserved_cost_usd=0, updated_at=now()
+           WHERE id=$1`,
+          [job.id, rateLimitDecision.resetAttempts ? 0 : job.attempt, JSON.stringify(nextPayload), JSON.stringify(retryState), rateLimitDecision.delayMs],
+        );
+        await client.query("UPDATE shots SET state='retrying',retry_count=$2,last_error=$3 WHERE id=$1", [job.shot_id, job.attempt, JSON.stringify(retryState)]);
+        await client.query("UPDATE projects SET status='generating',last_error=$2,updated_at=now() WHERE id=$1", [job.project_id, JSON.stringify(retryState)]);
+      }));
+      await requeueDatabaseJob({
+        databaseJobId: job.id,
+        attempt: rateLimitDecision.resetAttempts ? 0 : job.attempt,
+        delayMs: rateLimitDecision.delayMs,
+      });
+      return { cached: false, storageKey: "", retrying: true };
     }
     await withDurableDatabaseRetry(() => query(
       "UPDATE jobs SET state=$2, last_error=$3, available_at=now()+($4::text || ' milliseconds')::interval WHERE id=$1",
@@ -812,7 +845,7 @@ async function persistCompletedAsset(job: JobRow, storageKey: string, checksum: 
     );
     const progress = count.rows[0].total ? (count.rows[0].completed / count.rows[0].total) * 100 : 0;
     await client.query(
-      "UPDATE projects SET completed_shots=$2::integer, total_shots=$3::integer, progress=$4::numeric, spent_usd=spent_usd+$5::numeric,reserved_usd=GREATEST(0,reserved_usd-$5::numeric), status=CASE WHEN $2::integer=$3::integer THEN 'validating'::project_status WHEN status='paused' THEN 'paused'::project_status ELSE 'generating'::project_status END WHERE id=$1",
+      "UPDATE projects SET completed_shots=$2::integer, total_shots=$3::integer, progress=$4::numeric, spent_usd=spent_usd+$5::numeric,reserved_usd=GREATEST(0,reserved_usd-$5::numeric),last_error=NULL, status=CASE WHEN $2::integer=$3::integer THEN 'validating'::project_status WHEN status='paused' THEN 'paused'::project_status ELSE 'generating'::project_status END WHERE id=$1",
       [job.project_id, count.rows[0].completed, count.rows[0].total, progress, cost],
     );
     const states = await client.query<{ id: string; state: string }>("SELECT id,state FROM shots WHERE project_id=$1 ORDER BY created_at", [job.project_id]);

@@ -618,9 +618,10 @@ export function googleFileDownloadUrl(uri: string): string {
 
 async function googleHttpError(response: Response): Promise<Error> {
   const text = await response.text();
-  const normalized = normalizeGoogleProviderError({ status: response.status, message: text.slice(0, 1_500) });
+  const retryAfterMs = parseGoogleRetryAfter(response.headers.get("retry-after"));
+  const normalized = normalizeGoogleProviderError({ status: response.status, message: text.slice(0, 1_500), retryAfterMs });
   const error = new Error(normalized.message);
-  Object.assign(error, { status: response.status, code: normalized.code, providerMessage: text.slice(0, 1_500) });
+  Object.assign(error, { status: response.status, code: normalized.code, providerMessage: text.slice(0, 1_500), retryAfterMs });
   return error;
 }
 
@@ -635,13 +636,16 @@ function failedOperation(modelId: string, error: unknown, operationId = `failed-
   };
 }
 
-export function normalizeGoogleProviderError(error: unknown): { code: string; message: string; retryable: boolean; status?: number } {
+export function normalizeGoogleProviderError(error: unknown): { code: string; message: string; retryable: boolean; status?: number; retryAfterMs?: number } {
   const record = typeof error === "object" && error ? error as Record<string, unknown> : {};
   const status = [record.status, record.statusCode, record.httpStatus, record.code]
     .map((value) => typeof value === "number" || (typeof value === "string" && /^\d{3}$/.test(value)) ? Number(value) : undefined)
     .find((value) => value !== undefined && Number.isFinite(value));
   const rawMessage = error instanceof Error ? error.message : typeof record.message === "string" ? record.message : String(error ?? "");
   const providerMessage = typeof record.providerMessage === "string" ? record.providerMessage : "";
+  const retryAfterMs = typeof record.retryAfterMs === "number" && Number.isFinite(record.retryAfterMs)
+    ? Math.max(0, Math.floor(record.retryAfterMs))
+    : undefined;
   const probe = `${String(record.code ?? "")} ${rawMessage} ${providerMessage}`.toLowerCase();
 
   if (status === 401 || /api[_ -]?key.*(invalid|expired)|unauthenticated|authentication/.test(probe)) {
@@ -651,11 +655,11 @@ export function normalizeGoogleProviderError(error: unknown): { code: string; me
   // concurrency windows. Pause only for an explicit daily/spend/credit ceiling;
   // otherwise use bounded rate-limit backoff instead of making the user click
   // Resume every minute.
-  if (status === 429 && /daily|per day|requests per day|spend limit|spending limit|credit limit|prepay.*(?:empty|depleted)|limit(?:ed)?[^.]{0,30}\b0\b/.test(probe)) {
+  if (status === 429 && /daily|per day|requests per day|credit limit|prepay.*(?:empty|depleted)|limit(?:ed)?[^.]{0,30}\b0\b/.test(probe)) {
     return { code: "GOOGLE_QUOTA_EXHAUSTED", status, retryable: false, message: "Google временно остановил генерацию из-за квоты или лимита расходов текущего уровня. Готовые кадры сохранены; продолжите проект после восстановления лимита." };
   }
   if (status === 429) {
-    return { code: "GOOGLE_RATE_LIMIT", status, retryable: true, message: "Google временно ограничил частоту запросов. CineForge повторит только незавершённый кадр с увеличивающейся задержкой." };
+    return { code: "GOOGLE_RATE_LIMIT", status, retryable: true, retryAfterMs, message: "Google временно ограничил скорость или расходы в скользящем окне. CineForge сам продолжит с незавершённого кадра после безопасной паузы." };
   }
   // Do not classify every message containing the word "billing" as a payment
   // failure. Only explicit payment/prepay states qualify.
@@ -678,6 +682,15 @@ export function normalizeGoogleProviderError(error: unknown): { code: string; me
     return { code: "GOOGLE_SERVER_ERROR", status, retryable: true, message: "Видеосервис Google временно недоступен. CineForge повторит запрос с ограниченной автоматической задержкой." };
   }
   return { code: "GOOGLE_REQUEST_FAILED", status, retryable: isRetryableCode(status), message: rawMessage ? `Google не выполнил запрос: ${rawMessage.slice(0, 500)}` : "Google не выполнил запрос по неизвестной причине." };
+}
+
+export function parseGoogleRetryAfter(value: string | null, nowMs = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+  const dateMs = Date.parse(value);
+  if (!Number.isFinite(dateMs)) return undefined;
+  return Math.max(0, dateMs - nowMs);
 }
 
 function isRetryableCode(code: number | undefined): boolean {

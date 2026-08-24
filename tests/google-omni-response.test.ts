@@ -431,9 +431,9 @@ describe("Google Omni response parsing", () => {
       .toBe("GOOGLE_REQUEST_FAILED");
   });
 
-  it("classifies a billing-tier spend limit as quota before billing", () => {
+  it("classifies a billing-tier rolling spend window as a retryable rate limit", () => {
     expect(normalizeGoogleProviderError({ status: 429, message: "RESOURCE_EXHAUSTED: spend limit for billing tier 1" }).code)
-      .toBe("GOOGLE_QUOTA_EXHAUSTED");
+      .toBe("GOOGLE_RATE_LIMIT");
   });
   it("treats a generic RESOURCE_EXHAUSTED response as a retryable short rate window", () => {
     const normalized = normalizeGoogleProviderError({ status: 429, message: "RESOURCE_EXHAUSTED: requests per minute quota exceeded. Retry in 42 seconds." });

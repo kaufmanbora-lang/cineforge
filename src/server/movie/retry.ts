@@ -11,10 +11,10 @@ export function classifyFailure(error: unknown): FailureClass {
   // The fallback provider's explicit server status is authoritative. If an
   // earlier provider mentioned billing but Gemini returned 503, retry Gemini.
   if (status && status >= 500) return "server";
-  // HTTP 429 is a rate/quota signal even when Google mentions the account's
-  // billing tier in its explanatory metadata. It must never be converted into
-  // a false "payment inactive" pause.
-  if ((status === 429 || /google_quota_exhausted|insufficient_quota/.test(code)) && (/google_quota_exhausted|insufficient_quota/.test(code) || /daily|per day|requests per day|spend limit|spending limit|credit limit|prepay.*(?:empty|depleted)|no credits|credits? remaining.*\b0\b|limit(?:ed)?[^.]{0,30}\b0\b/.test(probe))) return "quota";
+  // Google's paid-tier spend limit is a rolling short window and must be
+  // retried like RPM, not mistaken for an exhausted balance. Only explicit
+  // daily/credit depletion signals require a manual quota pause.
+  if ((status === 429 || /google_quota_exhausted|insufficient_quota/.test(code)) && (/google_quota_exhausted|insufficient_quota/.test(code) || /daily|per day|requests per day|credit limit|prepay.*(?:empty|depleted)|no credits|credits? remaining.*\b0\b|limit(?:ed)?[^.]{0,30}\b0\b/.test(probe))) return "quota";
   if (status === 429 || /google_rate_limit|resource_exhausted|rate.?limit/.test(code)) return "rate-limit";
   if (/google_billing_not_ready|billing (?:account )?(?:is )?(?:inactive|required|disabled)|prepay (?:balance )?(?:is )?(?:depleted|empty)|payment required|credit balance (?:is )?(?:depleted|empty)|no credits|оплата (?:не активна|требуется)/.test(probe)) return "billing";
   if (status === 401 || /authentication|unauthenticated|api[_ -]?key.*invalid/.test(probe)) return "authentication";
@@ -40,4 +40,47 @@ export function retryDecision(input: { failure: FailureClass; attempt: number; m
   const exponential = (input.baseMs ?? 1_000) * 2 ** input.attempt;
   const deterministicJitter = Math.round(exponential * 0.15);
   return { retry: true, pauseProject: false, delayMs: Math.min(60_000, exponential + deterministicJitter) };
+}
+
+export function rateLimitRecoveryDecision(input: {
+  attempt: number;
+  maxAttempts: number;
+  cooldownCount?: number;
+  retryAfterMs?: number;
+  maxCooldowns?: number;
+}): {
+  retry: boolean;
+  pauseProject: boolean;
+  delayMs: number;
+  resetAttempts: boolean;
+  nextCooldownCount: number;
+} {
+  const cooldownCount = Math.max(0, Math.floor(input.cooldownCount ?? 0));
+  const providerDelay = Math.max(0, Math.floor(input.retryAfterMs ?? 0));
+  if (input.attempt < input.maxAttempts) {
+    const shortRetry = retryDecision({ failure: "rate-limit", attempt: input.attempt, maxAttempts: input.maxAttempts, baseMs: 15_000 });
+    return {
+      ...shortRetry,
+      delayMs: Math.max(shortRetry.delayMs, providerDelay),
+      resetAttempts: false,
+      nextCooldownCount: cooldownCount,
+    };
+  }
+
+  const maxCooldowns = Math.max(1, Math.floor(input.maxCooldowns ?? 4));
+  if (cooldownCount >= maxCooldowns) {
+    return { retry: false, pauseProject: true, delayMs: 0, resetAttempts: false, nextCooldownCount: cooldownCount };
+  }
+
+  // A short RPM/concurrency window can outlive the normal three job attempts.
+  // Start a new bounded attempt cycle after a durable cooldown instead of
+  // forcing the user to resume the whole project manually.
+  const cooldownMs = Math.min(8 * 60_000, 60_000 * 2 ** cooldownCount);
+  return {
+    retry: true,
+    pauseProject: false,
+    delayMs: Math.max(cooldownMs, providerDelay),
+    resetAttempts: true,
+    nextCooldownCount: cooldownCount + 1,
+  };
 }
