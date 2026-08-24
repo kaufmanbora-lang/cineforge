@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { zodTextFormat } from "openai/helpers/zod";
 import { buildContinuityState, validateContinuity } from "@/server/movie/continuity";
 import { MoviePlanStructuredOutputSchema, scopeMoviePlanIds, type MoviePlan } from "@/domain/movie";
+import { attachPrimaryCharacterReferences } from "@/server/movie/repository";
 import { character, location, scene, shot } from "./fixtures";
 
 describe("Project Memory and continuity", () => {
@@ -50,5 +51,18 @@ describe("Project Memory and continuity", () => {
     };
     visit(format.schema);
     expect(openObjects).toEqual([]);
+  });
+  it("locks uploaded visual references to the primary character and every shot containing them", () => {
+    const plan: MoviePlan = {
+      id: "plan-ref", projectId: "00000000-0000-0000-0000-000000000222",
+      summary: { title: "Reference", genre: "drama", style: "realistic", mood: "quiet", durationSeconds: 8, logline: "A test", synopsis: "A referenced character." },
+      characters: [character()], locations: [location()],
+      acts: [{ id: "act-1", number: 1, title: "One", purpose: "Set-up", startSceneNumber: 1, endSceneNumber: 1 }],
+      scenes: [scene()], createdAt: new Date(0).toISOString(),
+    };
+    const attached = attachPrimaryCharacterReferences(plan, ["00000000-0000-0000-0000-000000000999"]);
+    expect(attached.characters[0].referenceAssetIds).toContain("00000000-0000-0000-0000-000000000999");
+    expect(attached.characters[0].locks).toEqual({ appearance: true, voice: true, outfit: true });
+    expect(attached.scenes[0].shots[0].continuity.requiredReferences).toContain("00000000-0000-0000-0000-000000000999");
   });
 });

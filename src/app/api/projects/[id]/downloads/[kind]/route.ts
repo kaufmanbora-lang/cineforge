@@ -12,13 +12,27 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
     const plan = await latestMoviePlan(id);
     if (!plan) return NextResponse.json({ error: "No screenplay is available." }, { status: 404 });
     const safeTitle = plan.summary.title.replace(/[^a-z0-9-_]+/gi, "-").replace(/^-|-$/g, "") || "movie";
+    if (kind.startsWith("shot-")) {
+      const shotId = kind.slice("shot-".length);
+      if (!shotId) return NextResponse.json({ error: "Не указан кадр для скачивания." }, { status: 400 });
+      const rows = await query<{ storage_key: string; sequence: number }>(
+        `SELECT a.storage_key,s.sequence FROM generation_assets a
+         JOIN shot_versions sv ON sv.id=a.shot_version_id AND sv.active=true
+         JOIN shots s ON s.id=a.shot_id
+         WHERE a.project_id=$1 AND a.shot_id=$2 AND a.kind='video'
+         ORDER BY a.created_at DESC LIMIT 1`,
+        [id, shotId],
+      );
+      if (!rows[0]) return NextResponse.json({ error: "Готовое видео этого кадра не найдено." }, { status: 404 });
+      return NextResponse.redirect(await signedObjectUrl(rows[0].storage_key, 300, `${safeTitle}-shot-${rows[0].sequence}.mp4`));
+    }
     if (kind === "mp4" || kind === "mov") {
       const rows = await query<{ storage_key: string }>(
         "SELECT storage_key FROM exports WHERE project_id=$1 AND format=$2 AND state='completed' AND storage_key IS NOT NULL ORDER BY completed_at DESC LIMIT 1",
         [id, kind],
       );
       if (!rows[0]?.storage_key) return NextResponse.json({ error: `No completed ${kind.toUpperCase()} export is available.` }, { status: 404 });
-      return NextResponse.redirect(await signedObjectUrl(rows[0].storage_key, 300));
+      return NextResponse.redirect(await signedObjectUrl(rows[0].storage_key, 300, `${safeTitle}.${kind}`));
     }
     if (kind === "srt") {
       const entries: Array<{ start: number; end: number; text: string }> = [];

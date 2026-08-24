@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Aperture, Check, Clapperboard, Expand, Eye, Film, Gauge,
+  Aperture, Check, Clapperboard, Download, Expand, Eye, Film, Gauge,
   ImageIcon, Lightbulb, ListVideo, Lock, MessageSquareText, Music2, Play,
   Mic, Sparkles, Square, Subtitles, Volume2, Waves, X, Zap, ZoomIn, ZoomOut,
 } from "lucide-react";
@@ -41,11 +41,14 @@ export function StudioWorkspace() {
   const [accountModelIds, setAccountModelIds] = useState<Set<string> | null>(null);
   const [timelineZoom, setTimelineZoom] = useState(100);
   const [voiceState, setVoiceState] = useState<"recording" | "transcribing" | null>(null);
+  const [referenceFiles, setReferenceFiles] = useState<File[]>([]);
   const [etaClockMs, setEtaClockMs] = useState(0);
   const videoRef = useRef<HTMLVideoElement>(null);
   const autoContinueRef = useRef(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
+  const referenceInputRef = useRef<HTMLInputElement>(null);
   const microphoneStreamRef = useRef<MediaStream | null>(null);
+  const voiceTimeoutRef = useRef<number | null>(null);
   const projectLoadInFlightRef = useRef(false);
 
   const model = GOOGLE_VIDEO_MODELS[modelId];
@@ -149,10 +152,36 @@ export function StudioWorkspace() {
     void videoRef.current?.play().catch(() => setNotice("Следующий кадр выбран. Нажмите воспроизведение, если браузер заблокировал автозапуск."));
   }, [selectedPreview]);
 
+  useEffect(() => () => {
+    if (voiceTimeoutRef.current !== null) window.clearTimeout(voiceTimeoutRef.current);
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
+  }, []);
+
   function changeModel(nextId: string) { setModelId(nextId); setResolution((current) => normalizeResolution(nextId, current)); }
   function startNewProject() {
-    setProjectId(""); setDetail(null); setPreview({ clips: [], movieUrl: null }); setSelectedSceneId(""); setSelectedShotId(""); setPrompt(""); setBudgetOpen(false);
+    setProjectId(""); setDetail(null); setPreview({ clips: [], movieUrl: null }); setSelectedSceneId(""); setSelectedShotId(""); setPrompt(""); setReferenceFiles([]); setBudgetOpen(false);
     localStorage.removeItem("cineforge.projectId"); sessionStorage.removeItem("cineforge.preparedProject"); setNotice("Опишите идею нового фильма.");
+  }
+
+  function selectCharacterReferences(files: FileList | null) {
+    const accepted = [...(files ?? [])].filter((file) => ["image/jpeg","image/png","image/webp"].includes(file.type) && file.size <= 8 * 1024 * 1024).slice(0, 3);
+    setReferenceFiles(accepted);
+    setNotice(accepted.length
+      ? `Добавлено референсов персонажа: ${accepted.length}. Они будут закреплены в памяти проекта.`
+      : "Выберите JPEG, PNG или WebP до 8 МБ.");
+  }
+
+  async function uploadCharacterReferences(activeProjectId: string) {
+    for (const file of referenceFiles) {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      form.append("projectId", activeProjectId);
+      form.append("role", "subject");
+      const response = await fetch("/api/uploads/reference", { method: "POST", body: form, signal: AbortSignal.timeout(90_000) });
+      const payload = await response.json();
+      if (!response.ok || !payload.assetId) throw new Error(errorMessageRu(payload.error, `Не удалось загрузить референс ${file.name}.`));
+    }
   }
 
   function openProductionConfirmation() {
@@ -189,7 +218,9 @@ export function StudioWorkspace() {
     if (voiceState === "recording" && recorderRef.current) {
       setNotice("Распознаю запись и добавляю текст…");
       setVoiceState("transcribing");
-      recorderRef.current.stop();
+      if (voiceTimeoutRef.current !== null) window.clearTimeout(voiceTimeoutRef.current);
+      voiceTimeoutRef.current = null;
+      if (recorderRef.current.state !== "inactive") recorderRef.current.stop();
       return;
     }
     if (voiceState || plan) return;
@@ -202,19 +233,31 @@ export function StudioWorkspace() {
         video: false,
       });
       microphoneStreamRef.current = stream;
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
-      const recorder = new MediaRecorder(stream, { mimeType });
+      const requestedMimeType = chooseRecordingMimeType();
+      const recorder = requestedMimeType ? new MediaRecorder(stream, { mimeType: requestedMimeType }) : new MediaRecorder(stream);
+      const mimeType = recorder.mimeType || requestedMimeType || "audio/webm";
       const chunks: BlobPart[] = [];
       recorderRef.current = recorder;
       recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+      recorder.onerror = () => {
+        if (voiceTimeoutRef.current !== null) window.clearTimeout(voiceTimeoutRef.current);
+        voiceTimeoutRef.current = null;
+        microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
+        microphoneStreamRef.current = null;
+        recorderRef.current = null;
+        setVoiceState(null);
+        setNotice("Запись микрофона прервалась. Проверьте разрешение микрофона в браузере и повторите.");
+      };
       recorder.onstop = async () => {
+        if (voiceTimeoutRef.current !== null) window.clearTimeout(voiceTimeoutRef.current);
+        voiceTimeoutRef.current = null;
         microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
         microphoneStreamRef.current = null;
         try {
           const audio = new Blob(chunks, { type: mimeType });
-          if (audio.size < 500) throw new Error("Запись получилась пустой. Нажмите микрофон и произнесите описание фильма.");
+          if (audio.size < 64) throw new Error("Запись получилась пустой. Нажмите микрофон и произнесите описание фильма.");
           const form = new FormData();
-          form.append("audio", audio, "movie-description.webm");
+          form.append("audio", audio, `movie-description.${recordingExtension(mimeType)}`);
           const response = await fetch("/api/screenwriter/chat?transcribe=1", {
             method: "POST",
             body: form,
@@ -234,6 +277,13 @@ export function StudioWorkspace() {
         }
       };
       recorder.start(250);
+      voiceTimeoutRef.current = window.setTimeout(() => {
+        if (recorder.state === "recording") {
+          setVoiceState("transcribing");
+          setNotice("Максимальная запись завершена. Распознаю речь…");
+          recorder.stop();
+        }
+      }, 60_000);
       setVoiceState("recording");
       setNotice("Запись идёт. Говорите, затем ещё раз нажмите красный микрофон.");
     } catch (error) {
@@ -241,7 +291,7 @@ export function StudioWorkspace() {
       microphoneStreamRef.current = null;
       recorderRef.current = null;
       setVoiceState(null);
-      setNotice(errorMessageRu(error, "Не удалось включить микрофон. Разрешите доступ к нему и повторите."));
+      setNotice(microphoneErrorRu(error));
     }
   }
 
@@ -256,6 +306,10 @@ export function StudioWorkspace() {
         const createdPayload = await created.json(); if (!created.ok) throw new Error(errorMessageRu(createdPayload.error, "Не удалось создать проект."));
         activeProjectId = createdPayload.projectId as string; setProjectId(activeProjectId); localStorage.setItem("cineforge.projectId", activeProjectId);
         window.history.replaceState(null, "", `/create?project=${encodeURIComponent(activeProjectId)}`);
+      }
+      if (referenceFiles.length) {
+        setNotice(`Загружаю и закрепляю референсы персонажа: ${referenceFiles.length}…`);
+        await uploadCharacterReferences(activeProjectId);
       }
       const response = await fetch(`/api/projects/${activeProjectId}/plan`, {
         method: "POST",
@@ -304,6 +358,7 @@ export function StudioWorkspace() {
       <div className="section-title"><h1>{plan ? detail?.project.title : "Опишите ваш фильм"}</h1>{plan ? <Button onClick={startNewProject} variant="ghost">Новый проект</Button> : null}</div>
       {plan ? <div className="secure-note"><StatusDot tone="green"/>Структурированный план фильма сохранён. Точечно изменить сценарий можно через ИИ-сценариста.</div> : <Segmented value={mode} onChange={setMode} options={[{ value: "quick", label: "Быстро" }, { value: "advanced", label: "Расширенно" }]}/>}
       <div className="prompt-box"><textarea aria-label="Описание фильма" disabled={Boolean(plan)} maxLength={20_000} onChange={(event) => setPrompt(event.target.value)} placeholder="Опишите историю, персонажей, место действия и желаемое настроение…" value={prompt}/><button aria-label={voiceState === "recording" ? "Остановить запись голоса" : "Продиктовать описание фильма"} className={`voice-input ${voiceState ?? ""}`} disabled={Boolean(plan) || voiceState === "transcribing"} onClick={() => void toggleVoiceInput()} title={voiceState === "recording" ? "Остановить и распознать" : "Надиктовать описание"} type="button"><Mic size={16}/></button><span>{voiceState === "recording" ? "Идёт запись…" : voiceState === "transcribing" ? "Распознаю…" : `${prompt.length} / 20 000`}</span></div>
+      {!plan ? <div className="reference-upload-row"><input accept="image/jpeg,image/png,image/webp" aria-label="Выбрать референсы персонажа" hidden multiple onChange={(event) => selectCharacterReferences(event.target.files)} ref={referenceInputRef} type="file"/><Button onClick={() => referenceInputRef.current?.click()} variant="ghost"><ImageIcon size={14}/>Референс персонажа</Button><span>{referenceFiles.length ? referenceFiles.map((file) => file.name).join(" · ") : "До 3 изображений — лицо, костюм или персонаж"}</span>{referenceFiles.length ? <button aria-label="Удалить референсы" onClick={() => setReferenceFiles([])} type="button"><X size={13}/></button> : null}</div> : null}
       <div className="control-stack">
         <label><span><Aperture size={15}/>Продолжительность</span><select disabled={Boolean(plan)} onChange={(event) => { if (event.target.value === "custom") setCustomDuration(true); else { setCustomDuration(false); setDuration(Number(event.target.value)); } }} value={customDuration ? "custom" : duration}>{[10,30,60,180,300,600,900,1200,1800,2700,3600].map((seconds) => <option key={seconds} value={seconds}>{formatDuration(seconds)}</option>)}<option value="custom">Своя продолжительность…</option></select></label>
         {customDuration ? <label><span>Секунды</span><input aria-label="Продолжительность в секундах" max="3600" min="1" onChange={(event) => setDuration(Math.max(1, Math.min(3600, Number(event.target.value) || 1)))} type="number" value={duration}/></label> : null}
@@ -319,7 +374,7 @@ export function StudioWorkspace() {
 
     <section className="preview-panel" aria-label="Предпросмотр фильма">
       <div className="preview-frame">{selectedPreview ? <video controls key={`${selectedPreview.shot_id}:${selectedPreview.version}`} onEnded={continuePreview} ref={videoRef} src={selectedPreview.url}/> : <div className="preview-empty"><Film size={36}/><strong>{selectedScene ? "Кадр ещё не создан" : "Сцена не выбрана"}</strong><span>{selectedScene ? "Видео появится после успешной контрольной точки." : "Создайте план фильма, чтобы построить граф сцен."}</span></div>}{selectedScene ? <div className="preview-corner"><span>СЦЕНА {selectedScene.number}</span><strong>{selectedScene.title}</strong></div> : null}</div>
-      <div className="transport"><strong>{selectedScene ? formatTimecode(sceneStart(scenes, selectedScene.id)) : "00:00:00"}</strong><span className="fit-control">{selectedPreview ? `Кадр ${selectedPreview.shot_id} · v${selectedPreview.version}` : "Нет видео"}</span><div className="transport-center"><button aria-label="Предыдущая сцена" disabled={!selectedScene || scenes[0]?.id === selectedScene.id} onClick={() => selectRelative(-1)} type="button"><Play size={17} style={{ transform: "rotate(180deg)" }}/></button>{selectedPreview ? <button aria-label="Воспроизвести или приостановить" className="play-control" onClick={() => void togglePreview()} type="button"><Play size={21} fill="currentColor"/></button> : null}<button aria-label="Следующая сцена" disabled={!selectedScene || scenes.at(-1)?.id === selectedScene.id} onClick={() => selectRelative(1)} type="button"><Play size={17}/></button></div><div className="transport-actions">{selectedPreview ? <button aria-label="Полноэкранный режим" onClick={() => void openFullscreen()} type="button"><Expand size={17}/></button> : null}</div></div>
+      <div className="transport"><strong>{selectedScene ? formatTimecode(sceneStart(scenes, selectedScene.id)) : "00:00:00"}</strong><span className="fit-control">{selectedPreview ? `Кадр ${selectedPreview.shot_id} · v${selectedPreview.version}` : "Нет видео"}</span><div className="transport-center"><button aria-label="Предыдущая сцена" disabled={!selectedScene || scenes[0]?.id === selectedScene.id} onClick={() => selectRelative(-1)} type="button"><Play size={17} style={{ transform: "rotate(180deg)" }}/></button>{selectedPreview ? <button aria-label="Воспроизвести или приостановить" className="play-control" onClick={() => void togglePreview()} type="button"><Play size={21} fill="currentColor"/></button> : null}<button aria-label="Следующая сцена" disabled={!selectedScene || scenes.at(-1)?.id === selectedScene.id} onClick={() => selectRelative(1)} type="button"><Play size={17}/></button></div><div className="transport-actions">{selectedPreview && projectId ? <a aria-label="Скачать выбранный кадр" className="transport-download" href={`/api/projects/${projectId}/downloads/shot-${encodeURIComponent(selectedPreview.shot_id)}`}><Download size={15}/><span>Кадр</span></a> : null}{productionComplete && projectId && preview.movieUrl ? <a aria-label="Скачать весь фильм" className="transport-download primary" href={`/api/projects/${projectId}/downloads/mp4`}><Download size={15}/><span>Весь фильм</span></a> : null}{selectedPreview ? <button aria-label="Полноэкранный режим" onClick={() => void openFullscreen()} type="button"><Expand size={17}/></button> : null}</div></div>
       <div className="seek-line"><i style={{ width: `${progress}%` }}/><b style={{ left: `${progress}%` }}/></div>
     </section>
 
@@ -352,6 +407,22 @@ function resolutionOptionLabel(modelId: string, resolution: Resolution): string 
   if (resolution === "preview") return "Предпросмотр / черновик";
   const label = resolution === "4k" ? "4K" : resolution;
   return isNativeResolution(modelId, resolution) ? `${label} · нативно` : `${label} · мастеринг студии`;
+}
+function chooseRecordingMimeType(): string | undefined {
+  return ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"]
+    .find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+}
+function recordingExtension(mimeType: string): string {
+  if (mimeType.includes("mp4")) return "m4a";
+  if (mimeType.includes("ogg")) return "ogg";
+  return "webm";
+}
+function microphoneErrorRu(error: unknown): string {
+  const name = error instanceof DOMException ? error.name : "";
+  if (name === "NotAllowedError" || name === "SecurityError") return "Доступ к микрофону запрещён. Нажмите значок замка у адреса сайта, разрешите микрофон и повторите.";
+  if (name === "NotFoundError" || name === "DevicesNotFoundError") return "Микрофон не найден. Подключите микрофон и повторите.";
+  if (name === "NotReadableError" || name === "TrackStartError") return "Микрофон занят другой программой. Закройте её или выберите другой микрофон.";
+  return errorMessageRu(error, "Не удалось включить микрофон. Разрешите доступ к нему и повторите.");
 }
 function buildTracks(scenes: Scene[]): Track[] { const shotRows = scenes.flatMap((scene) => scene.shots.map((shot) => ({ scene, shot }))); return [
   { label: "Видео", icon: Film, tone: "video", clips: shotRows.map(({scene,shot}) => ({ id: `v:${shot.id}`, sceneId: scene.id, label: shot.title, duration: shot.durationSeconds })) },

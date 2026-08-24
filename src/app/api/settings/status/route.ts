@@ -29,6 +29,7 @@ export async function GET() {
       qcFlagThreshold: saved.qcFlagThreshold ?? env().QC_FLAG_THRESHOLD,
       automaticRetries: saved.automaticRetries ?? env().MAX_AUTO_RETRIES,
       workerConcurrency: saved.workerConcurrency ?? env().WORKER_CONCURRENCY,
+      physicalContinuityQc: saved.physicalContinuityQc ?? true,
     },
     storage: { bucket: env().S3_BUCKET, region: env().S3_REGION, endpoint: env().S3_PUBLIC_ENDPOINT ?? env().S3_ENDPOINT },
   });
@@ -39,6 +40,7 @@ const EngineBody = z.object({
   qcFlagThreshold: z.number().min(0).max(100),
   automaticRetries: z.number().int().min(0).max(5),
   workerConcurrency: z.number().int().min(1).max(16),
+  physicalContinuityQc: z.boolean(),
 }).refine((value) => value.qcRetryThreshold <= value.qcFlagThreshold, "Retry threshold must not exceed the flag threshold.");
 
 export async function PATCH(request: Request) {

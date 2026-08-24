@@ -236,9 +236,15 @@ export const ShotQcSchema = z.object({
   dialogueAccuracy: z.number().min(0).max(100),
   visualQuality: z.number().min(0).max(100),
   continuity: z.number().min(0).max(100),
+  physicalPlausibility: z.number().min(0).max(100),
+  objectPermanence: z.number().min(0).max(100),
+  boundaryIntegrity: z.number().min(0).max(100),
+  motionContinuity: z.number().min(0).max(100),
   promptCompliance: z.number().min(0).max(100),
   audioQuality: z.number().min(0).max(100),
   overall: z.number().min(0).max(100),
+  severePhysicalViolation: z.boolean(),
+  observedPhysicalViolations: z.array(z.string()),
   issues: z.array(z.string()),
   retryInstruction: z.string().nullable(),
 });
@@ -249,17 +255,23 @@ export async function evaluateShot(input: {
   expected: unknown;
   generatedMetadata: unknown;
   projectMemory: unknown;
-  previewImageDataUrl?: string;
+  previewImages?: Array<{ label: string; imageDataUrl: string }>;
 }): Promise<ShotQcReport> {
   const client = await openAIClient();
-  const { previewImageDataUrl, ...evidence } = input;
+  const { previewImages = [], ...evidence } = input;
   const response = await client.responses.parse({
     model: (await openAIModelRouting()).qc,
     reasoning: { effort: "low" },
-    instructions: "You are a film continuity QC system. Score only from supplied evidence. If evidence is unavailable, flag it instead of inventing observations. A retry instruction must target only the failing shot and preserve unaffected content.",
+    instructions: `You are a strict film continuity and physical-world QC system.
+The images are labelled and ordered chronologically: optional PREVIOUS_SHOT_FINAL, then CURRENT_START, CURRENT_MIDDLE and CURRENT_END. Compare the actual visual evidence across time, not just one composition.
+Mark severePhysicalViolation=true only when directly visible: an impossible displacement or teleport; a person/object passing through or intersecting a wall, closed door, vehicle or other solid body; a persistent object appearing/disappearing; an unexplained location replacement at a continuous boundary; or physically impossible anatomy/motion. Do not call a motivated camera move or an explicitly planned hard cut a severe violation.
+Score only from supplied evidence. If evidence is insufficient, add an issue but do not invent an observation. A retry instruction must repair only this shot, begin from the exact previous endpoint when supplied, and preserve every unaffected identity, voice, costume, object, location and timeline segment.`,
     input: [{ role: "user", content: [
       { type: "input_text" as const, text: JSON.stringify(evidence) },
-      ...(previewImageDataUrl ? [{ type: "input_image" as const, image_url: previewImageDataUrl, detail: "low" as const }] : []),
+      ...previewImages.flatMap((preview) => [
+        { type: "input_text" as const, text: `VISUAL EVIDENCE ${preview.label}` },
+        { type: "input_image" as const, image_url: preview.imageDataUrl, detail: "low" as const },
+      ]),
     ] }],
     text: { format: zodTextFormat(ShotQcSchema, "shot_qc") },
   });
@@ -319,9 +331,11 @@ Write every user-visible field in the language of the user's idea. If the langua
 The screenplay must have meaningful dramatic content for the full target runtime without repeated shots, artificial slow motion, filler, reused dialogue or padding.
 Every scene and shot requires stable IDs. Every shot must be short enough for the chosen Google video model (maximum 10 seconds).
 Build character, location, wardrobe, voice, audio and continuity state explicitly. Dialogue text is exact. Every audio context starts clean and forbids prior dialogue, prior music and prior sound effects unless the screenplay explicitly requests a continuous sound bridge.
-Link every chronologically adjacent shot with previousShotId and nextShotId. Add a matching scheduling dependency only when the boundary is visually continuous at the same location and story moment. A true cut to another place or time keeps chronological memory but may render independently. A continuous next shot must begin from the exact end state of the previous shot: character and vehicle positions, movement direction, wardrobe, props, injuries, weather, time, lighting, location layout and unfinished dialogue. An intentional jump in time or place must still preserve character, wardrobe, voice and locked identity state and must be described explicitly in continuity requirements.
+Link every chronologically adjacent shot with previousShotId and nextShotId. The default is one continuous boundary: add the previous shot as a scheduling dependency and begin from its exact final frame. Use a hard cut only when the story truly needs another place or time, and explicitly write the journey, elapsed time or editorial cut in the scene action and continuity requirements. Never invent a new location merely to vary a camera angle. A true cut keeps chronological memory but may render independently. A continuous next shot must begin from the exact end state of the previous shot: character and vehicle positions, movement direction, wardrobe, props, injuries, weather, time, lighting, location layout and unfinished dialogue.
 Write every character position as a topological blocking state, including inside/outside, side of wall or doorway, foreground/background, facing direction and intended travel path. A position may change only through a visible physically reachable path. For door actions, explicitly identify who is on each side, who can reach which handle and in which direction the hinged door moves. Never script an impossible side change, passage through solid geometry or unexplained teleport. Use natural eyelines toward scene partners, props or travel direction; nobody looks into the camera unless direct address is explicitly requested.
 Treat every recurring vehicle, prop and background object as persistent state in locationState.objectPositions. Record vehicle count, convoy order, model/color, lane or curb offset, heading, wheel orientation, speed and stopped/moving state. Never remove or reposition an object between adjacent shots unless the screenplay visibly shows its continuous movement or removal. For continuous action, preserve screen direction and the 180-degree camera axis; do not invent a reverse angle or camera reset that changes geography.
+When the user names a fictional screen character, never rely on the proper name alone. Translate the requested character into stable, concrete visual traits: adult apparent age, face shape without naming a real actor, hair, build, signature costume colors/materials, helmet or accessories, silhouette and voice manner. Lock face, outfit and voice by default. For example, Mysterio must retain the recognizable emerald segmented illusionist armor, deep purple cape with gold clasps, metallic bracers and opaque glowing glass fishbowl helmet/silhouette in every applicable shot; do not randomly change ethnicity or costume. If user reference images exist, treat them as the highest-priority visual identity evidence while still obeying provider policy.
+Dialogue continuity is semantic but audio is isolated per clip: record the exact completed/unfinished conversational turn in the shot state, start the next shot with the correct next speaker and response, and never repeat a line that already finished. A clean audio start means no leaked waveform from the prior generated clip; it does not reset the story conversation, established character voice or speaking manner.
 Locked values must never change without a direct user request. The total of shot durations should closely match the requested runtime.`;
 
 const SCREENWRITER_CHAT_INSTRUCTIONS = `You are CineForge AI Screenwriter. Help develop titles, concepts, characters, acts, scenes, dialogue and production-ready screenplays.

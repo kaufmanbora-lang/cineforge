@@ -4,6 +4,13 @@ import { contentHash } from "./content-hash";
 import { transaction, query } from "@/server/db";
 
 export async function persistMoviePlan(plan: MoviePlan): Promise<void> {
+  const projectReferences = await query<{ id: string }>(
+    `SELECT id::text FROM generation_assets
+     WHERE project_id=$1 AND kind='reference-image' AND COALESCE(metadata->>'role','subject')='subject'
+     ORDER BY created_at`,
+    [plan.projectId],
+  );
+  plan = attachPrimaryCharacterReferences(plan, projectReferences.map((row) => row.id));
   plan = scopeMoviePlanIds(plan);
   const hash = contentHash(plan);
   await transaction(async (client) => {
@@ -124,6 +131,38 @@ export async function persistMoviePlan(plan: MoviePlan): Promise<void> {
       [plan.projectId, counts.rows[0].completed, counts.rows[0].total],
     );
   });
+}
+
+export function attachPrimaryCharacterReferences(plan: MoviePlan, referenceAssetIds: string[]): MoviePlan {
+  const primaryCharacter = plan.characters[0];
+  const references = [...new Set(referenceAssetIds)];
+  if (!primaryCharacter || !references.length) return plan;
+  return {
+    ...plan,
+    characters: plan.characters.map((character, index) => index === 0 ? {
+      ...character,
+      referenceAssetIds: [...new Set([...character.referenceAssetIds, ...references])],
+      locks: { ...character.locks, appearance: true, outfit: true, voice: true },
+    } : character),
+    scenes: plan.scenes.map((scene) => ({
+      ...scene,
+      shots: scene.shots.map((shot) => scene.characterIds.includes(primaryCharacter.id) ? {
+        ...shot,
+        continuity: {
+          ...shot.continuity,
+          requiredReferences: [...new Set([...shot.continuity.requiredReferences, ...references])],
+          lockedValues: {
+            ...shot.continuity.lockedValues,
+            [`${primaryCharacter.id}.appearanceReferenceAssetIds`]: references,
+          },
+        },
+        generationPrompt: shot.generationPrompt ? {
+          ...shot.generationPrompt,
+          referenceAssetIds: [...new Set([...shot.generationPrompt.referenceAssetIds, ...references])],
+        } : shot.generationPrompt,
+      } : shot),
+    })),
+  };
 }
 
 async function persistScene(client: PoolClient, projectId: string, scene: Scene, planVersion: number, startSeconds: number): Promise<number> {

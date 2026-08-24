@@ -238,6 +238,45 @@ export async function extractRepresentativeFrame(video: Uint8Array): Promise<Uin
   }
 }
 
+export type ShotQcFrame = {
+  label: "CURRENT_START" | "CURRENT_MIDDLE" | "CURRENT_END";
+  bytes: Uint8Array;
+};
+
+/**
+ * A single thumbnail cannot reveal a teleport, a disappearing object or a
+ * person crossing solid geometry. Extract three ordered observations so the
+ * continuity director can judge motion through time, not merely composition.
+ */
+export async function extractShotQcFrames(video: Uint8Array): Promise<ShotQcFrame[]> {
+  const tempRoot = path.join(os.tmpdir(), `cineforge-qc-frames-${randomUUID()}`);
+  await mkdir(tempRoot, { recursive: true });
+  try {
+    const source = path.join(tempRoot, "source.mp4");
+    await writeFile(source, video);
+    const probe = await probeMedia(source);
+    const end = Math.max(0.02, probe.duration - 0.12);
+    const observations = [
+      { label: "CURRENT_START" as const, seconds: Math.min(end, 0.08) },
+      { label: "CURRENT_MIDDLE" as const, seconds: Math.min(end, Math.max(0.02, probe.duration / 2)) },
+      { label: "CURRENT_END" as const, seconds: end },
+    ];
+    const frames: ShotQcFrame[] = [];
+    for (const [index, observation] of observations.entries()) {
+      const output = path.join(tempRoot, `frame-${index}.jpg`);
+      await execFileAsync(env().FFMPEG_PATH, [
+        "-y", "-nostdin", "-threads", "1", "-filter_threads", "1",
+        "-ss", observation.seconds.toFixed(3), "-i", source, "-frames:v", "1",
+        "-vf", "scale=768:-2", "-q:v", "3", output,
+      ], { maxBuffer: 8 * 1024 * 1024 });
+      frames.push({ label: observation.label, bytes: new Uint8Array(await readFile(output)) });
+    }
+    return frames;
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
 export async function extractFinalFrame(video: Uint8Array): Promise<Uint8Array> {
   const tempRoot = path.join(os.tmpdir(), `cineforge-final-frame-${randomUUID()}`);
   await mkdir(tempRoot, { recursive: true });

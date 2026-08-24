@@ -12,7 +12,63 @@ export interface ShotIntent {
   visualStyle: string;
   characterDetails: string[];
   continuity: ContinuityState;
+  previousContinuity: ContinuityState | null;
+  continuousBoundary: boolean;
   audio: AudioContext;
+}
+
+export function physicalTransitionContract(input: {
+  action: string;
+  previous: ContinuityState | null;
+  current: ContinuityState;
+  continuousBoundary: boolean;
+}): string {
+  if (!input.previous || !input.continuousBoundary) {
+    return [
+      "PHYSICAL TRANSITION: this is an establishing shot or an intentional hard cut.",
+      `TARGET WORLD STATE: ${JSON.stringify(worldStateSummary(input.current))}.`,
+      "Do not invent motion before the visible shot begins. Establish every subject and solid boundary clearly before movement.",
+    ].join("\n");
+  }
+  const previousObjects = input.previous.locationState.objectPositions;
+  const currentObjects = input.current.locationState.objectPositions;
+  const persistentObjects = Object.fromEntries(Object.entries(previousObjects).map(([id, position]) => [id, currentObjects[id] ?? position]));
+  const changedCharacters = Object.entries(input.current.characterStates).flatMap(([id, state]) => {
+    const before = input.previous?.characterStates[id];
+    if (!before || before.position === state.position) return [];
+    return [{ id, from: before.position, to: state.position }];
+  });
+  const changedObjects = Object.entries(currentObjects).flatMap(([id, position]) => {
+    const before = previousObjects[id];
+    if (before === undefined || before === position) return [];
+    return [{ id, from: before, to: position }];
+  });
+  return [
+    "PHYSICAL TRANSITION CONTRACT — CONTINUOUS BOUNDARY, NO RESET:",
+    `START STATE (exact previous endpoint): ${JSON.stringify(worldStateSummary(input.previous))}.`,
+    `ALLOWED STORY ACTION: ${input.action}.`,
+    `DECLARED CHARACTER PATHS: ${JSON.stringify(changedCharacters)}.`,
+    `DECLARED OBJECT PATHS: ${JSON.stringify(changedObjects)}.`,
+    `PERSISTENT OBJECTS: ${JSON.stringify(persistentObjects)}.`,
+    `TARGET END STATE: ${JSON.stringify(worldStateSummary(input.current))}.`,
+    "Begin on the exact start state. Reach the target only through visible, continuous and physically reachable motion during this shot. If the available duration is insufficient, show less progress instead of teleporting.",
+    "Any person or object not listed in a declared path is stationary in world space. Camera movement never changes world-space position. Solid boundaries remain closed unless the action visibly opens them; a body crosses a doorway only after the opening is clear and along one continuous path.",
+  ].join("\n");
+}
+
+function worldStateSummary(continuity: ContinuityState) {
+  return {
+    locationId: continuity.locationId,
+    timeOfDay: continuity.locationState.timeOfDay,
+    weather: continuity.locationState.weather,
+    lighting: continuity.locationState.lighting,
+    characters: Object.fromEntries(Object.entries(continuity.characterStates).map(([id, state]) => [id, {
+      position: state.position,
+      wardrobeId: state.wardrobeId,
+      heldProps: state.heldProps,
+    }])),
+    objects: continuity.locationState.objectPositions,
+  };
 }
 
 export function realismProductionProfile(styleOrPrompt: string): string {
@@ -34,6 +90,7 @@ export class VeoPromptAdapter implements PromptAdapter<ShotIntent> {
       `SUBJECT: ${intent.subject}`,
       `ENVIRONMENT: ${intent.environment}`,
       `ACTION: ${intent.action}`,
+      physicalTransitionContract({ action: intent.action, previous: intent.previousContinuity, current: intent.continuity, continuousBoundary: intent.continuousBoundary }),
       `CHARACTER CONTINUITY: ${intent.characterDetails.join("; ")}`,
       `CAMERA: ${intent.camera.shotSize}, ${intent.camera.angle}, ${intent.camera.lens}; ${intent.camera.movement}; framing ${intent.camera.framing}.`,
       `LIGHTING / WEATHER: ${intent.lighting}; ${intent.weather}.`,
@@ -90,6 +147,7 @@ export class OmniPromptAdapter implements PromptAdapter<ShotIntent> {
         `Sound design: ${intent.audio.ambience.join(", ") || "clean ambience"}; ${intent.audio.soundEffects.join(", ") || "no extra effects"}; music ${intent.audio.musicCue ?? "none"}.`,
         `Clean audio start. ${negatives.join(". ")}.`,
         `Spatial blocking: ${JSON.stringify(Object.fromEntries(Object.entries(intent.continuity.characterStates).map(([id, state]) => [id, state.position])))}. Object layout: ${JSON.stringify(intent.continuity.locationState.objectPositions)}. Preserve the inside/outside side of every doorway and wall until the person visibly crosses the threshold along a continuous reachable path. Door panels and handles stay correctly hinged and oriented.`,
+        physicalTransitionContract({ action: intent.action, previous: intent.previousContinuity, current: intent.continuity, continuousBoundary: intent.continuousBoundary }),
         "Every visible vehicle and prop persists until its continuous departure or removal is shown. Preserve vehicle count, convoy order, model, color, lane, curb offset, heading, wheel orientation and stopped/moving state. Continue from the exact prior endpoint at a plausible speed; nothing pops, vanishes or jumps.",
         "For continuous action preserve the 180-degree action axis, screen direction and supplied final-frame composition before any motivated camera movement. No unplanned reverse angle, orbit or spatial reset.",
         "Natural eyelines only: look at scene partners, relevant props or travel direction, never into or acknowledge the camera unless direct address is explicitly scripted.",
@@ -111,6 +169,7 @@ export function promptAdapterFor(modelId: string): PromptAdapter<ShotIntent> {
 export function adaptMoviePlanPrompts(plan: MoviePlan, modelId: string): MoviePlan {
   plan = normalizeMoviePlanRuntime(plan, modelId);
   const adapter = promptAdapterFor(modelId);
+  const shotById = new Map(plan.scenes.flatMap((scene) => scene.shots.map((shot) => [shot.id, shot] as const)));
   return {
     ...plan,
     scenes: plan.scenes.map((scene) => {
@@ -134,6 +193,8 @@ export function adaptMoviePlanPrompts(plan: MoviePlan, modelId: string): MoviePl
               return `${character.name}: ${character.face}; ${character.hair}; ${character.build}; wardrobe ${wardrobe?.clothing.join(", ") ?? "scripted"}; voice ${character.voice.description}`;
             }),
             continuity: shot.continuity,
+            previousContinuity: shot.continuity.previousShotId ? shotById.get(shot.continuity.previousShotId)?.continuity ?? null : null,
+            continuousBoundary: Boolean(shot.continuity.previousShotId && shot.dependencies.includes(shot.continuity.previousShotId)),
             audio: shot.audioContext,
           };
           const adapted = adapter.build(intent);
@@ -221,21 +282,28 @@ export function normalizeMoviePlanRuntime(plan: MoviePlan, modelId: string): Mov
   const timeline = scenes.flatMap((scene) => scene.shots.map((shot) => ({ scene, shot })));
   const validIds = new Set(timeline.map(({ shot }) => shot.id));
   let timelineIndex = 0;
+  let normalizedPrevious: Shot | null = null;
   scenes = scenes.map((scene) => {
     const shots = scene.shots.map((shot) => {
       const previous = timeline[timelineIndex - 1];
       const next = timeline[timelineIndex + 1];
       const continuousBoundary = previous ? visuallyContinuousBoundary(previous.scene, scene) : false;
       timelineIndex += 1;
-      return {
+      const previousContinuity = continuousBoundary ? normalizedPrevious?.continuity ?? null : null;
+      const continuity = previousContinuity
+        ? carryPhysicalWorldForward(previousContinuity, shot.continuity, `${scene.action} ${shot.action} ${scene.continuityRequirements.join(" ")}`)
+        : shot.continuity;
+      const normalized = {
         ...shot,
         sequence: timelineIndex,
         dependencies: [...new Set([
           ...shot.dependencies.filter((id) => validIds.has(id) && id !== shot.id && (id !== previous?.shot.id || continuousBoundary)),
           ...(previous && continuousBoundary ? [previous.shot.id] : []),
         ])],
-        continuity: { ...shot.continuity, previousShotId: previous?.shot.id ?? null, nextShotId: next?.shot.id ?? null },
+        continuity: { ...continuity, previousShotId: previous?.shot.id ?? null, nextShotId: next?.shot.id ?? null },
       };
+      normalizedPrevious = normalized;
+      return normalized;
     });
     return { ...scene, shots, durationSeconds: shots.reduce((sum, shot) => sum + shot.durationSeconds, 0) };
   });
@@ -243,14 +311,58 @@ export function normalizeMoviePlanRuntime(plan: MoviePlan, modelId: string): Mov
   return { ...plan, summary: { ...plan.summary, durationSeconds: target }, scenes };
 }
 
+export function carryPhysicalWorldForward(previous: ContinuityState, current: ContinuityState, scriptedAction: string): ContinuityState {
+  const allowsWardrobeChange = /change(?:s|d)? clothes|wardrobe change|dress(?:es|ed)?|переод|смен(?:а|ил|ила|или) одеж/i.test(scriptedAction);
+  const allowsPropChange = /pick(?:s|ed)? up|put(?:s)? down|drop(?:s|ped)?|take(?:s|n)?|give(?:s|n)?|бер[её]т|взял|клад[её]т|роняет|переда[её]т/i.test(scriptedAction);
+  const allowsInjuryChange = /injur|wound|hurt|лечен|ранен|травм/i.test(scriptedAction);
+  const allowsObjectMovement = /move|drive|roll|walk|run|turn|stop|park|arriv|depart|enter|leave|open|close|движ|едет|поех|останав|парку|поворач|въезж|выезж|входит|выходит|откры|закры/i.test(scriptedAction);
+  const characterStates = Object.fromEntries(Object.entries(current.characterStates).map(([id, state]) => {
+    const before = previous.characterStates[id];
+    if (!before) return [id, state];
+    return [id, {
+      ...state,
+      locationId: previous.locationId,
+      wardrobeId: allowsWardrobeChange ? state.wardrobeId : before.wardrobeId,
+      heldProps: allowsPropChange ? state.heldProps : before.heldProps,
+      injuries: allowsInjuryChange ? state.injuries : before.injuries,
+      appearanceChanges: allowsWardrobeChange || allowsInjuryChange ? state.appearanceChanges : before.appearanceChanges,
+    }];
+  }));
+  return {
+    ...current,
+    locationId: previous.locationId,
+    characterStates,
+    locationState: {
+      timeOfDay: previous.locationState.timeOfDay,
+      weather: previous.locationState.weather,
+      lighting: previous.locationState.lighting,
+      objectPositions: {
+        ...current.locationState.objectPositions,
+        ...Object.fromEntries(Object.entries(previous.locationState.objectPositions).map(([id, position]) => [
+          id,
+          allowsObjectMovement ? current.locationState.objectPositions[id] ?? position : position,
+        ])),
+      },
+    },
+    requiredReferences: [...new Set([...previous.requiredReferences, ...current.requiredReferences])],
+    lockedValues: { ...previous.lockedValues, ...current.lockedValues },
+  };
+}
+
 function visuallyContinuousBoundary(previous: Scene, current: Scene): boolean {
   if (previous.id === current.id) return true;
   // The same physical location at the same story moment remains continuous
   // even when no actor appears in both shots: parked cars, doors, furniture and
   // background objects still must not jump or disappear.
-  return previous.locationId === current.locationId
+  if (previous.locationId === current.locationId
     && previous.timeOfDay === current.timeOfDay
-    && previous.weather === current.weather;
+    && previous.weather === current.weather) return true;
+  // A model occasionally invents a different place/time for the next scene.
+  // Treat adjacency as continuous unless the screenplay explicitly describes
+  // the journey, elapsed time or editorial cut that makes the change possible.
+  const transition = `${current.title} ${current.action} ${current.continuityRequirements.join(" ")}`;
+  const explicitCut = /hard cut|cut to|time jump|montage transition|later that|next (?:day|morning|night)|meanwhile|after (?:the )?journey|arrives? at|travels? to|смена локации|монтажный переход|склейка на|тем временем|через (?:несколько|час|минут|дн)|на следующий день|позже|после поездки|прибыва|приезжа|подъезжа|перемещается в/i.test(transition);
+  return !explicitCut;
 }
 
 function splitShotIntoBeats(shot: Shot, maxBeatSeconds: number): Shot[] {

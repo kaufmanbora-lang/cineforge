@@ -8,6 +8,7 @@ import { assertRateLimit } from "@/server/rate-limit";
 
 export const runtime = "nodejs";
 const ProjectId = z.string().uuid().optional();
+const ReferenceRole = z.enum(["subject", "style", "first-frame", "last-frame"]).default("subject");
 const allowed = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 export async function POST(request: Request) {
@@ -16,6 +17,7 @@ export async function POST(request: Request) {
     const body = await request.formData();
     const file = body.get("file");
     const projectId = ProjectId.parse(body.get("projectId") || undefined);
+    const role = ReferenceRole.parse(body.get("role") || "subject");
     if (!(file instanceof File)) return NextResponse.json({ error: "An image file is required." }, { status: 400 });
     if (!allowed.has(file.type)) return NextResponse.json({ error: "Only JPEG, PNG and WebP reference images are accepted." }, { status: 415 });
     if (file.size > 8 * 1024 * 1024) return NextResponse.json({ error: "Reference images are limited to 8 MB." }, { status: 413 });
@@ -42,7 +44,7 @@ export async function POST(request: Request) {
          ON CONFLICT (project_id,checksum,kind) DO UPDATE SET
            storage_key=EXCLUDED.storage_key,mime_type=EXCLUDED.mime_type,byte_size=EXCLUDED.byte_size,metadata=EXCLUDED.metadata
          RETURNING id`,
-        [projectId, storageKey, file.type, file.size, checksum, JSON.stringify({ originalName: file.name.slice(0, 180) })],
+        [projectId, storageKey, file.type, file.size, checksum, JSON.stringify({ originalName: file.name.slice(0, 180), role })],
       );
       assetId = rows[0].id;
     }

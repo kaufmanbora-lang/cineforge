@@ -12,7 +12,7 @@ import { enqueueAutomaticAssemblyIfReady, enqueueDialoguePatch, enqueueReadyProj
 import { getAllowedDurations, getVideoModel, type Resolution } from "@/domain/video-models";
 import { env } from "@/server/env";
 import { contentHash } from "@/server/movie/content-hash";
-import { extractFinalFrame, extractRepresentativeFrame, validateGeneratedShot } from "@/server/movie/ffmpeg";
+import { extractFinalFrame, extractShotQcFrames, validateGeneratedShot } from "@/server/movie/ffmpeg";
 import { evaluateShot, type ShotQcReport } from "@/server/providers/openai";
 import type { ReferenceImage } from "@/server/providers/video/types";
 import type { AudioContext, ContinuityState, Shot, ShotArtifact } from "@/domain/movie";
@@ -35,7 +35,7 @@ interface JobRow {
   shot_id: string;
   attempt: number;
   max_attempts: number;
-  payload: { providerModelId?: string; omitProviderReferences?: boolean; editCommand?: string; shot: Shot; specHash: string };
+  payload: { providerModelId?: string; omitProviderReferences?: boolean; omitSubjectReferences?: boolean; editCommand?: string; shot: Shot; specHash: string };
   model_id: string;
   resolution: Resolution;
   aspect_ratio: "16:9" | "9:16";
@@ -93,6 +93,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   heartbeat.unref();
   let temporaryProviderFilePath: string | undefined;
   let releaseOmniProviderSlot: (() => void) | undefined;
+  let previousBoundaryFrame: Uint8Array | undefined;
   try {
   await query("UPDATE projects SET status='generating',updated_at=now() WHERE id=$1 AND status NOT IN ('completed','cancelled')", [job.project_id]);
   let cached = await findCachedShot(job.project_id, job.shot_id, job.payload.specHash);
@@ -171,7 +172,11 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       const apiKey = await getProviderKey("google");
       if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
       providerApiKey = apiKey;
-      const references = job.payload.omitProviderReferences ? [] : await loadShotReferences(job, effectiveModelId);
+      const references = job.payload.omitProviderReferences
+        ? []
+        : await loadShotReferences(job, effectiveModelId, { omitSubjectReferences: job.payload.omitSubjectReferences });
+      const boundaryReference = references.find((reference) => reference.role === "first-frame");
+      previousBoundaryFrame = boundaryReference ? new Uint8Array(Buffer.from(boundaryReference.data, "base64")) : undefined;
       // Google only accepts previous_interaction_id for a conversational edit.
       // A normal reference-to-video generation must continue from the extracted
       // final frame without attaching the interaction id (otherwise HTTP 400).
@@ -274,15 +279,18 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       throw error;
     }
     await query("UPDATE jobs SET state='validating' WHERE id=$1", [job.id]).catch(() => undefined);
-    // Fast Draft is the interactive path: publish the provider result immediately.
-    // Expensive vision QC remains enabled for Final; deterministic dialogue voices
-    // are kept in both tiers so a character cannot change voice between shots.
-    const qc = job.render_tier === "draft"
-      ? null
-      : await runShotQc(job, validationObject.bytes, validationObject.contentType, operation.operationId);
     const engineSettings = await movieEngineSettings(job.project_id);
-    if (qc && qc.overall < engineSettings.qcRetryThreshold && job.attempt < job.max_attempts) {
-      const retryPrompt = `${prompt.prompt}\nQC CORRECTION FOR THIS SHOT ONLY: ${qc.retryInstruction ?? qc.issues.join("; ")}. Preserve all unaffected details and locked values.`;
+    // Final renders receive complete artistic QC. Drafts still receive the
+    // cheaper but essential multi-frame physical-continuity gate so a fast
+    // preview cannot silently accept teleports or a changed location.
+    const qc = job.render_tier === "final" || engineSettings.physicalContinuityQc
+      ? await runShotQc(job, validationObject.bytes, validationObject.contentType, operation.operationId, previousBoundaryFrame)
+      : null;
+    const physicalScore = qc ? Math.min(qc.physicalPlausibility, qc.objectPermanence, qc.boundaryIntegrity, qc.motionContinuity) : 100;
+    const needsPhysicalRetry = Boolean(qc?.severePhysicalViolation) && physicalScore < engineSettings.qcRetryThreshold;
+    const needsFinalRetry = job.render_tier === "final" && (qc?.overall ?? 100) < engineSettings.qcRetryThreshold;
+    if (qc && (needsPhysicalRetry || needsFinalRetry) && job.attempt < job.max_attempts) {
+      const retryPrompt = `${prompt.prompt}\nPHYSICAL CONTINUITY CORRECTION FOR THIS SHOT ONLY: ${qc.retryInstruction ?? [...qc.observedPhysicalViolations, ...qc.issues].join("; ")}. Begin at the exact previous-shot endpoint. Keep the same location topology, camera axis, people, faces, wardrobe, voices, vehicles and persistent objects. Every change must follow a visible physically reachable path. Preserve all unaffected details and locked values.`;
       const nextPayload = {
         ...job.payload,
         shot: { ...job.payload.shot, generationPrompt: { ...prompt, prompt: retryPrompt } },
@@ -416,7 +424,7 @@ export function omniNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pa
   if (!generationPrompt) return { ...payload, providerModelId: "gemini-omni-flash-preview" };
   const alreadyClean = generationPrompt.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")
     && !containsLegacySensitiveTerms(`${generationPrompt.prompt} ${generationPrompt.negativeDirectives.join(" ")}`);
-  if (alreadyClean) return { ...payload, omitProviderReferences: true };
+  if (alreadyClean) return { ...payload, omitProviderReferences: false, omitSubjectReferences: true };
   const seconds = payload.shot.durationSeconds;
   const action = neutralizeSensitiveStoryTerms(`${payload.shot.title}. ${payload.shot.action}`);
   const camera = payload.shot.camera;
@@ -426,7 +434,7 @@ export function omniNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pa
     prompt,
     negativeDirectives: ["cartoon look", "camera eye contact", "teleportation", "geometry intersection", "readable text"],
   } };
-  return { ...payload, providerModelId: "gemini-omni-flash-preview", omitProviderReferences: true, shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview", neutralRescue: 1 }) };
+  return { ...payload, providerModelId: "gemini-omni-flash-preview", omitProviderReferences: false, omitSubjectReferences: true, shot, specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview", neutralRescue: 1 }) };
 }
 
 export function shouldRestoreLegacyBillingFallback(job: Pick<JobRow, "payload">): boolean {
@@ -448,7 +456,7 @@ export function restoreOmniAfterLegacyBillingFallbackPayload(payload: JobRow["pa
 function neutralizeSensitiveStoryTerms(value: string): string {
   return value
     .replace(/Ник(?:о)?\s+Фьюри/giu, "the established adult team leader")
-    .replace(/Мистерио/giu, "the established adult man in a green and burgundy theatrical outfit")
+    .replace(/Mysterio|Мистерио/giu, "the established adult illusionist in emerald segmented armor, a deep purple cape with gold clasps, metallic bracers and an opaque glowing glass fishbowl helmet; preserve this exact costume and silhouette")
     .replace(/Marvel|Человек(?:а)?[- ]паука/giu, "the original fictional production")
     .replace(/автомат(?:ами|а|ы|ов)?|винтовк(?:ами|а|и|у)?|оружи(?:е|я|ем)/giu, "secured professional equipment")
     .replace(/задерж(?:ать|ивает|ивают|ание|ан|ана)|арест(?:овать|овывает|овывают|ован)?|наручник(?:и|ами|ов)?/giu, "calm voluntary handover")
@@ -456,7 +464,7 @@ function neutralizeSensitiveStoryTerms(value: string): string {
 }
 
 export function veoNeutralRescuePayload(payload: JobRow["payload"]): JobRow["payload"] {
-  if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE")) return { ...payload, omitProviderReferences: true };
+  if (payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO NEUTRAL RESCUE")) return { ...payload, omitProviderReferences: false, omitSubjectReferences: true };
   const generationPrompt = payload.shot.generationPrompt;
   if (!generationPrompt) return { ...payload, providerModelId: "veo-3.1-fast-generate-preview" };
   const seconds = payload.shot.durationSeconds;
@@ -466,16 +474,16 @@ export function veoNeutralRescuePayload(payload: JobRow["payload"]): JobRow["pay
     prompt,
     negativeDirectives: [...generationPrompt.negativeDirectives, "violence", "dangerous driving", "logos", "public figures"],
   } };
-  return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", omitProviderReferences: true, shot, specHash: contentHash({ shot, providerModelId: "veo-3.1-fast-generate-preview", neutralRescue: 1 }) };
+  return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", omitProviderReferences: false, omitSubjectReferences: true, shot, specHash: contentHash({ shot, providerModelId: "veo-3.1-fast-generate-preview", neutralRescue: 1 }) };
 }
 
 export function veoSafeBridgePayload(payload: JobRow["payload"]): JobRow["payload"] {
   const generationPrompt = payload.shot.generationPrompt;
-  if (!generationPrompt) return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", omitProviderReferences: true };
+  if (!generationPrompt) return { ...payload, providerModelId: "veo-3.1-fast-generate-preview", omitProviderReferences: false, omitSubjectReferences: true };
   const alreadyClean = generationPrompt.prompt.includes("CINEFORGE VEO SAFE BRIDGE")
     && generationPrompt.prompt.includes("SAFE FICTIONAL PRODUCTION FRAME")
     && !containsLegacySensitiveTerms(`${generationPrompt.prompt} ${generationPrompt.negativeDirectives.join(" ")}`);
-  if (alreadyClean) return { ...payload, omitProviderReferences: true };
+  if (alreadyClean) return { ...payload, omitProviderReferences: false, omitSubjectReferences: true };
   const prompt = "Create one continuous photorealistic live-action continuity bridge at the same established location and time of day. Hold on stable architectural details, the doorway, furniture and persistent vehicles or props already established by the story. Nearby adult characters continue ordinary calm movement naturally through the space with relaxed body language and natural eyelines. Preserve solid geometry, realistic door hinges, object permanence, camera axis and screen direction. Clean ambient sound begins at zero and ends inside this clip. Plain surfaces contain no readable text. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE VEO SAFE BRIDGE.";
   const shot = { ...payload.shot, generationPrompt: {
     ...generationPrompt,
@@ -485,7 +493,8 @@ export function veoSafeBridgePayload(payload: JobRow["payload"]): JobRow["payloa
   return {
     ...payload,
     providerModelId: "veo-3.1-fast-generate-preview",
-    omitProviderReferences: true,
+    omitProviderReferences: false,
+    omitSubjectReferences: true,
     shot,
     specHash: contentHash({ shot, providerModelId: "veo-3.1-fast-generate-preview", safeBridge: 1 }),
   };
@@ -519,7 +528,7 @@ function shouldRefreshVeoSafeBridge(job: JobRow): boolean {
 }
 
 function containsLegacySensitiveTerms(value: string): boolean {
-  return /weapon|restraint|threat|agency|violence|оруж|наручник|задерж|угроз/i.test(value);
+  return /weapon|restraint|threat|agency|violence|оруж|наручник|задерж|угроз|adult man in a green and burgundy theatrical outfit|established adult performer/i.test(value);
 }
 
 export function providerDurationSeconds(modelId: string, resolution: Resolution, plannedSeconds: number, usesReferenceImages = false): number {
@@ -610,15 +619,15 @@ export function neutralRescueAudioContext(audio: AudioContext | undefined): Audi
 
 export function neutralRescueContinuity(continuity: ContinuityState): ContinuityState {
   const characterStates = Object.fromEntries(Object.values(continuity.characterStates).map((state, index) => [
-    `adult-${index + 1}`,
+    `established-adult-${index + 1}`,
     {
-      locationId: "established-location",
-      wardrobeId: `established-outfit-${index + 1}`,
-      heldProps: [],
-      injuries: [],
-      appearanceChanges: [],
+      locationId: continuity.locationId,
+      wardrobeId: state.wardrobeId,
+      heldProps: state.heldProps.map(sanitizeNeutralRescueText),
+      injuries: state.injuries.map(sanitizeNeutralRescueText),
+      appearanceChanges: state.appearanceChanges.map(sanitizeNeutralRescueText),
       position: sanitizeNeutralRescueText(state.position),
-      emotionalState: "calm",
+      emotionalState: sanitizeNeutralRescueText(state.emotionalState),
     },
   ]));
   const objectPositions = Object.fromEntries(Object.values(continuity.locationState.objectPositions).map((position, index) => [
@@ -627,23 +636,26 @@ export function neutralRescueContinuity(continuity: ContinuityState): Continuity
   ]));
   return {
     characterStates,
-    locationId: "established-location",
+    locationId: continuity.locationId,
     locationState: {
       timeOfDay: sanitizeNeutralRescueText(continuity.locationState.timeOfDay),
       weather: sanitizeNeutralRescueText(continuity.locationState.weather),
       lighting: sanitizeNeutralRescueText(continuity.locationState.lighting),
       objectPositions,
     },
-    previousShotId: null,
-    nextShotId: null,
-    requiredReferences: [],
-    lockedValues: {},
+    previousShotId: continuity.previousShotId,
+    nextShotId: continuity.nextShotId,
+    requiredReferences: continuity.requiredReferences,
+    lockedValues: Object.fromEntries(Object.values(continuity.lockedValues).map((value, index) => [
+      `locked-value-${index + 1}`,
+      typeof value === "string" ? sanitizeNeutralRescueText(value) : value,
+    ])),
   };
 }
 
 function sanitizeNeutralRescueText(value: string): string {
   return neutralizeSensitiveStoryTerms(value)
-    .replace(/Nick Fury|Niko Fury|Ник(?:о)? Фьюри|Mysterio|Мистерио|Marvel|Spider-?Man|Человек(?:а)?[- ]паука/giu, "established adult performer")
+    .replace(/Nick Fury|Niko Fury|Ник(?:о)? Фьюри|Marvel|Spider-?Man|Человек(?:а)?[- ]паука/giu, "established adult performer")
     .replace(/Cadillac/giu, "black civilian vehicle")
     .replace(/gun|rifle|firearm|weapon|ammo|handcuff|restraint|threat|assault|arrest|detain/giu, "ordinary production prop")
     .replace(/пистолет\w*|автомат\w*|винтовк\w*|оружи\w*|наручник\w*|угроз\w*|штурм\w*|арест\w*|задерж\w*/giu, "обычный реквизит");
@@ -703,7 +715,7 @@ async function withDurableDatabaseRetry<T>(operation: () => Promise<T>): Promise
   }
 }
 
-async function loadShotReferences(job: JobRow, modelId: string): Promise<ReferenceImage[]> {
+async function loadShotReferences(job: JobRow, modelId: string, options: { omitSubjectReferences?: boolean } = {}): Promise<ReferenceImage[]> {
   const capabilities = getVideoModel(modelId);
   const references: ReferenceImage[] = [];
   const dependencyId = job.payload.shot.continuity && "previousShotId" in job.payload.shot.continuity
@@ -713,18 +725,12 @@ async function loadShotReferences(job: JobRow, modelId: string): Promise<Referen
   // reference only when the scheduler declared a continuous dependency; a hard
   // cut to another place/time must never inherit the previous composition.
   if (dependencyId && job.payload.shot.dependencies.includes(dependencyId) && capabilities.firstFrame) {
-    const previous = await query<{ storage_key: string }>(
-      `SELECT a.storage_key FROM generation_assets a JOIN shot_versions sv ON sv.id=a.shot_version_id AND sv.active=true
-       WHERE a.project_id=$1 AND a.shot_id=$2 AND a.kind='video' ORDER BY a.created_at DESC LIMIT 1`,
-      [job.project_id, dependencyId],
-    );
-    if (previous[0]) {
-      const response = await fetch(await signedObjectUrl(previous[0].storage_key), { signal: AbortSignal.timeout(120_000) });
-      if (!response.ok) throw new Error(`Unable to load previous-shot reference: ${response.status}`);
-      const frame = await extractFinalFrame(new Uint8Array(await response.arrayBuffer()));
+    const frame = await loadPreviousShotFinalFrame(job.project_id, dependencyId);
+    if (frame) {
       references.push({ id: `${dependencyId}:final-frame`, data: Buffer.from(frame).toString("base64"), mimeType: "image/jpeg", role: "first-frame" });
     }
   }
+  if (options.omitSubjectReferences) return references;
   const requiredIds = job.payload.shot.continuity.requiredReferences.slice(0, Math.max(0, capabilities.referenceImages - references.length));
   if (requiredIds.length) {
     const assets = await query<{ id: string; storage_key: string; mime_type: string; metadata: { role?: ReferenceImage["role"] } }>(
@@ -740,18 +746,45 @@ async function loadShotReferences(job: JobRow, modelId: string): Promise<Referen
   return references;
 }
 
+async function loadPreviousShotFinalFrame(projectId: string, shotId: string): Promise<Uint8Array | undefined> {
+  const previous = await query<{ storage_key: string }>(
+    `SELECT a.storage_key FROM generation_assets a JOIN shot_versions sv ON sv.id=a.shot_version_id AND sv.active=true
+     WHERE a.project_id=$1 AND a.shot_id=$2 AND a.kind='video' ORDER BY a.created_at DESC LIMIT 1`,
+    [projectId, shotId],
+  );
+  if (!previous[0]) return undefined;
+  const response = await fetch(await signedObjectUrl(previous[0].storage_key), { signal: AbortSignal.timeout(120_000) });
+  if (!response.ok) throw new Error(`Unable to load previous-shot reference: ${response.status}`);
+  return extractFinalFrame(new Uint8Array(await response.arrayBuffer()));
+}
+
 async function loadCurrentInteractionId(job: JobRow): Promise<string | undefined> {
   return job.shot_last_operation?.output?.interactionId;
 }
 
-async function runShotQc(job: JobRow, bytes: Uint8Array, mimeType: string, operationId: string): Promise<ShotQcReport | null> {
+async function runShotQc(job: JobRow, bytes: Uint8Array, mimeType: string, operationId: string, previousBoundaryFrame?: Uint8Array): Promise<ShotQcReport | null> {
   try {
-    const frame = await extractRepresentativeFrame(bytes);
+    const dependencyId = job.payload.shot.continuity.previousShotId;
+    const expectedContinuousBoundary = Boolean(dependencyId && job.payload.shot.dependencies.includes(dependencyId));
+    const previous = previousBoundaryFrame ?? (expectedContinuousBoundary && dependencyId
+      ? await loadPreviousShotFinalFrame(job.project_id, dependencyId)
+      : undefined);
+    const frames = await extractShotQcFrames(bytes);
+    const previewImages = [
+      ...(previous ? [{ label: "PREVIOUS_SHOT_FINAL", imageDataUrl: `data:image/jpeg;base64,${Buffer.from(previous).toString("base64")}` }] : []),
+      ...frames.map((frame) => ({ label: frame.label, imageDataUrl: `data:image/jpeg;base64,${Buffer.from(frame.bytes).toString("base64")}` })),
+    ];
     return await evaluateShot({
       expected: job.payload.shot,
-      generatedMetadata: { operationId, mimeType, byteSize: bytes.byteLength, evidence: "representative frame at approximately one second" },
+      generatedMetadata: {
+        operationId,
+        mimeType,
+        byteSize: bytes.byteLength,
+        expectedContinuousBoundary,
+        evidence: previewImages.map((image) => image.label),
+      },
       projectMemory: job.payload.shot.continuity,
-      previewImageDataUrl: `data:image/jpeg;base64,${Buffer.from(frame).toString("base64")}`,
+      previewImages,
     });
   } catch {
     // Generation remains usable if the independent QC provider is temporarily unavailable.
@@ -805,14 +838,15 @@ async function persistCompletedAsset(job: JobRow, storageKey: string, checksum: 
   });
 }
 
-async function movieEngineSettings(projectId: string): Promise<{ qcRetryThreshold: number; qcFlagThreshold: number }> {
-  const rows = await query<{ settings: { qcRetryThreshold?: number; qcFlagThreshold?: number } }>(
+async function movieEngineSettings(projectId: string): Promise<{ qcRetryThreshold: number; qcFlagThreshold: number; physicalContinuityQc: boolean }> {
+  const rows = await query<{ settings: { qcRetryThreshold?: number; qcFlagThreshold?: number; physicalContinuityQc?: boolean } }>(
     "SELECT ws.settings FROM workspace_settings ws JOIN projects p ON p.workspace_id=ws.workspace_id WHERE p.id=$1",
     [projectId],
   ).catch(() => []);
   return {
     qcRetryThreshold: Number(rows[0]?.settings.qcRetryThreshold ?? env().QC_RETRY_THRESHOLD),
     qcFlagThreshold: Number(rows[0]?.settings.qcFlagThreshold ?? env().QC_FLAG_THRESHOLD),
+    physicalContinuityQc: rows[0]?.settings.physicalContinuityQc ?? true,
   };
 }
 

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { createGoogleOmniInteraction, extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniInteractionRequest, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
 import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
-import { normalizeMoviePlanRuntime, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
+import { carryPhysicalWorldForward, normalizeMoviePlanRuntime, physicalTransitionContract, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import type { MoviePlan } from "@/domain/movie";
 import { character, location, scene, shot } from "./fixtures";
 
@@ -276,7 +276,8 @@ describe("Google Omni response parsing", () => {
     expect(rescued.providerModelId).toBe("gemini-omni-flash-preview");
     expect(rescued.shot.generationPrompt?.prompt).toContain("CINEFORGE OMNI NEUTRAL RESCUE");
     expect(rescued.shot.generationPrompt?.prompt).not.toMatch(/ФБР|наручник|задерж|оруж|weapon|restraint|threat|agency/i);
-    expect(rescued.omitProviderReferences).toBe(true);
+    expect(rescued.omitProviderReferences).toBe(false);
+    expect(rescued.omitSubjectReferences).toBe(true);
     expect(providerAudioContext(rescued.shot.generationPrompt!.prompt, audio)?.dialogue).toEqual([]);
     expect(audio.dialogue[0].text).toBe("ФБР! Руки вверх!");
     expect(omniNeutralRescuePayload(rescued)).toEqual(rescued);
@@ -303,15 +304,17 @@ describe("Google Omni response parsing", () => {
     expect(rescued.providerModelId).toBe("veo-3.1-fast-generate-preview");
     expect(rescued.specHash).not.toBe(omni.specHash);
     expect(rescued.shot.generationPrompt?.prompt).toContain("CINEFORGE VEO NEUTRAL RESCUE");
-    expect(rescued.omitProviderReferences).toBe(true);
+    expect(rescued.omitProviderReferences).toBe(false);
+    expect(rescued.omitSubjectReferences).toBe(true);
     expect(veoNeutralRescuePayload(rescued)).toEqual(rescued);
   });
 
-  it("uses a reference-free Veo bridge after a filtered neutral Omni frame", () => {
+  it("keeps the previous boundary frame while omitting subject references in a Veo bridge", () => {
     const neutral = omniNeutralRescuePayload({ shot: { ...shot("shot-safe-bridge"), generationPrompt: shot("shot-safe-bridge").generationPrompt! }, specHash: "original" });
     const bridge = veoSafeBridgePayload(neutral);
     expect(bridge.providerModelId).toBe("veo-3.1-fast-generate-preview");
-    expect(bridge.omitProviderReferences).toBe(true);
+    expect(bridge.omitProviderReferences).toBe(false);
+    expect(bridge.omitSubjectReferences).toBe(true);
     expect(bridge.shot.generationPrompt?.prompt).toContain("CINEFORGE VEO SAFE BRIDGE");
     expect(providerAudioContext(bridge.shot.generationPrompt!.prompt, neutral.shot.audioContext)?.dialogue).toEqual([]);
     expect(veoSafeBridgePayload(bridge)).toEqual(bridge);
@@ -343,8 +346,8 @@ describe("Google Omni response parsing", () => {
       dialogue: [{ id: "d1", characterId: "Nick Fury", characterName: "Nick Fury", text: "Вы арестованы", delivery: "firm", startSeconds: 0, durationSeconds: 1 }],
     });
     expect(JSON.stringify(safeContinuity)).not.toMatch(/Nick Fury|Mysterio|Marvel|Cadillac|rifle|weapon|arrest/i);
-    expect(safeContinuity.requiredReferences).toEqual([]);
-    expect(safeContinuity.lockedValues).toEqual({});
+    expect(safeContinuity.requiredReferences).toEqual(["ref-face", "ref-street"]);
+    expect(Object.values(safeContinuity.lockedValues)).toContain("the original fictional production likeness");
     expect(safeAudio?.dialogue).toEqual([]);
     expect(safeAudio?.soundEffects).toEqual([]);
   });
@@ -489,7 +492,7 @@ describe("Google Omni response parsing", () => {
       },
     };
     const firstScene = scene([firstShot]);
-    const secondScene = { ...scene([secondShot]), id: "scene-2", number: 2, locationId: "location-office", timeOfDay: "day", weather: "clear" };
+    const secondScene = { ...scene([secondShot]), id: "scene-2", number: 2, title: "Hard cut to office", action: "Hard cut to the office after the journey.", continuityRequirements: ["Intentional location and time jump."], locationId: "location-office", timeOfDay: "day", weather: "clear" };
     const plan: MoviePlan = {
       id: "plan-cut", projectId: "project-cut", createdAt: new Date(0).toISOString(),
       summary: { title: "Cut", genre: "Drama", style: "realistic", mood: "calm", durationSeconds: 10, logline: "Cut", synopsis: "Cut" },
@@ -500,5 +503,56 @@ describe("Google Omni response parsing", () => {
     const shots = normalized.scenes.flatMap((item) => item.shots);
     expect(shots[1].continuity.previousShotId).toBe(shots[0].id);
     expect(shots[1].dependencies).not.toContain(shots[0].id);
+  });
+
+  it("rejects an unexplained location reset and carries the physical world into the next shot", () => {
+    const firstShot = shot("shot-1");
+    const driftedShot = {
+      ...shot("shot-2"),
+      sceneId: "scene-2",
+      continuity: {
+        ...shot("shot-2").continuity,
+        locationId: "location-airport",
+        locationState: { timeOfDay: "day", weather: "clear", lighting: "airport fluorescent", objectPositions: {} },
+      },
+    };
+    const plan: MoviePlan = {
+      id: "plan-drift", projectId: "project-drift", createdAt: new Date(0).toISOString(),
+      summary: { title: "Drift", genre: "Drama", style: "realistic", mood: "calm", durationSeconds: 16, logline: "Drift", synopsis: "Drift" },
+      characters: [character()], locations: [location(), location({ id: "location-airport", name: "Airport" })],
+      acts: [{ id: "act-1", number: 1, title: "Act", purpose: "Test", startSceneNumber: 1, endSceneNumber: 2 }],
+      scenes: [scene([firstShot]), { ...scene([driftedShot]), id: "scene-2", number: 2, locationId: "location-airport", timeOfDay: "day", weather: "clear", title: "Another angle", action: "The conversation continues from the same instant." }],
+    };
+    const shots = normalizeMoviePlanRuntime(plan, "gemini-omni-flash-preview").scenes.flatMap((item) => item.shots);
+    expect(shots[1].dependencies).toContain(shots[0].id);
+    expect(shots[1].continuity.locationId).toBe("location-street");
+    expect(shots[1].continuity.locationState).toMatchObject({ timeOfDay: "night", weather: "light snow", objectPositions: { phoneBooth: "north corner" } });
+  });
+
+  it("builds an exact previous-endpoint contract and preserves locked physical state", () => {
+    const before = shot("shot-before").continuity;
+    const proposed = {
+      ...before,
+      characterStates: { ...before.characterStates, "character-elias": { ...before.characterStates["character-elias"], wardrobeId: "random-costume", position: "north curb" } },
+      locationState: { ...before.locationState, objectPositions: {} },
+    };
+    const carried = carryPhysicalWorldForward(before, proposed, "Элиас продолжает разговор.");
+    expect(carried.characterStates["character-elias"].wardrobeId).toBe("coat");
+    expect(carried.locationState.objectPositions.phoneBooth).toBe("north corner");
+    const contract = physicalTransitionContract({ action: "Элиас идёт к северному бордюру", previous: before, current: carried, continuousBoundary: true });
+    expect(contract).toContain("START STATE (exact previous endpoint)");
+    expect(contract).toContain("PERSISTENT OBJECTS");
+    expect(contract).toContain("visible, continuous and physically reachable motion");
+  });
+
+  it("turns Mysterio into a stable recognizable costume specification in a safe retry", () => {
+    const planned = shot("shot-mysterio");
+    const rescued = omniNeutralRescuePayload({
+      shot: { ...planned, action: "Мистерио входит в помещение", generationPrompt: planned.generationPrompt! },
+      specHash: "mysterio-original",
+    });
+    expect(rescued.shot.generationPrompt?.prompt).toContain("emerald segmented armor");
+    expect(rescued.shot.generationPrompt?.prompt).toContain("opaque glowing glass fishbowl helmet");
+    expect(rescued.shot.generationPrompt?.prompt).not.toContain("adult man in a green and burgundy theatrical outfit");
   });
 });
