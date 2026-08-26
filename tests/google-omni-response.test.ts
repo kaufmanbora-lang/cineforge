@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { createGoogleOmniInteraction, extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniInteractionRequest, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { buildContinuityChainPrompt, durableProviderOperation, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
+import { buildContinuityChainPrompt, durableProviderOperation, environmentalContinuityBridgePayload, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { carryPhysicalWorldForward, normalizeMoviePlanRuntime, physicalTransitionContract, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import { effectiveVideoModelId } from "@/domain/video-models";
 import type { MoviePlan } from "@/domain/movie";
@@ -334,6 +334,18 @@ describe("Google Omni response parsing", () => {
     expect(veoSafeBridgePayload(bridge)).toEqual(bridge);
     const legacy = { ...bridge, shot: { ...bridge.shot, generationPrompt: { ...bridge.shot.generationPrompt!, prompt: bridge.shot.generationPrompt!.prompt.replace("SAFE FICTIONAL PRODUCTION FRAME. ", "") } } };
     expect(veoSafeBridgePayload(legacy).shot.generationPrompt?.prompt).toContain("SAFE FICTIONAL PRODUCTION FRAME");
+  });
+
+  it("uses one reference-free environmental insert after a filtered Veo bridge", () => {
+    const neutral = omniNeutralRescuePayload({ shot: { ...shot("shot-environment"), generationPrompt: shot("shot-environment").generationPrompt! }, specHash: "original" });
+    const bridge = veoSafeBridgePayload(neutral);
+    const insert = environmentalContinuityBridgePayload(bridge);
+    expect(insert.providerModelId).toBe("gemini-omni-flash-preview");
+    expect(insert.omitProviderReferences).toBe(true);
+    expect(insert.shot.generationPrompt?.prompt).toContain("CINEFORGE ENVIRONMENTAL BRIDGE");
+    expect(insert.shot.generationPrompt?.prompt).toContain("no people visible");
+    expect(neutralRescueAudioContext(insert.shot.audioContext)?.dialogue).toEqual([]);
+    expect(environmentalContinuityBridgePayload(insert)).toBe(insert);
   });
 
   it("removes sensitive names, props, references and dialogue from a neutral rescue request only", () => {

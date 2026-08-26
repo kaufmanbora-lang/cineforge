@@ -322,6 +322,19 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     await withDurableDatabaseRetry(() => settleFailedReservation(job.id, job.project_id, providerCompleted));
     const mayTryAnotherProviderVariant = job.attempt < job.max_attempts;
     if (failure === "moderation"
+      && job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO SAFE BRIDGE")
+      && !job.payload.shot.generationPrompt.prompt.includes("CINEFORGE ENVIRONMENTAL BRIDGE")) {
+      // The provider may reject even a benign continuation when the supplied
+      // boundary frame itself contains filtered material. Make one final
+      // editorial insert from canonical location memory without that image.
+      // Its marker is a hard stop: another rejection becomes a terminal error,
+      // never an Omni↔Veo spending loop.
+      const nextPayload = environmentalContinuityBridgePayload(job.payload);
+      await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_ENVIRONMENTAL_BRIDGE"));
+      await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
+      return { cached: false, storageKey: "", retrying: true };
+    }
+    if (failure === "moderation"
       && (job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni")
       && job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")) {
       // The neutral Omni rescue consumes the normal final attempt. Allow one
@@ -529,10 +542,31 @@ export function veoSafeBridgePayload(payload: JobRow["payload"]): JobRow["payloa
   };
 }
 
+export function environmentalContinuityBridgePayload(payload: JobRow["payload"]): JobRow["payload"] {
+  const generationPrompt = payload.shot.generationPrompt;
+  if (!generationPrompt || generationPrompt.prompt.includes("CINEFORGE ENVIRONMENTAL BRIDGE")) return payload;
+  const location = neutralRescueContinuity(payload.shot.continuity).locationState;
+  const prompt = `Create one ${payload.shot.durationSeconds}-second photorealistic live-action editorial insert of the same fictional location, with no people visible. Canonical location memory: ${JSON.stringify(location)}. Show stable architecture, the same doorway or gate, furniture, parked civilian vehicles and ordinary persistent props. Preserve wall planes, door hinge side, handle side, opening direction, weather, lighting and camera axis. Nothing moves, appears, disappears, changes side or becomes mirrored. Natural empty-room ambience starts clean at 00:00 and ends inside the clip. Only quiet architecture and ordinary civilian objects appear; all surfaces are plain and unreadable. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE ENVIRONMENTAL BRIDGE.`;
+  const shot = { ...payload.shot, generationPrompt: {
+    ...generationPrompt,
+    prompt,
+    negativeDirectives: ["people", "readable text", "mirrored doorway", "teleportation", "disappearing objects", "cartoon look"],
+  } };
+  return {
+    ...payload,
+    providerModelId: "gemini-omni-flash-preview",
+    omitProviderReferences: true,
+    omitSubjectReferences: true,
+    shot,
+    specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview", environmentalBridge: 1 }),
+  };
+}
+
 function shouldSwitchFilteredVeoToOmni(job: JobRow): boolean {
   return !job.model_id.startsWith("gemini-omni")
     && !job.payload.providerModelId
     && Boolean(job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE SAFETY RETRY"))
+    && !job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO SAFE BRIDGE")
     && job.shot_last_operation?.state === "failed"
     && job.shot_last_operation.error?.code === "GOOGLE_MODERATION";
 }
@@ -632,7 +666,7 @@ export function providerAudioContext(_providerPrompt: string, audio: AudioContex
 }
 
 function isNeutralRescuePrompt(prompt: string): boolean {
-  return /CINEFORGE (?:OMNI NEUTRAL RESCUE|VEO NEUTRAL RESCUE|VEO SAFE BRIDGE)/.test(prompt);
+  return /CINEFORGE (?:OMNI NEUTRAL RESCUE|VEO NEUTRAL RESCUE|VEO SAFE BRIDGE|ENVIRONMENTAL BRIDGE)/.test(prompt);
 }
 
 export function neutralRescueAudioContext(audio: AudioContext | undefined): AudioContext | undefined {
