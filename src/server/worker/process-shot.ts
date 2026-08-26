@@ -87,6 +87,12 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     await query("UPDATE jobs SET payload=$2 WHERE id=$1", [job.id, JSON.stringify(job.payload)]);
     await query("UPDATE shots SET last_operation=NULL WHERE id=$1", [job.shot_id]);
   }
+  if (shouldReplaceShortVeoBridge(job)) {
+    job.payload = environmentalContinuityBridgePayload(job.payload);
+    job.shot_last_operation = null;
+    await query("UPDATE jobs SET payload=$2,last_error=NULL WHERE id=$1", [job.id, JSON.stringify(job.payload)]);
+    await query("UPDATE shots SET last_operation=NULL WHERE id=$1", [job.shot_id]);
+  }
   const heartbeat = setInterval(() => {
     void query("UPDATE jobs SET updated_at=now() WHERE id=$1 AND state IN ('generating','validating')", [job.id]).catch(() => undefined);
   }, 10_000);
@@ -341,8 +347,10 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       // additional, marker-guarded Veo bridge rather than terminating the
       // entire movie. veoSafeBridgePayload is idempotent and its marker prevents
       // this branch from becoming an unbounded provider loop.
-      const nextPayload = veoSafeBridgePayload(job.payload);
-      await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_VEO_SAFE_BRIDGE"));
+      const nextPayload = job.payload.shot.durationSeconds > 8
+        ? environmentalContinuityBridgePayload(job.payload)
+        : veoSafeBridgePayload(job.payload);
+      await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, job.payload.shot.durationSeconds > 8 ? "GOOGLE_ENVIRONMENTAL_BRIDGE" : "GOOGLE_VEO_SAFE_BRIDGE"));
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
@@ -560,6 +568,12 @@ export function environmentalContinuityBridgePayload(payload: JobRow["payload"])
     shot,
     specHash: contentHash({ shot, providerModelId: "gemini-omni-flash-preview", environmentalBridge: 1 }),
   };
+}
+
+export function shouldReplaceShortVeoBridge(job: Pick<JobRow, "payload">): boolean {
+  return job.payload.providerModelId === "veo-3.1-fast-generate-preview"
+    && job.payload.shot.durationSeconds > 8
+    && Boolean(job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO SAFE BRIDGE"));
 }
 
 function shouldSwitchFilteredVeoToOmni(job: JobRow): boolean {

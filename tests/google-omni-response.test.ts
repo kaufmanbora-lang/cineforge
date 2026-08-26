@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { createGoogleOmniInteraction, extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniInteractionRequest, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { buildContinuityChainPrompt, durableProviderOperation, environmentalContinuityBridgePayload, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
+import { buildContinuityChainPrompt, durableProviderOperation, environmentalContinuityBridgePayload, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldReplaceShortVeoBridge, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { carryPhysicalWorldForward, normalizeMoviePlanRuntime, physicalTransitionContract, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import { effectiveVideoModelId } from "@/domain/video-models";
 import type { MoviePlan } from "@/domain/movie";
@@ -346,6 +346,17 @@ describe("Google Omni response parsing", () => {
     expect(insert.shot.generationPrompt?.prompt).toContain("no people visible");
     expect(neutralRescueAudioContext(insert.shot.audioContext)?.dialogue).toEqual([]);
     expect(environmentalContinuityBridgePayload(insert)).toBe(insert);
+  });
+
+  it("never routes a ten-second Omni shot through an eight-second Veo bridge", () => {
+    const planned = { ...shot("shot-ten-second-bridge"), durationSeconds: 10 };
+    const neutral = omniNeutralRescuePayload({ shot: { ...planned, generationPrompt: planned.generationPrompt! }, specHash: "original" });
+    const bridge = veoSafeBridgePayload(neutral);
+    expect(shouldReplaceShortVeoBridge({ payload: bridge })).toBe(true);
+    const replacement = environmentalContinuityBridgePayload(bridge);
+    expect(replacement.providerModelId).toBe("gemini-omni-flash-preview");
+    expect(replacement.shot.durationSeconds).toBe(10);
+    expect(replacement.shot.generationPrompt?.prompt).toContain("10-second");
   });
 
   it("removes sensitive names, props, references and dialogue from a neutral rescue request only", () => {
