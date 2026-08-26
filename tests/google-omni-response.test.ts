@@ -272,12 +272,14 @@ describe("Google Omni response parsing", () => {
     expect(framed).toContain("controlled lawful detention");
     expect(framed).not.toMatch(/\bФБР\b/i);
   });
-  it("keeps sensitive dialogue for post-production instead of the video safety request", () => {
+  it("keeps exact dialogue in Google's native synchronized audio request", () => {
     const plannedShot = shot("shot-dialogue");
     const audio = { ...plannedShot.audioContext, speakers: ["character-elias"], dialogue: [{ id: "d1", characterId: "character-elias", characterName: "Elias", text: "ФБР! Руки вверх!", delivery: "firm", startSeconds: 0, durationSeconds: 2 }] };
     const safe = providerAudioContext(providerSafetyFraming("ФБР задерживает человека"), audio)!;
-    expect(safe.dialogue).toEqual([]);
-    expect(safe.speakers).toEqual([]);
+    expect(safe.dialogue).toEqual(audio.dialogue);
+    expect(safe.speakers).toEqual(audio.speakers);
+    expect(safe.cleanStart).toBe(true);
+    expect(safe.forbidCarryOver).toContain("all previous generated dialogue");
     expect(audio.dialogue[0].text).toBe("ФБР! Руки вверх!");
   });
 
@@ -290,7 +292,7 @@ describe("Google Omni response parsing", () => {
     expect(rescued.shot.generationPrompt?.prompt).not.toMatch(/ФБР|наручник|задерж|оруж|weapon|restraint|threat|agency/i);
     expect(rescued.omitProviderReferences).toBe(false);
     expect(rescued.omitSubjectReferences).toBe(true);
-    expect(providerAudioContext(rescued.shot.generationPrompt!.prompt, audio)?.dialogue).toEqual([]);
+    expect(neutralRescueAudioContext(audio)?.dialogue).toEqual([]);
     expect(audio.dialogue[0].text).toBe("ФБР! Руки вверх!");
     expect(omniNeutralRescuePayload(rescued)).toEqual(rescued);
     const legacy = { ...rescued, shot: { ...rescued.shot, generationPrompt: { ...rescued.shot.generationPrompt!, prompt: `${rescued.shot.generationPrompt!.prompt} no visible weapon` } } };
@@ -328,7 +330,7 @@ describe("Google Omni response parsing", () => {
     expect(bridge.omitProviderReferences).toBe(false);
     expect(bridge.omitSubjectReferences).toBe(true);
     expect(bridge.shot.generationPrompt?.prompt).toContain("CINEFORGE VEO SAFE BRIDGE");
-    expect(providerAudioContext(bridge.shot.generationPrompt!.prompt, neutral.shot.audioContext)?.dialogue).toEqual([]);
+    expect(neutralRescueAudioContext(neutral.shot.audioContext)?.dialogue).toEqual([]);
     expect(veoSafeBridgePayload(bridge)).toEqual(bridge);
     const legacy = { ...bridge, shot: { ...bridge.shot, generationPrompt: { ...bridge.shot.generationPrompt!, prompt: bridge.shot.generationPrompt!.prompt.replace("SAFE FICTIONAL PRODUCTION FRAME. ", "") } } };
     expect(veoSafeBridgePayload(legacy).shot.generationPrompt?.prompt).toContain("SAFE FICTIONAL PRODUCTION FRAME");
@@ -554,7 +556,37 @@ describe("Google Omni response parsing", () => {
     const contract = physicalTransitionContract({ action: "Элиас идёт к северному бордюру", previous: before, current: carried, continuousBoundary: true });
     expect(contract).toContain("START STATE (exact previous endpoint)");
     expect(contract).toContain("PERSISTENT OBJECTS");
+    expect(contract).toContain("IMMUTABLE SPATIAL ANCHORS");
     expect(contract).toContain("visible, continuous and physically reachable motion");
+  });
+
+  it("allows a door to open without mirroring its hinge topology or moving unrelated objects", () => {
+    const before = {
+      ...shot("shot-door-before").continuity,
+      locationState: {
+        ...shot("shot-door-before").continuity.locationState,
+        objectPositions: {
+          frontDoor: "north wall; hinge left from exterior; handle right; opens inward; closed",
+          blackCar: "parked at south curb, heading east",
+        },
+      },
+    };
+    const proposed = {
+      ...before,
+      locationState: {
+        ...before.locationState,
+        objectPositions: {
+          frontDoor: "open 70 degrees",
+          blackCar: "teleported beside the north wall",
+        },
+      },
+    };
+    const carried = carryPhysicalWorldForward(before, proposed, "Элиас открывает входную дверь.");
+    expect(carried.locationState.objectPositions.frontDoor).toContain("hinge left from exterior");
+    expect(carried.locationState.objectPositions.frontDoor).toContain("open 70 degrees");
+    expect(carried.locationState.objectPositions.blackCar).toBe(before.locationState.objectPositions.blackCar);
+    const contract = physicalTransitionContract({ action: "Элиас открывает дверь", previous: before, current: carried, continuousBoundary: true });
+    expect(contract).toContain("camera cut cannot mirror the doorway");
   });
 
   it("turns Mysterio into a stable recognizable costume specification in a safe retry", () => {

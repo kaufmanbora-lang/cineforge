@@ -1,5 +1,5 @@
 import { Worker } from "bullmq";
-import { MOVIE_QUEUE, enqueueAutomaticAssemblyIfReady, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverCompletedShotProjects, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob, resumeProjectJobs } from "@/server/movie/queue";
+import { MOVIE_QUEUE, enqueueAutomaticAssemblyIfReady, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverCompletedShotProjects, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob, restoreLegacyAutomaticDialoguePatches, resumeProjectJobs } from "@/server/movie/queue";
 import { processShot } from "./process-shot";
 import { processDialoguePatch } from "./process-dialogue";
 import { processAssembly } from "./process-assembly";
@@ -14,6 +14,8 @@ import { persistMoviePlan } from "@/server/movie/repository";
 import { estimateGeneration } from "@/domain/estimation";
 import type { Resolution } from "@/domain/video-models";
 
+const restoredNativeGoogleAudio = await restoreLegacyAutomaticDialoguePatches();
+if (restoredNativeGoogleAudio) process.stdout.write(`Restored native Google audio for ${restoredNativeGoogleAudio} legacy shot(s).\n`);
 await recoverInterruptedJobs();
 await recoverActiveProjects();
 await recoverCompletedShotProjects();
@@ -48,7 +50,7 @@ const worker = new Worker(
   { connection: redisConnection(), concurrency: workerConcurrency },
 );
 const reconciliationTimer = setInterval(() => {
-  void Promise.all([reconcileQueuedJobs(), recoverStaleJobs(), recoverCompletedShotProjects()]).catch((error) => process.stderr.write(`Queue reconciliation failed: ${error instanceof Error ? error.message : String(error)}\n`));
+  void Promise.all([reconcileQueuedJobs(), recoverStaleJobs(), recoverCompletedShotProjects(), restoreLegacyAutomaticDialoguePatches()]).catch((error) => process.stderr.write(`Queue reconciliation failed: ${error instanceof Error ? error.message : String(error)}\n`));
 }, 30_000);
 reconciliationTimer.unref();
 

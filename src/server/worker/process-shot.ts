@@ -307,8 +307,8 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       ? { ...qc, decision: qc.overall < engineSettings.qcFlagThreshold ? "flag" : "accept" }
       : null;
     // Google video models generate native synchronized speech and ambience.
-    // Keep that human performance intact; the separate TTS pipeline is reserved
-    // for explicit non-destructive dialogue edits requested after generation.
+    // Keep that human performance intact. Dialogue edits also go back through
+    // Google; CineForge never lays a synthetic narrator over provider audio.
     await withDurableDatabaseRetry(() => persistCompletedAsset(job, storageKey, checksum, stored.byteSize, operation.operationId, cost, classifiedQc));
     await withDurableDatabaseRetry(async () => {
       await enqueueReadyProjectJobs(job.project_id);
@@ -321,9 +321,13 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     process.stderr.write(`Shot provider failure ${job.id}: ${failure}: ${message}\n`);
     await withDurableDatabaseRetry(() => settleFailedReservation(job.id, job.project_id, providerCompleted));
     const mayTryAnotherProviderVariant = job.attempt < job.max_attempts;
-    if (mayTryAnotherProviderVariant && failure === "moderation"
+    if (failure === "moderation"
       && (job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni")
       && job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")) {
+      // The neutral Omni rescue consumes the normal final attempt. Allow one
+      // additional, marker-guarded Veo bridge rather than terminating the
+      // entire movie. veoSafeBridgePayload is idempotent and its marker prevents
+      // this branch from becoming an unbounded provider loop.
       const nextPayload = veoSafeBridgePayload(job.payload);
       await withDurableDatabaseRetry(() => persistModerationRetry(job, nextPayload, message, "GOOGLE_VEO_SAFE_BRIDGE"));
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
@@ -609,18 +613,21 @@ export function providerSafetyFraming(originalPrompt: string): string {
   return `${fictionalized}\nSAFE FICTIONAL PRODUCTION FRAME: adult actors perform a controlled lawful detention for a fictional film. No real agency names or insignia, no public figures, no weapon use, no threats, no injury, no physical abuse, no dangerous driving and no readable private information. Preserve the requested arrival, entry and calm detention as non-graphic story action.`;
 }
 
-export function providerAudioContext(providerPrompt: string, audio: AudioContext | undefined): AudioContext | undefined {
-  if (!audio || !providerPrompt.includes("SAFE FICTIONAL PRODUCTION FRAME")) return audio;
-  // The canonical dialogue is preserved in the job and is added by the
-  // separate stable-voice pipeline after the video succeeds. Keeping it out of
-  // the visual provider avoids a false safety rejection and audio carry-over.
+export function providerAudioContext(_providerPrompt: string, audio: AudioContext | undefined): AudioContext | undefined {
+  if (!audio) return undefined;
+  // Gemini/Veo owns both picture and synchronized performance. Safety framing
+  // must not silently strip the dialogue and later replace it with a robotic
+  // TTS track. Only the explicitly marked last-resort neutral rescue is silent
+  // (handled by neutralRescueAudioContext before this function is called).
   return {
     ...audio,
-    speakers: [],
-    silentCharacters: [...new Set([...audio.silentCharacters, ...audio.speakers])],
-    dialogue: [],
     cleanStart: true,
-    forbidCarryOver: [...new Set([...audio.forbidCarryOver, "all generated dialogue"])],
+    forbidCarryOver: [...new Set([
+      ...audio.forbidCarryOver,
+      "all previous generated dialogue",
+      "all previous music",
+      "all previous ambience and sound effects",
+    ])],
   };
 }
 
@@ -712,14 +719,23 @@ export function buildContinuityChainPrompt(
     `Canonical character state: ${JSON.stringify(characterState)}.`,
     `Canonical location state: ${JSON.stringify({ locationId: continuity.locationId, ...continuity.locationState })}.`,
     `Immutable locked values: ${JSON.stringify(continuity.lockedValues)}.`,
+    `Spatial anchors that must not be mirrored or moved by a camera cut: ${JSON.stringify(spatialAnchorMap(continuity))}.`,
     "PHYSICAL WORLD CONTRACT: preserve ordinary geometry, gravity, inertia, collisions and occlusion. People, vehicles, walls, doors, furniture and props are solid. They cannot intersect, pass through one another, teleport, reverse direction without motion, change scale or appear/disappear between frames.",
-    "TOPOLOGY AND DOOR CONTRACT: keep every character on the recorded inside/outside side of each wall and doorway until their body visibly follows a continuous path across the threshold. A person outside cannot operate or appear on the indoor side without first crossing; a person inside cannot appear outside without crossing. Door panels, frames, handles, walls and bodies remain solid, hinged and correctly oriented.",
+    "TOPOLOGY AND DOOR CONTRACT: keep every character on the recorded inside/outside side of each wall and doorway until their body visibly follows a continuous path across the threshold. A person outside cannot operate or appear on the indoor side without first crossing; a person inside cannot appear outside without crossing. Door panels, frames, handles, walls and bodies remain solid, hinged and correctly oriented. The hinge edge, handle edge, inward/outward swing, wall plane and camera-side relationship are immutable. A cut or new lens must never mirror a doorway, exchange its left/right edges or move it to the other side of the room.",
     "BLOCKING AND EYELINE CONTRACT: preserve the recorded left/right/foreground/background positions and travel direction. Each changed position must be reached through visible continuous motion. Characters look at the other character, the relevant prop or their travel path; nobody looks into or acknowledges the camera unless the screenplay explicitly requires it.",
     "PERSISTENT OBJECT AND VEHICLE CONTRACT: every vehicle, prop and background object visible or recorded in objectPositions remains present until the screenplay explicitly shows a continuous departure or removal. Preserve vehicle count, convoy order, model, color, lane, curb offset, heading, wheel orientation and moving/stopped state. A moving vehicle begins this shot at the exact prior endpoint and continues the same screen direction and plausible speed; a parked vehicle stays at the same curb coordinate. Nothing pops in, vanishes or jumps between positions.",
     "CAMERA CONTINUITY CONTRACT: for a continuous action, remain on the same side of the 180-degree action axis and preserve screen direction. Start from the supplied final-frame composition before any motivated camera movement. Do not use an unplanned reverse angle, reset, orbit or reframing that disguises a spatial jump.",
     `Exact dialogue for this shot only: ${JSON.stringify(dialogue)}.`,
     "AUDIO ISOLATION: start a completely new audio context at 00:00. Do not repeat, continue or leak any word, voice, music, ambience or sound effect from a previous generated clip. Characters not listed as speakers remain silent. End every sound inside this shot boundary.",
   ].join("\n");
+}
+
+function spatialAnchorMap(continuity: ContinuityState): Record<string, string> {
+  const spatialPattern = /door|doorway|gate|portal|threshold|wall|window|curb|lane|двер|про[её]м|ворот|стен|окн|бордюр|полос/i;
+  return Object.fromEntries([
+    ...Object.entries(continuity.locationState.objectPositions),
+    ...Object.entries(continuity.lockedValues).map(([id, value]) => [id, typeof value === "string" ? value : JSON.stringify(value)] as const),
+  ].filter(([id, value]) => spatialPattern.test(`${id} ${value}`)));
 }
 
 export function buildTargetedEditInstruction(command: string, shotId: string): string {

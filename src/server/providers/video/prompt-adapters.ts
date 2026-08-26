@@ -33,6 +33,8 @@ export function physicalTransitionContract(input: {
   const previousObjects = input.previous.locationState.objectPositions;
   const currentObjects = input.current.locationState.objectPositions;
   const persistentObjects = Object.fromEntries(Object.entries(previousObjects).map(([id, position]) => [id, currentObjects[id] ?? position]));
+  const previousSpatialAnchors = spatialAnchors(input.previous);
+  const currentSpatialAnchors = spatialAnchors(input.current);
   const changedCharacters = Object.entries(input.current.characterStates).flatMap(([id, state]) => {
     const before = input.previous?.characterStates[id];
     if (!before || before.position === state.position) return [];
@@ -50,10 +52,21 @@ export function physicalTransitionContract(input: {
     `DECLARED CHARACTER PATHS: ${JSON.stringify(changedCharacters)}.`,
     `DECLARED OBJECT PATHS: ${JSON.stringify(changedObjects)}.`,
     `PERSISTENT OBJECTS: ${JSON.stringify(persistentObjects)}.`,
+    `IMMUTABLE SPATIAL ANCHORS AT START: ${JSON.stringify(previousSpatialAnchors)}.`,
+    `IMMUTABLE SPATIAL ANCHORS AT END: ${JSON.stringify(currentSpatialAnchors)}.`,
     `TARGET END STATE: ${JSON.stringify(worldStateSummary(input.current))}.`,
     "Begin on the exact start state. Reach the target only through visible, continuous and physically reachable motion during this shot. If the available duration is insufficient, show less progress instead of teleporting.",
     "Any person or object not listed in a declared path is stationary in world space. Camera movement never changes world-space position. Solid boundaries remain closed unless the action visibly opens them; a body crosses a doorway only after the opening is clear and along one continuous path.",
+    "A doorway is one immutable physical object: keep its wall plane, hinge edge, handle edge, inward/outward swing and inside/outside sides unchanged. A camera cut cannot mirror the doorway, swap left and right, or move it to the opposite side of the room. Change only its opening angle through visible rotation around the same hinge.",
   ].join("\n");
+}
+
+function spatialAnchors(continuity: ContinuityState): Record<string, string> {
+  const spatialPattern = /door|doorway|gate|portal|threshold|wall|window|curb|lane|двер|про[её]м|ворот|стен|окн|бордюр|полос/i;
+  return Object.fromEntries([
+    ...Object.entries(continuity.locationState.objectPositions),
+    ...Object.entries(continuity.lockedValues).map(([id, value]) => [id, typeof value === "string" ? value : JSON.stringify(value)] as const),
+  ].filter(([id, value]) => spatialPattern.test(`${id} ${value}`)));
 }
 
 function worldStateSummary(continuity: ContinuityState) {
@@ -115,6 +128,7 @@ export class VeoPromptAdapter implements PromptAdapter<ShotIntent> {
         "unexpected text overlays",
         "looking into the camera",
         "impossible side change across a wall or doorway",
+        "mirrored doorway, swapped hinge side or handle side",
         "disappearing or teleporting vehicles and props",
         "unmotivated 180-degree axis flip",
         "cartoon, anime, illustration or CGI look unless explicitly requested",
@@ -135,7 +149,7 @@ export class OmniPromptAdapter implements PromptAdapter<ShotIntent> {
       .map((line) => `${line.characterName} says exactly, ${line.delivery}: "${line.text}"`)
       .join(" ");
     const refs = intent.continuity.requiredReferences.map((_, index) => `<IMAGE_REF_${index}>`).join(" ");
-    const negatives = ["No extra dialogue", "No audio carry-over", "No unplanned wardrobe changes", "No text overlays"];
+    const negatives = ["No extra dialogue", "No audio carry-over", "No unplanned wardrobe changes", "No text overlays", "No mirrored doorway or swapped hinge/handle side"];
     return {
       prompt: [
         `[0-${intent.durationSeconds}s] In a single continuous shot, no scene cuts.`,
@@ -317,7 +331,6 @@ export function carryPhysicalWorldForward(previous: ContinuityState, current: Co
   const allowsWardrobeChange = /change(?:s|d)? clothes|wardrobe change|dress(?:es|ed)?|переод|смен(?:а|ил|ила|или) одеж/i.test(scriptedAction);
   const allowsPropChange = /pick(?:s|ed)? up|put(?:s)? down|drop(?:s|ped)?|take(?:s|n)?|give(?:s|n)?|бер[её]т|взял|клад[её]т|роняет|переда[её]т/i.test(scriptedAction);
   const allowsInjuryChange = /injur|wound|hurt|лечен|ранен|травм/i.test(scriptedAction);
-  const allowsObjectMovement = /move|drive|roll|walk|run|turn|stop|park|arriv|depart|enter|leave|open|close|движ|едет|поех|останав|парку|поворач|въезж|выезж|входит|выходит|откры|закры/i.test(scriptedAction);
   const characterStates = Object.fromEntries(Object.entries(current.characterStates).map(([id, state]) => {
     const before = previous.characterStates[id];
     if (!before) return [id, state];
@@ -342,13 +355,34 @@ export function carryPhysicalWorldForward(previous: ContinuityState, current: Co
         ...current.locationState.objectPositions,
         ...Object.fromEntries(Object.entries(previous.locationState.objectPositions).map(([id, position]) => [
           id,
-          allowsObjectMovement ? current.locationState.objectPositions[id] ?? position : position,
+          carriedObjectPosition(id, position, current.locationState.objectPositions[id], scriptedAction),
         ])),
       },
     },
     requiredReferences: [...new Set([...previous.requiredReferences, ...current.requiredReferences])],
     lockedValues: { ...previous.lockedValues, ...current.lockedValues },
   };
+}
+
+function carriedObjectPosition(id: string, previous: string, proposed: string | undefined, scriptedAction: string): string {
+  if (!proposed || proposed === previous) return previous;
+  const descriptor = `${id} ${previous} ${proposed}`;
+  const doorLike = /door|doorway|gate|portal|двер|ворот|калитк|про[её]м/i.test(descriptor);
+  const vehicleLike = /car|vehicle|truck|van|bus|motor|машин|автомоб|фургон|грузов|автобус|мото/i.test(descriptor);
+  const actionMovesDoor = /open|close|swing|unlock|откры|закры|распах|захлоп/i.test(scriptedAction);
+  const actionMovesVehicle = /drive|roll|turn|stop|park|arriv|depart|enter|leave|едет|поех|останав|парку|поворач|въезж|выезж|уезж|приезж/i.test(scriptedAction);
+  const objectTokens = id.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((token) => token.length >= 4);
+  const actionNamesObject = objectTokens.some((token) => scriptedAction.toLowerCase().includes(token));
+  if (!(actionNamesObject || (doorLike && actionMovesDoor) || (vehicleLike && actionMovesVehicle))) return previous;
+  if (!doorLike) return proposed;
+  const topology = previous
+    .split(/[.;,]/)
+    .map((part) => part.trim())
+    .filter((part) => /hinge|handle|left|right|inward|outward|inside|outside|wall|петл|ручк|лев|прав|внутр|наруж|стен/i.test(part))
+    .join("; ");
+  return topology && !proposed.includes(topology)
+    ? `${proposed}; immutable topology from previous shot: ${topology}`
+    : proposed;
 }
 
 function visuallyContinuousBoundary(previous: Scene, current: Scene): boolean {

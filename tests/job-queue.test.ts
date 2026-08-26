@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { planGenerationJobs, readyJobs } from "@/server/movie/job-planner";
-import { retryEnvelopeJobId } from "@/server/movie/queue";
+import { isLegacyAutomaticDialogueJob, retryEnvelopeJobId } from "@/server/movie/queue";
 import { scene, shot } from "./fixtures";
 
 describe("idempotent dependency-aware job queue", () => {
@@ -42,5 +42,9 @@ describe("idempotent dependency-aware job queue", () => {
     const resumed = retryEnvelopeJobId("database-job", 1, "run-b");
     expect(first).not.toBe(resumed);
     expect(retryEnvelopeJobId("database-job", 1, "run-a")).toBe(first);
+  });
+  it("restores only legacy automatic voiceovers, never an explicit user edit", () => {
+    expect(isLegacyAutomaticDialogueJob("dialogue-master:shot-1:hash")).toBe(true);
+    expect(isLegacyAutomaticDialogueJob("dialogue-patch:shot-1:hash")).toBe(false);
   });
 });

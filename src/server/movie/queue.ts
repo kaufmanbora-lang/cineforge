@@ -1,6 +1,7 @@
 import { Queue } from "bullmq";
 import { createHash, randomUUID } from "node:crypto";
 import type { PlannedJob } from "./job-planner";
+import type { Shot } from "@/domain/movie";
 import { env } from "@/server/env";
 import { query, transaction } from "@/server/db";
 
@@ -139,6 +140,101 @@ export async function recoverInterruptedJobs(): Promise<number> {
     await movieQueue().add(row.type, { databaseJobId: row.id }, { jobId: bullId });
   }
   return rows.length;
+}
+
+export function isLegacyAutomaticDialogueJob(idempotencyKey: string): boolean {
+  return idempotencyKey.startsWith("dialogue-master:");
+}
+
+/**
+ * Releases projects created before native Google speech became authoritative.
+ * Those builds automatically rendered an OpenAI TTS copy as the active shot
+ * version. The original Google generation is still durable, so restoring it is
+ * free, lossless for video and does not call either paid provider.
+ */
+export async function restoreLegacyAutomaticDialoguePatches(): Promise<number> {
+  await query(
+    `UPDATE jobs SET state='cancelled',completed_at=now(),updated_at=now(),
+       result=COALESCE(result,'{}'::jsonb) || '{"nativeGoogleAudioRestored":true,"automaticTtsCancelled":true}'::jsonb,
+       last_error=NULL
+     WHERE type='dialogue-patch' AND idempotency_key LIKE 'dialogue-master:%'
+       AND state IN ('planned','queued','retrying','generating','validating','paused','failed')`,
+  );
+  const candidates = await query<{ project_id: string; shot_id: string }>(
+    `SELECT DISTINCT j.project_id,j.shot_id
+     FROM jobs j
+     JOIN shot_versions active ON active.shot_id=j.shot_id AND active.active=true AND active.reason='edited dialogue'
+     WHERE j.type='dialogue-patch' AND j.idempotency_key LIKE 'dialogue-master:%' AND j.shot_id IS NOT NULL`,
+  );
+  const reassemble = new Set<string>();
+  let restored = 0;
+  for (const candidate of candidates) {
+    const result = await transaction(async (client) => {
+      const current = await client.query<{ current_version: number }>(
+        "SELECT current_version FROM shots WHERE id=$1 AND project_id=$2 FOR UPDATE",
+        [candidate.shot_id, candidate.project_id],
+      );
+      if (!current.rows[0]) return { restored: false, complete: false };
+      const active = await client.query<{ id: string; reason: string }>(
+        "SELECT id,reason FROM shot_versions WHERE shot_id=$1 AND active=true ORDER BY created_at DESC LIMIT 1",
+        [candidate.shot_id],
+      );
+      if (active.rows[0]?.reason !== "edited dialogue") return { restored: false, complete: false };
+      const native = await client.query<{ id: string; version: number; generation_spec: Shot; asset_id: string }>(
+        `SELECT sv.id,sv.version,sv.generation_spec,a.id asset_id
+         FROM shot_versions sv
+         JOIN generation_assets a ON a.shot_version_id=sv.id AND a.kind='video'
+         WHERE sv.shot_id=$1 AND sv.reason='generation'
+         ORDER BY sv.version DESC,a.created_at DESC LIMIT 1`,
+        [candidate.shot_id],
+      );
+      if (!native.rows[0]) return { restored: false, complete: false };
+      const nativeShot = native.rows[0].generation_spec;
+      await client.query("UPDATE shot_versions SET active=(id=$2) WHERE shot_id=$1", [candidate.shot_id, native.rows[0].id]);
+      await client.query(
+        `UPDATE shots SET current_version=$2,generation_spec=$3,audio_context=$4,continuity_state=$5,
+           state='completed',last_error=NULL,updated_at=now() WHERE id=$1`,
+        [candidate.shot_id, native.rows[0].version, JSON.stringify(nativeShot), JSON.stringify(nativeShot.audioContext), JSON.stringify(nativeShot.continuity)],
+      );
+      await client.query(
+        "UPDATE timeline_clips SET asset_id=$2,updated_at=now() WHERE shot_id=$1 AND track='video' AND enabled=true",
+        [candidate.shot_id, native.rows[0].asset_id],
+      );
+      await client.query(
+        "UPDATE timeline_clips SET metadata=$2,updated_at=now() WHERE shot_id=$1 AND track='dialogue' AND enabled=true",
+        [candidate.shot_id, JSON.stringify({ dialogue: nativeShot.audioContext.dialogue })],
+      );
+      await client.query(
+        "UPDATE timeline_clips SET metadata=$2,updated_at=now() WHERE shot_id=$1 AND track='subtitles' AND enabled=true",
+        [candidate.shot_id, JSON.stringify({ lines: nativeShot.audioContext.dialogue.map((line) => ({ id: line.id, text: line.text, startSeconds: line.startSeconds, durationSeconds: line.durationSeconds })) })],
+      );
+      const completion = await client.query<{ complete: boolean }>(
+        "SELECT NOT EXISTS (SELECT 1 FROM shots WHERE project_id=$1 AND state NOT IN ('completed','cancelled')) complete",
+        [candidate.project_id],
+      );
+      await client.query(
+        `UPDATE projects SET final_movie_storage_key=NULL,
+           status=CASE WHEN $2::boolean AND status<>'cancelled' THEN 'validating'::project_status ELSE status END,
+           last_error=CASE WHEN $2::boolean THEN NULL ELSE last_error END,updated_at=now() WHERE id=$1`,
+        [candidate.project_id, completion.rows[0]?.complete ?? false],
+      );
+      await client.query(
+        "UPDATE exports SET state='cancelled' WHERE project_id=$1 AND format IN ('mp4','mov') AND state='completed'",
+        [candidate.project_id],
+      );
+      await client.query(
+        `UPDATE jobs SET result=COALESCE(result,'{}'::jsonb) || $2::jsonb,last_error=NULL,updated_at=now()
+         WHERE project_id=$1 AND shot_id=$3 AND type='dialogue-patch' AND idempotency_key LIKE 'dialogue-master:%'`,
+        [candidate.project_id, JSON.stringify({ nativeGoogleAudioRestored: true, restoredVersion: native.rows[0].version }), candidate.shot_id],
+      );
+      return { restored: true, complete: completion.rows[0]?.complete ?? false };
+    });
+    if (!result.restored) continue;
+    restored += 1;
+    if (result.complete) reassemble.add(candidate.project_id);
+  }
+  for (const projectId of reassemble) await enqueueAutomaticAssemblyIfReady(projectId);
+  return restored;
 }
 
 export async function reconcileQueuedJobs(): Promise<number> {
