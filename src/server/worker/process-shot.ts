@@ -191,6 +191,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         : undefined;
       const providerPrompt = providerSafetyFraming(prompt.prompt);
       const neutralRescue = isNeutralRescuePrompt(providerPrompt);
+      const environmentalBridge = providerPrompt.includes("CINEFORGE ENVIRONMENTAL BRIDGE");
       const providerAudio = neutralRescue
         ? neutralRescueAudioContext(job.payload.shot.audioContext)
         : providerAudioContext(providerPrompt, job.payload.shot.audioContext);
@@ -202,15 +203,17 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
         sceneId: job.scene_id,
         shotId: job.shot_id,
         modelId: effectiveModelId,
-        prompt: buildContinuityChainPrompt(providerPrompt, providerContinuity, providerAudio, references.some((reference) => reference.role === "first-frame")),
-        negativeDirectives: [...new Set([
-          ...prompt.negativeDirectives,
-          "character identity drift",
-          "wardrobe changes",
-          "teleportation",
-          "weather or lighting reset",
-          "previous dialogue, music or sound leaking into this shot",
-        ])],
+        prompt: providerRequestPrompt(providerPrompt, providerContinuity, providerAudio, references.some((reference) => reference.role === "first-frame")),
+        negativeDirectives: environmentalBridge
+          ? prompt.negativeDirectives
+          : [...new Set([
+              ...prompt.negativeDirectives,
+              "character identity drift",
+              "wardrobe changes",
+              "teleportation",
+              "weather or lighting reset",
+              "previous dialogue, music or sound leaking into this shot",
+            ])],
         durationSeconds: providerDuration,
         resolution: job.resolution,
         aspectRatio: job.aspect_ratio,
@@ -326,7 +329,8 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`Shot provider failure ${job.id}: ${failure}: ${message}\n`);
     await withDurableDatabaseRetry(() => settleFailedReservation(job.id, job.project_id, providerCompleted));
-    const mayTryAnotherProviderVariant = job.attempt < job.max_attempts;
+    const environmentalBridgeRejected = Boolean(job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE ENVIRONMENTAL BRIDGE"));
+    const mayTryAnotherProviderVariant = !environmentalBridgeRejected && job.attempt < job.max_attempts;
     if (failure === "moderation"
       && job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO SAFE BRIDGE")
       && !job.payload.shot.generationPrompt.prompt.includes("CINEFORGE ENVIRONMENTAL BRIDGE")) {
@@ -554,7 +558,7 @@ export function environmentalContinuityBridgePayload(payload: JobRow["payload"])
   const generationPrompt = payload.shot.generationPrompt;
   if (!generationPrompt || generationPrompt.prompt.includes("CINEFORGE ENVIRONMENTAL BRIDGE")) return payload;
   const location = neutralRescueContinuity(payload.shot.continuity).locationState;
-  const prompt = `Create one ${payload.shot.durationSeconds}-second photorealistic live-action editorial insert of the same fictional location, with no people visible. Canonical location memory: ${JSON.stringify(location)}. Show stable architecture, the same doorway or gate, furniture, parked civilian vehicles and ordinary persistent props. Preserve wall planes, door hinge side, handle side, opening direction, weather, lighting and camera axis. Nothing moves, appears, disappears, changes side or becomes mirrored. Natural empty-room ambience starts clean at 00:00 and ends inside the clip. Only quiet architecture and ordinary civilian objects appear; all surfaces are plain and unreadable. SAFE FICTIONAL PRODUCTION FRAME. CINEFORGE ENVIRONMENTAL BRIDGE.`;
+  const prompt = `Create one ${payload.shot.durationSeconds}-second photorealistic live-action static editorial insert of a quiet empty fictional location. Location layout: ${JSON.stringify(location)}. Show stable architecture, the same doorway or gate, furniture, parked civilian vehicles and ordinary persistent props. Preserve wall planes, door hinge side, handle side, opening direction, weather, lighting and camera axis. Nothing moves, appears, disappears, changes side or becomes mirrored. Natural empty-room ambience starts clean at 00:00 and ends inside the clip. All surfaces are plain and unreadable. CINEFORGE ENVIRONMENTAL BRIDGE.`;
   const shot = { ...payload.shot, generationPrompt: {
     ...generationPrompt,
     prompt,
@@ -776,6 +780,20 @@ export function buildContinuityChainPrompt(
     `Exact dialogue for this shot only: ${JSON.stringify(dialogue)}.`,
     "AUDIO ISOLATION: start a completely new audio context at 00:00. Do not repeat, continue or leak any word, voice, music, ambience or sound effect from a previous generated clip. Characters not listed as speakers remain silent. End every sound inside this shot boundary.",
   ].join("\n");
+}
+
+export function providerRequestPrompt(
+  providerPrompt: string,
+  continuity: ContinuityState,
+  audio: AudioContext | undefined,
+  hasFirstFrame: boolean,
+): string {
+  // The final moderation fallback intentionally contains only a neutral place.
+  // Reattaching the original character memory here would put filtered context
+  // straight back into the request and defeat the fallback.
+  return providerPrompt.includes("CINEFORGE ENVIRONMENTAL BRIDGE")
+    ? providerPrompt
+    : buildContinuityChainPrompt(providerPrompt, continuity, audio, hasFirstFrame);
 }
 
 function spatialAnchorMap(continuity: ContinuityState): Record<string, string> {

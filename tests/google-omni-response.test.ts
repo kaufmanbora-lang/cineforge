@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { createGoogleOmniInteraction, extractOmniVideo, extractVeoVideo, googleFileDownloadUrl, googleOmniInteractionRequest, googleOmniShouldStore, googleOmniVideoTask, googleVeoConfig, normalizeGoogleProviderError, readVeoOperationResponse } from "@/server/providers/video/google";
-import { buildContinuityChainPrompt, durableProviderOperation, environmentalContinuityBridgePayload, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldReplaceShortVeoBridge, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
+import { buildContinuityChainPrompt, durableProviderOperation, environmentalContinuityBridgePayload, generationAccountingCost, moderationRetryPayload, neutralRescueAudioContext, neutralRescueContinuity, omniFallbackPayload, omniNeutralRescuePayload, providerAudioContext, providerDurationSeconds, providerRequestPrompt, providerSafetyFraming, restoreOmniAfterLegacyBillingFallbackPayload, resumableProviderOperation, shouldReplaceShortVeoBridge, shouldRestoreLegacyBillingFallback, veoNeutralRescuePayload, veoSafeBridgePayload } from "@/server/worker/process-shot";
 import { carryPhysicalWorldForward, normalizeMoviePlanRuntime, physicalTransitionContract, realismProductionProfile } from "@/server/providers/video/prompt-adapters";
 import { effectiveVideoModelId } from "@/domain/video-models";
 import type { MoviePlan } from "@/domain/movie";
@@ -343,7 +343,9 @@ describe("Google Omni response parsing", () => {
     expect(insert.providerModelId).toBe("gemini-omni-flash-preview");
     expect(insert.omitProviderReferences).toBe(true);
     expect(insert.shot.generationPrompt?.prompt).toContain("CINEFORGE ENVIRONMENTAL BRIDGE");
-    expect(insert.shot.generationPrompt?.prompt).toContain("no people visible");
+    expect(insert.shot.generationPrompt?.prompt).toContain("quiet empty fictional location");
+    expect(insert.shot.generationPrompt?.prompt).not.toContain("SAFE FICTIONAL PRODUCTION FRAME");
+    expect(providerRequestPrompt(insert.shot.generationPrompt!.prompt, insert.shot.continuity, insert.shot.audioContext, false)).toBe(insert.shot.generationPrompt!.prompt);
     expect(neutralRescueAudioContext(insert.shot.audioContext)?.dialogue).toEqual([]);
     expect(environmentalContinuityBridgePayload(insert)).toBe(insert);
   });
