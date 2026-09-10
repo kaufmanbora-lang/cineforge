@@ -296,7 +296,7 @@ export function normalizeMoviePlanRuntime(plan: MoviePlan, modelId: string): Mov
   // continuous boundaries are hard scheduling dependencies. A real cut to a
   // different location/time can render in parallel without losing story state.
   const timeline = scenes.flatMap((scene) => scene.shots.map((shot) => ({ scene, shot })));
-  const validIds = new Set(timeline.map(({ shot }) => shot.id));
+  const shotOrder = new Map(timeline.map(({ shot }, index) => [shot.id, index]));
   let timelineIndex = 0;
   let normalizedPrevious: Shot | null = null;
   scenes = scenes.map((scene) => {
@@ -313,7 +313,7 @@ export function normalizeMoviePlanRuntime(plan: MoviePlan, modelId: string): Mov
         ...shot,
         sequence: timelineIndex,
         dependencies: [...new Set([
-          ...shot.dependencies.filter((id) => validIds.has(id) && id !== shot.id && (id !== previous?.shot.id || continuousBoundary)),
+          ...shot.dependencies.filter((id) => (shotOrder.get(id) ?? timelineIndex) < timelineIndex - 1 && (id !== previous?.shot.id || continuousBoundary)),
           ...(previous && continuousBoundary ? [previous.shot.id] : []),
         ])],
         continuity: { ...continuity, previousShotId: previous?.shot.id ?? null, nextShotId: next?.shot.id ?? null },

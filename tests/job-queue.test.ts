@@ -45,6 +45,8 @@ describe("real PostgreSQL queue recovery regressions", () => {
   }
   it("schedules 1 → 2 → 3 even when the worker crashes after each checkpoint but before queue publication", async () => {
     const jobs = await prepare();
+    // Simulate a plan persisted by an older build with a 2 ↔ 3 dependency cycle.
+    await harness.db!.query("UPDATE jobs SET payload=jsonb_set(payload,'{shot,dependencies}',$2::jsonb) WHERE shot_id=$1", [jobs[1].shotId, JSON.stringify([jobs[0].shotId, jobs[2].shotId])]);
     for (let n = 0; n < 2; n++) {
       await harness.db!.query("UPDATE shots SET state='completed' WHERE id=$1", [jobs[n].shotId]);
       await harness.db!.query("UPDATE jobs SET state='completed' WHERE shot_id=$1", [jobs[n].shotId]);
@@ -92,6 +94,12 @@ describe("idempotent dependency-aware job queue", () => {
     const jobs = planGenerationJobs("project", [scene(shots)]);
     expect(readyJobs(jobs, new Set(), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-1","shot-3"]);
     expect(readyJobs(jobs, new Set(["shot-1"]), new Set(), 4).map((job) => job.shotId)).toEqual(["shot-2","shot-3"]);
+  });
+  it("does not deadlock after shot one when screenplay dependencies mistakenly point to a future shot", () => {
+    const jobs = planGenerationJobs("project", [scene([shot("s1"), shot("s2", ["s1", "s3"]), shot("s3", ["s2"])])]);
+    expect(jobs[1].dependencies).toEqual(["s1"]);
+    expect(readyJobs(jobs, new Set(["s1"]), new Set(), 1)[0].shotId).toBe("s2");
+    expect(readyJobs(jobs, new Set(["s1", "s2"]), new Set(), 1)[0].shotId).toBe("s3");
   });
   it("ignores non-shot graph IDs that would otherwise deadlock the queue", () => {
     const jobs = planGenerationJobs("project", [scene([shot("shot-1", ["character-1", "location-1"])])]);

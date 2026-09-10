@@ -17,7 +17,8 @@ export function planGenerationJobs(projectId: string, scenes: Scene[], options: 
   const sceneOrder = new Map(scenes.map((scene, index) => [scene.id, index]));
   const sceneByShot = new Map(jobs.map(({ scene, shot }) => [shot.id, scene.id]));
   const shotIds = new Set(sceneByShot.keys());
-  return jobs.map(({ scene, shot }) => {
+  const shotOrder = new Map(jobs.map(({ shot }, index) => [shot.id, index]));
+  return jobs.map(({ scene, shot }, index) => {
     // Structured screenplay models occasionally put character, wardrobe or location
     // IDs in this field. Only shot IDs are scheduling dependencies; accepting any
     // other graph node leaves the first generation permanently in `planned`.
@@ -29,7 +30,10 @@ export function planGenerationJobs(projectId: string, scenes: Scene[], options: 
     // `shot.dependencies`; treating every hard cut as dependent serializes a
     // whole movie and makes independent locations unnecessarily slow.
     const dependencies = [...new Set(shot.dependencies)]
-      .filter((id) => id !== shot.id && shotIds.has(id));
+      // Only prior generated shots can supply a production reference. LLMs
+      // sometimes confuse nextShotId with dependencies, producing 2 ↔ 3 and
+      // stalling forever after Shot 1. Future story context is not a job lock.
+      .filter((id) => shotIds.has(id) && (shotOrder.get(id) ?? index) < index);
     const specHash = contentHash({
       prompt: shot.generationPrompt,
       references: shot.continuity.requiredReferences,

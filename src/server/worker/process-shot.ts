@@ -52,6 +52,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     `WITH claimed AS (
        UPDATE jobs SET state='generating',started_at=now(),attempt=attempt+1,updated_at=now()
        WHERE id=$1 AND state IN ('queued','retrying') AND available_at<=now() AND attempt<max_attempts
+         AND EXISTS (SELECT 1 FROM shots sh WHERE sh.id=jobs.shot_id AND sh.state<>'completed')
        RETURNING *
      )
      SELECT claimed.*,p.model_id,p.resolution,p.aspect_ratio,p.render_tier,p.maximum_budget_usd,p.spent_usd,p.reserved_usd,

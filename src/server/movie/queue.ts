@@ -105,13 +105,23 @@ export async function enqueueReadyProjectJobs(projectId: string): Promise<number
   const ready = await transaction(async (client) => {
     const project = await client.query<{ status: string }>("SELECT status FROM projects WHERE id=$1 FOR UPDATE", [projectId]);
     if (!project.rows[0] || ["paused", "failed", "cancelled", "completed"].includes(project.rows[0].status)) return [];
-    const completed = await client.query<{ id: string }>("SELECT id FROM shots WHERE project_id=$1 AND state='completed'", [projectId]);
-    const completedIds = new Set(completed.rows.map((row) => row.id));
-    const planned = await client.query<{ id: string; type: string; idempotency_key: string; priority: number; payload: { shot?: { dependencies?: string[] } } }>(
-      "SELECT id,type,idempotency_key,priority,payload FROM jobs WHERE project_id=$1 AND state='planned' ORDER BY priority DESC FOR UPDATE",
+    const timeline = await client.query<{ id: string; state: string }>("SELECT sh.id,sh.state FROM shots sh JOIN scenes s ON s.id=sh.scene_id WHERE sh.project_id=$1 ORDER BY s.number,sh.sequence", [projectId]);
+    const completedIds = new Set(timeline.rows.filter((row) => row.state === "completed").map((row) => row.id));
+    const shotOrder = new Map(timeline.rows.map((row, index) => [row.id, index]));
+    const planned = await client.query<{ id: string; shot_id: string | null; type: string; idempotency_key: string; priority: number; payload: { shot?: { dependencies?: string[] } } }>(
+      "SELECT id,shot_id,type,idempotency_key,priority,payload FROM jobs WHERE project_id=$1 AND state='planned' ORDER BY priority DESC FOR UPDATE",
       [projectId],
     );
-    const rows = planned.rows.filter((job) => (job.payload.shot?.dependencies ?? []).every((id) => completedIds.has(id)));
+    for (const job of planned.rows) {
+      if (!job.payload.shot || !job.shot_id) continue;
+      const deps = job.payload.shot.dependencies ?? [];
+      const preceding = deps.filter((id) => shotOrder.has(id) && (shotOrder.get(id) ?? Infinity) < (shotOrder.get(job.shot_id!) ?? 0));
+      if (preceding.length !== deps.length) {
+        job.payload.shot.dependencies = preceding;
+        await client.query("UPDATE jobs SET payload=$2 WHERE id=$1", [job.id, JSON.stringify(job.payload)]);
+      }
+    }
+    const rows = planned.rows.filter((job) => !completedIds.has(job.shot_id ?? "") && (job.payload.shot?.dependencies ?? []).every((id) => completedIds.has(id)));
     if (rows.length) await client.query("UPDATE jobs SET state='queued',available_at=now() WHERE id=ANY($1::uuid[])", [rows.map((row) => row.id)]);
     return rows;
   });
