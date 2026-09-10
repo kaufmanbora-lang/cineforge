@@ -82,6 +82,17 @@ describe("real PostgreSQL queue recovery regressions", () => {
     expect((await harness.db!.query<{ status: string }>("SELECT status FROM projects")).rows[0].status).toBe("paused");
     expect((await harness.db!.query<{ state: string }>("SELECT state FROM shots WHERE id=$1", [jobs[0].shotId])).rows[0].state).toBe("completed");
   });
+  it("recovers an interrupted assembly promptly but leaves a live FFmpeg heartbeat alone", async () => {
+    await prepare();
+    await harness.db!.query("UPDATE projects SET status='assembling' WHERE id=$1", [projectId]);
+    await harness.db!.query(`INSERT INTO jobs(project_id,type,state,idempotency_key,payload,attempt,updated_at)
+      VALUES ($1,'assemble-movie','generating','assembly-heartbeat','{}',1,now())`, [projectId]);
+    expect(await recoverStaleJobs()).toBe(0);
+    await harness.db!.exec("UPDATE jobs SET updated_at=now()-interval '3 minutes' WHERE type='assemble-movie'");
+    expect(await recoverStaleJobs()).toBe(1);
+    expect((await harness.db!.query<{ state: string; attempt: number }>("SELECT state,attempt FROM jobs WHERE type='assemble-movie'")).rows[0]).toEqual({ state: "queued", attempt: 1 });
+    expect(await recoverStaleJobs()).toBe(0);
+  });
 });
 
 describe("idempotent dependency-aware job queue", () => {

@@ -25,8 +25,8 @@ await recoverActiveProjects();
 await recoverCompletedShotProjects();
 await reconcileQueuedJobs();
 const settingRows = await query<{ settings: { workerConcurrency?: number } }>("SELECT settings FROM workspace_settings WHERE workspace_id=$1", [env().DEFAULT_WORKSPACE_ID]).catch(() => []);
-// Video payloads are streamed to object storage or a temporary file, so a
-// generation slot no longer needs to reserve the worker's full 512 MB plan.
+// The shared queue also runs FFmpeg. Reserve memory for its decoder/encoder
+// buffers rather than treating every slot as a lightweight network request.
 const memoryConcurrency = Math.max(1, Math.floor(env().WORKER_MEMORY_MB / 512));
 const workerConcurrency = Math.max(1, Math.min(16, memoryConcurrency, Number(settingRows[0]?.settings.workerConcurrency ?? env().WORKER_CONCURRENCY)));
 process.stdout.write(`Worker concurrency ${workerConcurrency} for ${env().WORKER_MEMORY_MB} MB memory budget.\n`);
@@ -90,7 +90,7 @@ async function processProjectPlan(databaseJobId: string) {
   }>(
     `WITH claimed AS (
        UPDATE jobs SET state='generating',started_at=now(),attempt=attempt+1,updated_at=now()
-       WHERE id=$1 AND type='plan-project' AND state IN ('queued','retrying') AND available_at<=now()
+       WHERE id=$1 AND type='plan-project' AND state IN ('queued','retrying') AND available_at<=now() AND attempt<max_attempts
        RETURNING *
      )
      SELECT claimed.*,p.prompt,p.duration_seconds,p.model_id,p.resolution,p.render_tier,p.maximum_budget_usd

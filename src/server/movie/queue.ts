@@ -255,9 +255,9 @@ export async function reconcileQueuedJobs(): Promise<number> {
 }
 
 export async function recoverStaleJobs(): Promise<number> {
-  // Video and planning jobs publish frequent heartbeats, so two minutes of
-  // silence proves their worker lease is gone. FFmpeg/audio jobs get a longer
-  // window because their native subprocesses can legitimately stay quiet.
+  // Video, planning and assembly publish heartbeats even while awaiting native
+  // subprocesses. Recover a silent worker after two minutes, not twelve minutes
+  // of an apparently frozen export. Legacy dialogue work has no heartbeat yet.
   const rows = await transaction(async (client) => {
     const result = await client.query<{ id: string; project_id: string; type: string; state: string; idempotency_key: string; priority: number; payload: { exportId?: string; sceneId?: string } }>(
     `UPDATE jobs j SET state=CASE WHEN j.attempt<j.max_attempts THEN 'queued'::job_state ELSE 'failed'::job_state END,
@@ -266,7 +266,7 @@ export async function recoverStaleJobs(): Promise<number> {
          'message','Рабочий процесс прервался. Готовые кадры сохранены; лимит автоматического восстановления ограничен.'),updated_at=now()
      FROM projects p
      WHERE j.project_id=p.id AND (
-       (j.state IN ('generating','validating') AND j.updated_at < now() - CASE WHEN j.type IN ('generate-shot','plan-project') THEN interval '2 minutes' ELSE interval '12 minutes' END)
+       (j.state IN ('generating','validating') AND j.updated_at < now() - CASE WHEN j.type IN ('generate-shot','plan-project','assemble-movie') THEN interval '2 minutes' ELSE interval '12 minutes' END)
        OR (j.state IN ('queued','retrying') AND j.attempt>=j.max_attempts AND j.available_at<=now())
      )
        AND p.status IN ('planning','queued','generating','validating','assembling')
