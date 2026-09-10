@@ -1,5 +1,5 @@
 import { Worker } from "bullmq";
-import { MOVIE_QUEUE, enqueueAutomaticAssemblyIfReady, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverCompletedShotProjects, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob, restoreLegacyAutomaticDialoguePatches, resumeProjectJobs } from "@/server/movie/queue";
+import { ASSEMBLY_PIPELINE_VERSION, MOVIE_QUEUE, enqueueAutomaticAssemblyIfReady, enqueueJobs, pauseProjectJobs, reconcileQueuedJobs, recoverCompletedShotProjects, recoverInterruptedJobs, recoverStaleJobs, redisConnection, requeueDatabaseJob, restoreLegacyAutomaticDialoguePatches } from "@/server/movie/queue";
 import { processShot } from "./process-shot";
 import { processDialoguePatch } from "./process-dialogue";
 import { processAssembly } from "./process-assembly";
@@ -16,6 +16,10 @@ import type { Resolution } from "@/domain/video-models";
 
 const restoredNativeGoogleAudio = await restoreLegacyAutomaticDialoguePatches();
 if (restoredNativeGoogleAudio) process.stdout.write(`Restored native Google audio for ${restoredNativeGoogleAudio} legacy shot(s).\n`);
+// Supersede only unfinished exports from the old pipeline. Saved video assets
+// and completed exports remain intact; recovery builds the new free master.
+await query(`UPDATE jobs SET state='cancelled',updated_at=now() WHERE type='assemble-movie'
+  AND state NOT IN ('completed','cancelled') AND COALESCE(payload->>'pipelineVersion','0')<>$1`, [String(ASSEMBLY_PIPELINE_VERSION)]);
 await recoverInterruptedJobs();
 await recoverActiveProjects();
 await recoverCompletedShotProjects();
@@ -23,7 +27,7 @@ await reconcileQueuedJobs();
 const settingRows = await query<{ settings: { workerConcurrency?: number } }>("SELECT settings FROM workspace_settings WHERE workspace_id=$1", [env().DEFAULT_WORKSPACE_ID]).catch(() => []);
 // Video payloads are streamed to object storage or a temporary file, so a
 // generation slot no longer needs to reserve the worker's full 512 MB plan.
-const memoryConcurrency = Math.max(1, Math.floor(env().WORKER_MEMORY_MB / 256));
+const memoryConcurrency = Math.max(1, Math.floor(env().WORKER_MEMORY_MB / 512));
 const workerConcurrency = Math.max(1, Math.min(16, memoryConcurrency, Number(settingRows[0]?.settings.workerConcurrency ?? env().WORKER_CONCURRENCY)));
 process.stdout.write(`Worker concurrency ${workerConcurrency} for ${env().WORKER_MEMORY_MB} MB memory budget.\n`);
 
@@ -49,9 +53,17 @@ const worker = new Worker(
   },
   { connection: redisConnection(), concurrency: workerConcurrency },
 );
+let reconciling = false;
 const reconciliationTimer = setInterval(() => {
-  void Promise.all([reconcileQueuedJobs(), recoverStaleJobs(), recoverCompletedShotProjects(), restoreLegacyAutomaticDialoguePatches()]).catch((error) => process.stderr.write(`Queue reconciliation failed: ${error instanceof Error ? error.message : String(error)}\n`));
-}, 30_000);
+  if (reconciling) return;
+  reconciling = true;
+  void (async () => {
+    await recoverStaleJobs();
+    await reconcileQueuedJobs();
+    await recoverCompletedShotProjects();
+  })().catch((error) => process.stderr.write(`Queue reconciliation failed: ${error instanceof Error ? error.message : String(error)}\n`))
+    .finally(() => { reconciling = false; });
+}, 15_000);
 reconciliationTimer.unref();
 
 async function recoverActiveProjects() {
@@ -65,7 +77,8 @@ async function recoverActiveProjects() {
     // Deploys recover jobs rejected by the old Omni request shape. This is
     // limited to already-confirmed active projects and never touches completed
     // shots, so a fixed worker continues from the last checkpoint by itself.
-    await resumeProjectJobs(project.id);
+    // Do not turn a deployment into manual Resume: preserve cooldowns, failed
+    // attempts and edited prompts. The reconciler handles durable queued work.
   }
 }
 
@@ -109,7 +122,7 @@ async function processProjectPlan(databaseJobId: string) {
       [job.project_id, plan.summary.title, maximumBudget, estimate.estimatedTotalUsd],
     );
     let queued = await enqueueJobs(planGenerationJobs(job.project_id, plan.scenes, { fastDraft: job.render_tier === "draft" }));
-    if (!queued) queued = await resumeProjectJobs(job.project_id, { manual: true });
+    if (!queued) queued = await reconcileQueuedJobs();
     await query("UPDATE jobs SET state='completed',result=$2,completed_at=now(),last_error=NULL WHERE id=$1", [
       job.id,
       JSON.stringify({ scenes: plan.scenes.length, shots: plan.scenes.reduce((sum, scene) => sum + scene.shots.length, 0), queued }),

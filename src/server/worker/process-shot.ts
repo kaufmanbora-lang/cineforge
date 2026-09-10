@@ -51,7 +51,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
   const rows = await query<JobRow>(
     `WITH claimed AS (
        UPDATE jobs SET state='generating',started_at=now(),attempt=attempt+1,updated_at=now()
-       WHERE id=$1 AND state IN ('queued','retrying') AND available_at<=now()
+       WHERE id=$1 AND state IN ('queued','retrying') AND available_at<=now() AND attempt<max_attempts
        RETURNING *
      )
      SELECT claimed.*,p.model_id,p.resolution,p.aspect_ratio,p.render_tier,p.maximum_budget_usd,p.spent_usd,p.reserved_usd,
@@ -108,17 +108,19 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     try {
       if (!cachedObject) throw new Error("Cached object is missing from object storage.");
       await validateGeneratedShot(cachedObject.bytes, job.payload.shot.durationSeconds);
-      await activateCachedShot(job, cached);
-      await enqueueReadyProjectJobs(job.project_id);
-      await enqueueAutomaticAssemblyIfReady(job.project_id);
-      return { cached: true, storageKey: cached.storageKey };
-    } catch {
+    } catch (error) {
+      if (cachedObject && classifyFailure(error) !== "corrupt") throw error;
       // Metadata without valid media is not a checkpoint. Remove only that
       // unusable cached version before the paid provider call so the same
       // content hash can be persisted again without a uniqueness deadlock.
       await purgeInvalidCachedShot(job, cached);
       await deleteObject(cached.storageKey).catch(() => undefined);
       cached = null;
+    }
+    if (cached) {
+      await activateCachedShot(job, cached);
+      await publishNextWork(job.project_id);
+      return { cached: true, storageKey: cached.storageKey };
     }
   }
   const effectiveModelId = effectiveVideoModelId(job.payload.providerModelId ?? job.model_id, job.render_tier);
@@ -319,10 +321,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     // Keep that human performance intact. Dialogue edits also go back through
     // Google; CineForge never lays a synthetic narrator over provider audio.
     await withDurableDatabaseRetry(() => persistCompletedAsset(job, storageKey, checksum, stored.byteSize, operation.operationId, cost, classifiedQc));
-    await withDurableDatabaseRetry(async () => {
-      await enqueueReadyProjectJobs(job.project_id);
-      await enqueueAutomaticAssemblyIfReady(job.project_id);
-    });
+    await publishNextWork(job.project_id);
     return { cached: false, storageKey };
   } catch (error) {
     const failure = classifyFailure(error);
@@ -331,7 +330,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     await withDurableDatabaseRetry(() => settleFailedReservation(job.id, job.project_id, providerCompleted));
     const environmentalBridgeRejected = Boolean(job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE ENVIRONMENTAL BRIDGE"));
     const mayTryAnotherProviderVariant = !environmentalBridgeRejected && job.attempt < job.max_attempts;
-    if (failure === "moderation"
+    if (mayTryAnotherProviderVariant && failure === "moderation"
       && job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE VEO SAFE BRIDGE")
       && !job.payload.shot.generationPrompt.prompt.includes("CINEFORGE ENVIRONMENTAL BRIDGE")) {
       // The provider may reject even a benign continuation when the supplied
@@ -344,7 +343,7 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
       await requeueDatabaseJob({ databaseJobId: job.id, attempt: job.attempt, delayMs: 1_000 });
       return { cached: false, storageKey: "", retrying: true };
     }
-    if (failure === "moderation"
+    if (mayTryAnotherProviderVariant && failure === "moderation"
       && (job.payload.providerModelId ?? job.model_id).startsWith("gemini-omni")
       && job.payload.shot.generationPrompt?.prompt.includes("CINEFORGE OMNI NEUTRAL RESCUE")) {
       // The neutral Omni rescue consumes the normal final attempt. Allow one
@@ -442,6 +441,17 @@ export async function processShot(databaseJobId: string): Promise<{ cached: bool
     clearInterval(heartbeat);
     releaseOmniProviderSlot?.();
     if (temporaryProviderFilePath) await rm(temporaryProviderFilePath, { force: true }).catch(() => undefined);
+  }
+}
+
+async function publishNextWork(projectId: string): Promise<void> {
+  try {
+    await enqueueReadyProjectJobs(projectId);
+    await enqueueAutomaticAssemblyIfReady(projectId);
+  } catch (error) {
+    // The paid result is already committed. Redis publication failure is not a
+    // generation failure: the reconciler resumes from this exact checkpoint.
+    process.stderr.write(`Deferred queue handoff for ${projectId}: ${error instanceof Error ? error.message : String(error)}\n`);
   }
 }
 

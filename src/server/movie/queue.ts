@@ -6,6 +6,7 @@ import { env } from "@/server/env";
 import { query, transaction } from "@/server/db";
 
 export const MOVIE_QUEUE = "cineforge-movie-generation";
+export const ASSEMBLY_PIPELINE_VERSION = 2;
 
 export function redisConnection() {
   const url = new URL(env().REDIS_URL);
@@ -87,12 +88,10 @@ export async function enqueueJobs(jobs: PlannedJob[]): Promise<number> {
       );
       const row = existing.rows[0];
       if (!row || row.state === "completed" || row.state === "generating" || row.state === "validating") return { id: null, enqueue: false, existing: true };
-      if (!["planned", "failed", "paused", "cancelled", "retrying", "queued"].includes(row.state)) return { id: null, enqueue: false, existing: true };
-      await client.query(
-        "UPDATE jobs SET payload=$2,priority=$3,max_attempts=$4,state=$5,attempt=CASE WHEN state IN ('failed','paused','cancelled') THEN 0 ELSE attempt END,last_error=NULL,available_at=now(),updated_at=now() WHERE id=$1",
-        [row.id, JSON.stringify(job.payload), job.priority, maxAttempts, ready ? "queued" : "planned"],
-      );
-      return { id: row.id, enqueue: ready, existing: true };
+      // Rebuilding an envelope must not reset the provider operation, corrected
+      // prompt, cooldown or attempt budget. Only explicit Resume revives failed
+      // work; reconciliation promotes ready dependencies separately.
+      return { id: row.id, enqueue: false, existing: true };
     });
     if (!result.id || !result.enqueue) continue;
     const bullId = createHash("sha256").update(result.existing ? `${job.idempotencyKey}:envelope:${randomUUID()}` : job.idempotencyKey).digest("hex");
@@ -126,20 +125,7 @@ export async function enqueueReadyProjectJobs(projectId: string): Promise<number
 }
 
 export async function recoverInterruptedJobs(): Promise<number> {
-  const rows = await query<{ id: string; type: string; idempotency_key: string }>(
-    `UPDATE jobs j SET state='queued', available_at=now(), last_error=jsonb_build_object('code','WORKER_RESTART','message','Recovered after worker restart')
-     FROM projects p
-     WHERE j.project_id=p.id
-       AND j.state IN ('generating','validating','retrying')
-       AND p.status IN ('planning','queued','generating','validating','assembling')
-       AND j.updated_at < now() - CASE WHEN j.type IN ('generate-shot','plan-project') THEN interval '2 minutes' ELSE interval '12 minutes' END
-     RETURNING j.id, j.type, j.idempotency_key`,
-  );
-  for (const row of rows) {
-    const bullId = createHash("sha256").update(`${row.idempotency_key}:recovery:${randomUUID()}`).digest("hex");
-    await movieQueue().add(row.type, { databaseJobId: row.id }, { jobId: bullId });
-  }
-  return rows.length;
+  return recoverStaleJobs();
 }
 
 export function isLegacyAutomaticDialogueJob(idempotencyKey: string): boolean {
@@ -238,10 +224,16 @@ export async function restoreLegacyAutomaticDialoguePatches(): Promise<number> {
 }
 
 export async function reconcileQueuedJobs(): Promise<number> {
+  // A crash between saving Shot 1 and publishing Shot 2 used to leave Shot 2
+  // permanently planned. Promote from durable checkpoints on every pass.
+  const projects = await query<{ id: string }>(
+    "SELECT id FROM projects WHERE status IN ('queued','generating','validating') AND EXISTS (SELECT 1 FROM jobs j WHERE j.project_id=projects.id AND j.state='planned')",
+  );
+  for (const project of projects) await enqueueReadyProjectJobs(project.id);
   const rows = await query<{ id: string; type: string; idempotency_key: string; priority: number }>(
     `SELECT j.id,j.type,j.idempotency_key,j.priority FROM jobs j
      JOIN projects p ON p.id=j.project_id
-     WHERE j.state='queued' AND j.available_at<=now()
+     WHERE j.state IN ('queued','retrying') AND j.available_at<=now() AND j.attempt<j.max_attempts
        AND p.status IN ('planning','queued','generating','validating','assembling')`,
   );
   const bucket = Math.floor(Date.now() / 30_000);
@@ -256,16 +248,30 @@ export async function recoverStaleJobs(): Promise<number> {
   // Video and planning jobs publish frequent heartbeats, so two minutes of
   // silence proves their worker lease is gone. FFmpeg/audio jobs get a longer
   // window because their native subprocesses can legitimately stay quiet.
-  const rows = await query<{ id: string; type: string; idempotency_key: string; priority: number }>(
-    `UPDATE jobs j SET state='queued',available_at=now(),started_at=NULL,
-       last_error=jsonb_build_object('code','STALE_JOB_RECOVERY','message','Recovered an orphaned generation job'),updated_at=now()
+  const rows = await transaction(async (client) => {
+    const result = await client.query<{ id: string; project_id: string; type: string; state: string; idempotency_key: string; priority: number; payload: { exportId?: string; sceneId?: string } }>(
+    `UPDATE jobs j SET state=CASE WHEN j.attempt<j.max_attempts THEN 'queued'::job_state ELSE 'failed'::job_state END,
+       available_at=now(),started_at=NULL,
+       last_error=jsonb_build_object('code',CASE WHEN j.attempt<j.max_attempts THEN 'STALE_JOB_RECOVERY' ELSE 'WORKER_RECOVERY_EXHAUSTED' END,
+         'message','Рабочий процесс прервался. Готовые кадры сохранены; лимит автоматического восстановления ограничен.'),updated_at=now()
      FROM projects p
-     WHERE j.project_id=p.id AND j.state IN ('generating','validating','retrying')
-       AND j.updated_at < now() - CASE WHEN j.type IN ('generate-shot','plan-project') THEN interval '2 minutes' ELSE interval '12 minutes' END
+     WHERE j.project_id=p.id AND (
+       (j.state IN ('generating','validating') AND j.updated_at < now() - CASE WHEN j.type IN ('generate-shot','plan-project') THEN interval '2 minutes' ELSE interval '12 minutes' END)
+       OR (j.state IN ('queued','retrying') AND j.attempt>=j.max_attempts AND j.available_at<=now())
+     )
        AND p.status IN ('planning','queued','generating','validating','assembling')
-     RETURNING j.id,j.type,j.idempotency_key,j.priority`,
-  );
-  for (const row of rows) {
+     RETURNING j.id,j.project_id,j.type,j.state,j.idempotency_key,j.priority,j.payload`,
+    );
+    for (const row of result.rows.filter((job) => job.state === "failed")) {
+      if (row.payload.exportId) await client.query("UPDATE exports SET state='failed',qc_report=$2 WHERE id=$1", [row.payload.exportId, JSON.stringify({ code: "WORKER_RECOVERY_EXHAUSTED" })]);
+      if (!row.payload.sceneId) await client.query(
+        "UPDATE projects SET status='paused',last_error=$2,updated_at=now() WHERE id=$1 AND status NOT IN ('completed','cancelled')",
+        [row.project_id, JSON.stringify({ code: "WORKER_RECOVERY_EXHAUSTED", message: "Обработчик несколько раз прервался. Готовые кадры сохранены; бесконечный перезапуск остановлен." })],
+      );
+    }
+    return result.rows;
+  });
+  for (const row of rows.filter((job) => job.state === "queued")) {
     const bullId = createHash("sha256").update(`${row.idempotency_key}:stale:${Date.now()}`).digest("hex");
     await movieQueue().add(row.type, { databaseJobId: row.id }, { jobId: bullId, priority: Math.max(1, 20_000 - row.priority) });
   }
@@ -348,17 +354,18 @@ export async function recoverCompletedShotProjects(): Promise<number> {
   const rows = await query<{ id: string }>(
     `SELECT p.id FROM projects p
      WHERE p.status IN ('paused','failed','generating','validating','assembling')
-       AND COALESCE(p.last_error->>'code','') <> 'FINAL_QC_FAILED'
        AND EXISTS (SELECT 1 FROM shots s WHERE s.project_id=p.id AND s.state<>'cancelled')
        AND NOT EXISTS (SELECT 1 FROM shots s WHERE s.project_id=p.id AND s.state NOT IN ('completed','cancelled'))
        AND NOT EXISTS (
          SELECT 1 FROM jobs j WHERE j.project_id=p.id AND j.type='assemble-movie' AND j.state='failed'
+           AND j.payload->>'pipelineVersion'=$1
            AND (j.attempt>=j.max_attempts OR COALESCE(j.last_error->>'code','')='FINAL_QC_FAILED')
        )
        AND NOT EXISTS (
          SELECT 1 FROM jobs j WHERE j.project_id=p.id AND j.type='dialogue-patch'
            AND j.state IN ('planned','queued','retrying','generating','validating')
        )`,
+    [String(ASSEMBLY_PIPELINE_VERSION)],
   );
   let recovered = 0;
   for (const row of rows) {
@@ -432,7 +439,7 @@ export async function enqueueAssembly(input: {
        JOIN shots sh ON sh.id=sv.shot_id WHERE sv.active=true AND sh.project_id=$1 AND sh.state<>'cancelled' AND ($2::text IS NULL OR sh.scene_id=$2)`,
       [input.projectId, input.sceneId ?? null],
     );
-    const key = `assemble:${input.projectId}:${input.sceneId ?? "all"}:${input.format}:${createHash("sha256").update(versions.rows[0]?.versions ?? "").digest("hex")}`;
+    const key = `assemble:v${ASSEMBLY_PIPELINE_VERSION}:${input.projectId}:${input.sceneId ?? "all"}:${input.format}:${input.resolution}:${createHash("sha256").update(versions.rows[0]?.versions ?? "").digest("hex")}`;
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [key]);
     const existing = await client.query<{ id: string; state: string; payload: { exportId?: string } }>("SELECT id,state,payload FROM jobs WHERE idempotency_key=$1 FOR UPDATE", [key]);
     if (existing.rows[0]?.payload.exportId) {
@@ -451,7 +458,7 @@ export async function enqueueAssembly(input: {
       `INSERT INTO jobs (project_id,type,state,idempotency_key,priority,payload)
        VALUES ($1,'assemble-movie','queued',$2,1,$3)
        ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id`,
-      [input.projectId, key, JSON.stringify({ ...input, exportId: exportRow.rows[0].id })],
+      [input.projectId, key, JSON.stringify({ ...input, pipelineVersion: ASSEMBLY_PIPELINE_VERSION, exportId: exportRow.rows[0].id })],
     );
     return { exportId: exportRow.rows[0].id, jobId: job.rows[0].id, enqueue: true, key, state: "queued" };
   });

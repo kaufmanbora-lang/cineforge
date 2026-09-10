@@ -44,6 +44,14 @@ export async function GET(request: Request) {
     if (!projectId) return NextResponse.json({ projects });
     const project = projects.find((item) => item.id === projectId);
     if (!project) return NextResponse.json({ error: "Проект не найден." }, { status: 404 });
+    if (new URL(request.url).searchParams.get("view") === "production") {
+      const [plan, jobs, checkpoints] = await Promise.all([
+        latestMoviePlan(projectId),
+        query("SELECT id,type,state,scene_id,shot_id,attempt,max_attempts,last_error,result,available_at,created_at,updated_at,started_at,completed_at FROM jobs WHERE project_id=$1 ORDER BY created_at DESC LIMIT 100", [projectId]),
+        query("SELECT sequence,event_type,completed_shot_ids,failed_shot_ids,pending_shot_ids,current_job_id,created_at FROM checkpoints WHERE project_id=$1 ORDER BY sequence DESC LIMIT 1", [projectId]),
+      ]);
+      return NextResponse.json({ project, plan, jobs, checkpoints });
+    }
     const [plan, jobs, checkpoints, timeline, versions, exports, characters, locations] = await Promise.all([
       latestMoviePlan(projectId),
       query("SELECT id,type,state,scene_id,shot_id,attempt,max_attempts,last_error,created_at,updated_at,started_at,completed_at FROM jobs WHERE project_id=$1 ORDER BY created_at DESC LIMIT 500", [projectId]),

@@ -2,8 +2,13 @@ import { describe, expect, it } from "vitest";
 import { nextCheckpoint, resumeFromCheckpoint, type CheckpointSnapshot } from "@/server/movie/checkpoints";
 import { preservePreviewUrls } from "@/domain/movie";
 import { estimateRemainingGenerationSeconds, formatRemainingGenerationTime } from "@/domain/estimation";
-import { canStreamCopyVideo } from "@/server/movie/ffmpeg";
-import { createExpressDraftMoviePlan } from "@/server/providers/openai";
+import { assembleMovieFiles, canStreamCopyVideo } from "@/server/movie/ffmpeg";
+import { createExpressDraftMoviePlan, moviePlanRequest } from "@/server/providers/openai";
+import { execFile, spawnSync } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { promisify } from "node:util";
 
 const initial: CheckpointSnapshot = { projectId: "p", planVersion: 1, completedShotIds: ["s1"], failedShotIds: [], pendingShotIds: ["s2","s3"], currentJobId: "j2", spentUsd: 1, projectMemoryHash: "memory", createdAt: "2026-01-01" };
 
@@ -66,6 +71,10 @@ describe("dynamic generation ETA", () => {
 });
 
 describe("ten-second express planning", () => {
+  it("requests three full ten-second beats for a thirty-second Omni draft", () => {
+    expect(moviePlanRequest({ projectId: "p", idea: "A continuous journey", durationSeconds: 30, videoModelId: "gemini-omni-flash-preview", fastDraft: true })).toContain("exactly 3 shots with durations [10, 10, 10]");
+    expect(moviePlanRequest({ projectId: "p", idea: "A continuous journey", durationSeconds: 30, videoModelId: "veo-3.1-fast-generate-preview", fastDraft: true })).toContain("exactly 4 shots with durations [8, 8, 8, 6]");
+  });
   it("creates one exact-duration production shot without waiting for an LLM", () => {
     const plan = createExpressDraftMoviePlan({
       projectId: "project-express",
@@ -79,6 +88,41 @@ describe("ten-second express planning", () => {
     expect(plan.scenes[0].shots[0].audioContext.dialogue[0].text).toBe("Привет, как дела?");
     expect(plan.scenes[0].shots[0].action).toContain("зимнему Нью-Йорку");
   });
+});
+
+const ffmpeg = process.env.FFMPEG_PATH ?? "ffmpeg";
+const ffprobe = process.env.FFPROBE_PATH ?? "ffprobe";
+const hasMediaTools = [ffmpeg, ffprobe].every((bin) => spawnSync(bin, ["-version"], { windowsHide: true, timeout: 10_000 }).status === 0);
+describe.skipIf(!hasMediaTools)("real FFmpeg end-to-end assembly (no video API calls)", () => {
+  const run = promisify(execFile);
+  it.each([{ clips: 3, seconds: 10, resolution: "720p" as const }, { clips: 6, seconds: 5, resolution: "1080p" as const }])(
+    "assembles $clips × $seconds seconds into exactly 30s at $resolution without AAC timestamp drift", async ({ clips, seconds, resolution }) => {
+      const root = await mkdtemp(join(tmpdir(), "cineforge-media-regression-"));
+      try {
+        const paths: string[] = [];
+        for (const [n, color] of ["red", "green", "blue"].entries()) {
+          const file = join(root, `source-${n}.mp4`);
+          await run(ffmpeg, ["-v", "error", "-nostdin", "-f", "lavfi", "-i", `color=c=${color}:s=1280x720:r=24`, "-f", "lavfi", "-i", `sine=frequency=${440 + n * 220}:sample_rate=44100`, "-t", String(seconds + (clips === 6 ? 0.25 : 0)), "-c:v", "libx264", "-preset", "veryfast", "-threads", "1", "-c:a", "aac", file], { windowsHide: true, timeout: 30_000 });
+          paths.push(file);
+        }
+        const output = join(root, "movie.mp4");
+        const stages: string[] = [];
+        const qc = await assembleMovieFiles({
+          clips: Array.from({ length: clips }, (_, n) => ({ filePath: paths[n % 3], durationSeconds: seconds })), resolution, outputPath: output,
+          onProgress: async (stage) => { stages.push(stage); },
+        });
+        expect(qc.issues).toEqual([]);
+        expect(qc.passed).toBe(true);
+        expect(Math.abs(qc.probe.duration - 30)).toBeLessThanOrEqual(1 / 24);
+        expect(stages.at(-1)).toBe("quality-check");
+        for (let n = 0; n < clips; n++) {
+          const { stdout } = await run(ffmpeg, ["-v", "error", "-ss", String(n * seconds + 0.5), "-i", output, "-frames:v", "1", "-vf", "scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"], { encoding: "buffer", windowsHide: true });
+          const channels = [...stdout];
+          expect(channels.indexOf(Math.max(...channels))).toBe(n % 3);
+        }
+      } finally { await rm(root, { recursive: true, force: true }); }
+    }, 120_000,
+  );
 });
 
 describe("fast assembly path", () => {

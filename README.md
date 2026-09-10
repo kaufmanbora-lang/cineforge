@@ -52,8 +52,8 @@ Desktop-клиент и облачный Movie Engine разделены нам�
 - Checkpoint после каждого принятого shot; completed shots исключаются из resume.
 - Reference image loader и передача final frame предыдущего shot как first-frame reference, когда выбранная модель это поддерживает.
 - AI Director QC каждого shot по metadata и representative frame. Низкий score улучшает prompt и ставит только этот shot на ограниченный retry.
-- Нативная речь Google сохраняется вместе с мимикой, эмоцией и синхронизацией губ; Voice Bible повторяет тембр, возраст, акцент, ритм и манеру речи персонажа в каждом следующем запросе. `gpt-4o-mini-tts` используется только для точечного недеструктивного исправления уже готовой реплики.
-- Non-destructive editor: timestamp/scene impact analysis, dialogue-only patch без перекодирования video stream и отдельные shot versions.
+- Нативная речь Google сохраняется вместе с мимикой, эмоцией и синхронизацией губ; Voice Bible повторяет описание голоса. Это не гарантированная блокировка voice identity. Автоматическая TTS-озвучка поверх Google отключена.
+- Non-destructive editor: timestamp/scene impact analysis и отдельные shot versions. Изменение реплики отправляет затронутый shot в Google; сохранение каждого пикселя внутри изменяемого shot не гарантируется.
 - FFmpeg normalisation: 24 fps, фиксированное разрешение, H.264, AAC 48 kHz, loudness `-16 LUFS`, `faststart`.
 - Final QC: ffprobe integrity, video/audio stream, resolution, FPS, sample rate, black-frame scan, maximum audio level и duplicate asset checks.
 - MP4/MOV assembly, SRT, Markdown screenplay и JSON project archive.
@@ -62,6 +62,18 @@ Desktop-клиент и облачный Movie Engine разделены нам�
 - Профессиональный интерфейс: Project Library, Create Movie, AI Screenwriter, Characters, Locations, Editor, Renders, Settings.
 
 ## Актуальные API, проверенные 23 августа 2026
+
+### Исправления восстановления и монтажа — 10 сентября 2026
+
+- Reconciliation каждые 15 секунд подхватывает кадры, оставшиеся `planned` после сохранения предыдущего кадра и обрыва Redis. Завершённое видео не превращается в ошибку генерации из-за неудачной отправки следующего задания.
+- Повторное enqueue/deploy сохраняет исправленный prompt, provider operation, cooldown и счётчик попыток. Восстановление упавшего процесса учитывает `max_attempts`, а не повторяется бесконечно. Настоящие ограничения Google не скрываются и не обходятся.
+- На worker с 512 MB одновременно выполняется одно тяжёлое задание; FFmpeg использует один поток H.264 без lookahead. На сервере с большим объёмом памяти параллелизм увеличивается. Это предотвращает одновременные тяжёлые склейки на малом тарифе, но не ускоряет очередь самого Google.
+- Монтаж v2 использует PCM-промежуточные файлы и кодирует AAC один раз, явно задаёт длительность каждого отрезка; сохраняет вертикальную ориентацию. При обновлении пересобирает незавершённые старые экспорты без повторной видеогенерации.
+- Плеер ждёт следующий хронологический shot, если тот ещё генерируется, и продолжает после его появления; готовые более поздние кадры не перепрыгивают через пробел в фильме.
+- Fast Draft для Omni запрашивает три содержательных 10-секундных shot на 30 секунд. Это указание планировщику, не обещание точной длительности ответа закрытой видеомодели.
+- `pnpm test`: SQL-регрессии на изолированном PGlite/PostgreSQL из настоящей миграции, потеря отправки после checkpoint, сохранение cooldown и ограничение восстановления. Если FFmpeg/ffprobe доступны в PATH или `FFMPEG_PATH`/`FFPROBE_PATH`, дополнительно запускаются реальные тесты склейки 3×10 и 6×5 секунд с проверкой длительности, порядка цветов, FPS, разрешения и аудио. Эти тесты не обращаются к платным API.
+
+Официальные источники проверки: [Google Omni](https://ai.google.dev/gemini-api/docs/omni), [FFmpeg concat](https://ffmpeg.org/ffmpeg-formats.html#concat-1), [OpenAI latency optimization](https://developers.openai.com/api/docs/guides/latency-optimization). Каталог аккаунта по-прежнему определяет доступность моделей; новая Omni 1.1 показывается как обнаруженная, без автоматической смены модели уже начатого фильма.
 
 Реестр capabilities в [`src/domain/video-models.ts`](src/domain/video-models.ts) основан только на официальной документации.
 

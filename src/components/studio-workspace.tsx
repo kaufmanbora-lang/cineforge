@@ -12,7 +12,7 @@ import { GOOGLE_VIDEO_MODELS, isNativeResolution, normalizeResolution, type Aspe
 import { Button, Segmented, StatusDot } from "./ui";
 import { errorMessageRu, lockLabelRu, projectStatusRu } from "@/lib/ru";
 
-type JobRow = { id: string; type: string; state: string; scene_id: string | null; shot_id: string | null; last_error: unknown; created_at: string; updated_at: string; started_at: string | null; completed_at: string | null };
+type JobRow = { id: string; type: string; state: string; scene_id: string | null; shot_id: string | null; last_error: unknown; result?: { stage?: string; completed?: number; total?: number }; created_at: string; updated_at: string; started_at: string | null; completed_at: string | null };
 type CheckpointRow = { sequence: string; event_type: string; completed_shot_ids: string[]; failed_shot_ids: string[]; pending_shot_ids: string[]; created_at: string };
 type DetailPayload = { project: ProjectRecord; plan: MoviePlan | null; jobs: JobRow[]; checkpoints: CheckpointRow[] };
 type PreviewClip = { shot_id: string; scene_id: string; url: string; version: number; continuity_score: string | null };
@@ -45,6 +45,7 @@ export function StudioWorkspace() {
   const [etaClockMs, setEtaClockMs] = useState(0);
   const videoRef = useRef<HTMLVideoElement>(null);
   const autoContinueRef = useRef(false);
+  const waitingAfterShotRef = useRef<string | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
   const microphoneStreamRef = useRef<MediaStream | null>(null);
@@ -70,7 +71,7 @@ export function StudioWorkspace() {
     projectLoadInFlightRef.current = true;
     try {
       const [detailResponse, previewResponse] = await Promise.all([
-        fetch(`/api/projects?id=${encodeURIComponent(id)}`, { cache: "no-store", signal: AbortSignal.timeout(20_000) }),
+        fetch(`/api/projects?id=${encodeURIComponent(id)}&view=production`, { cache: "no-store", signal: AbortSignal.timeout(20_000) }),
         fetch(`/api/projects/${id}/preview`, { cache: "no-store", signal: AbortSignal.timeout(20_000) }),
       ]);
       const payload = await detailResponse.json();
@@ -94,6 +95,11 @@ export function StudioWorkspace() {
         setNotice(errorMessageRu(payload.project.lastError.message, "Проект остановлен с ошибкой. Можно безопасно повторить действие."));
       } else if (payload.project.status === "planning") {
         setNotice("Проект сохранён. ИИ-сценарист создаёт сценарий и память в фоновой очереди — окно можно закрыть.");
+      } else if (payload.project.status === "assembling") {
+        const assembly = (payload.jobs as JobRow[]).find((job) => job.type === "assemble-movie" && job.state === "generating");
+        const result = assembly?.result;
+        const labels: Record<string, string> = { downloading: "Загрузка сохранённых кадров", normalizing: "Подготовка кадров к склейке", muxing: "Склейка в один фильм", "quality-check": "Финальная проверка видео и звука" };
+        setNotice(result?.stage ? `${labels[result.stage] ?? "Монтаж"}: ${result.completed ?? 0}/${result.total ?? payload.project.totalShots}. Повторная генерация не требуется.` : "Все кадры сохранены. Фильм в очереди на автоматическую склейку.");
       } else if (["queued","generating","validating","assembling"].includes(payload.project.status)) {
         setNotice(`Производство работает: готово ${payload.project.completedShots} из ${payload.project.totalShots} кадров.`);
       } else if (payload.project.status === "completed") {
@@ -103,7 +109,7 @@ export function StudioWorkspace() {
       } else if (!quiet) {
         setNotice(payload.plan ? `Из памяти проекта загружено сцен: ${payload.plan.scenes.length}.` : "У проекта ещё нет сценария. Можно повторить планирование без создания копии.");
       }
-    } catch (error) { if (!quiet) setNotice(errorMessageRu(error, "Не удалось загрузить проект.")); }
+    } catch (error) { setNotice(errorMessageRu(error, "Связь с сервером прервалась. Готовые кадры сохранены; проверяю соединение…")); }
     finally { projectLoadInFlightRef.current = false; }
   }, []);
 
@@ -135,10 +141,10 @@ export function StudioWorkspace() {
   }, [loadProject]);
 
   useEffect(() => {
-    if (!projectId || !detail || ["draft","planned","completed","paused","failed","cancelled"].includes(detail.project.status)) return;
+    if (!projectId || !productionStatus || ["draft","planned","completed","paused","failed","cancelled"].includes(productionStatus)) return;
     const interval = window.setInterval(() => void loadProject(projectId, true), 2_500);
     return () => window.clearInterval(interval);
-  }, [detail, loadProject, projectId]);
+  }, [productionStatus, loadProject, projectId]);
 
   useEffect(() => {
     if (!["planning","queued","generating","validating","assembling"].includes(productionStatus)) return;
@@ -151,6 +157,19 @@ export function StudioWorkspace() {
     autoContinueRef.current = false;
     void videoRef.current?.play().catch(() => setNotice("Следующий кадр выбран. Нажмите воспроизведение, если браузер заблокировал автозапуск."));
   }, [selectedPreview]);
+
+  useEffect(() => {
+    const previous = waitingAfterShotRef.current;
+    if (!previous) return;
+    const ordered = detail?.plan?.scenes.flatMap((scene) => scene.shots) ?? [];
+    const nextId = ordered[ordered.findIndex((shot) => shot.id === previous) + 1]?.id;
+    const next = preview.clips.find((clip) => clip.shot_id === nextId);
+    if (!next) return;
+    waitingAfterShotRef.current = null;
+    autoContinueRef.current = true;
+    setSelectedSceneId(next.scene_id);
+    setSelectedShotId(next.shot_id);
+  }, [preview.clips, detail?.plan]);
 
   useEffect(() => () => {
     if (voiceTimeoutRef.current !== null) window.clearTimeout(voiceTimeoutRef.current);
@@ -329,9 +348,16 @@ export function StudioWorkspace() {
   function selectRelative(offset: number) { const index = scenes.findIndex((scene) => scene.id === selectedScene?.id); const next = scenes[Math.max(0, Math.min(scenes.length - 1, index + offset))]; if (next) { setSelectedSceneId(next.id); setSelectedShotId(preview.clips.find((clip) => clip.scene_id === next.id)?.shot_id ?? ""); } }
   function continuePreview() {
     if (!selectedPreview) return;
-    const index = preview.clips.findIndex((clip) => clip.shot_id === selectedPreview.shot_id);
-    const next = preview.clips[index + 1];
-    if (!next) return;
+    const ordered = scenes.flatMap((scene) => scene.shots);
+    const index = ordered.findIndex((shot) => shot.id === selectedPreview.shot_id);
+    const nextId = ordered[index + 1]?.id;
+    const next = preview.clips.find((clip) => clip.shot_id === nextId);
+    if (!next) {
+      waitingAfterShotRef.current = nextId ? selectedPreview.shot_id : null;
+      if (nextId) setNotice("Этот кадр готов. Жду следующий — воспроизведение продолжится автоматически после его сохранения.");
+      return;
+    }
+    waitingAfterShotRef.current = null;
     autoContinueRef.current = true;
     setSelectedSceneId(next.scene_id);
     setSelectedShotId(next.shot_id);

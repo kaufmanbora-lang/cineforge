@@ -16,6 +16,9 @@ export interface MediaProbe {
   sampleRate: number | null;
   hasVideo: boolean;
   hasAudio: boolean;
+  videoDuration?: number;
+  videoStart?: number;
+  codec?: string;
 }
 
 export interface FinalMediaQc {
@@ -36,9 +39,9 @@ export function canStreamCopyVideo(probe: Pick<MediaProbe, "width" | "height" | 
 export async function probeMedia(filePath: string): Promise<MediaProbe> {
   const { stdout } = await execFileAsync(env().FFPROBE_PATH, [
     "-v", "error", "-show_streams", "-show_format", "-of", "json", filePath,
-  ], { maxBuffer: 8 * 1024 * 1024 });
+  ], { maxBuffer: 8 * 1024 * 1024, timeout: 60_000, windowsHide: true });
   const payload = JSON.parse(stdout) as {
-    streams?: Array<{ codec_type?: string; width?: number; height?: number; r_frame_rate?: string; sample_rate?: string }>;
+    streams?: Array<{ codec_type?: string; codec_name?: string; duration?: string; start_time?: string; width?: number; height?: number; r_frame_rate?: string; sample_rate?: string }>;
     format?: { duration?: string };
   };
   const video = payload.streams?.find((stream) => stream.codec_type === "video");
@@ -51,6 +54,9 @@ export async function probeMedia(filePath: string): Promise<MediaProbe> {
     sampleRate: audio?.sample_rate ? Number(audio.sample_rate) : null,
     hasVideo: Boolean(video),
     hasAudio: Boolean(audio),
+    videoDuration: video?.duration ? Number(video.duration) : undefined,
+    videoStart: Number(video?.start_time ?? 0),
+    codec: video?.codec_name,
   };
 }
 
@@ -110,20 +116,32 @@ export async function assembleMovieFiles(input: {
   resolution: "720p" | "1080p" | "4k";
   outputFormat?: "mp4" | "mov";
   outputPath: string;
+  onProgress?: (stage: string, completed: number, total: number) => Promise<void>;
 }): Promise<FinalMediaQc> {
   if (!input.clips.length) throw new Error("Cannot assemble a movie without clips.");
   const tempRoot = path.join(path.dirname(input.outputPath), `cineforge-normalized-${randomUUID()}`);
   await mkdir(tempRoot, { recursive: true });
   try {
-    const dimensions = input.resolution === "4k" ? "3840:2160" : input.resolution === "1080p" ? "1920:1080" : "1280:720";
+    const firstProbe = await probeMedia(input.clips[0].filePath);
+    const landscape = input.resolution === "4k" ? [3840, 2160] : input.resolution === "1080p" ? [1920, 1080] : [1280, 720];
+    const dimensions = (firstProbe.height > firstProbe.width ? landscape.toReversed() : landscape).join(":");
     const normalized: string[] = [];
+    const durations: number[] = [];
     for (let index = 0; index < input.clips.length; index += 1) {
       const source = input.clips[index].filePath;
-      const target = path.join(tempRoot, `clip-${index}.mp4`);
+      const target = path.join(tempRoot, `clip-${index}.mov`);
       const sourceProbe = await probeMedia(source);
       if (!sourceProbe.hasVideo) throw new Error(`Invalid media: source clip ${index + 1} has no video stream.`);
-      const clipDuration = input.clips[index].durationSeconds;
-      const canCopyVideo = canStreamCopyVideo(sourceProbe, input.resolution);
+      const clipDuration = input.clips[index].durationSeconds ?? sourceProbe.videoDuration ?? sourceProbe.duration;
+      if (!Number.isFinite(clipDuration) || clipDuration <= 0) throw new Error(`Invalid media: clip ${index + 1} has invalid duration.`);
+      if ((sourceProbe.videoDuration ?? sourceProbe.duration) + 1 / 24 < clipDuration) throw new Error(`Invalid media: clip ${index + 1} is shorter than its planned duration.`);
+      durations.push(clipDuration);
+      // Copy only frame-exact sources. -t with stream copy can retain B-frames
+      // past the cut; audio padding must not decide the next clip's timestamp.
+      const canCopyVideo = `${sourceProbe.width}:${sourceProbe.height}` === dimensions
+        && sourceProbe.codec === "h264" && Math.abs(sourceProbe.frameRate - 24) < 0.01
+        && Math.abs((sourceProbe.videoDuration ?? sourceProbe.duration) - clipDuration) < 1 / 48
+        && Math.abs(sourceProbe.videoStart ?? 0) < 1 / 48;
       const audioBoundaryFilter = clipDuration
         ? `atrim=start=0:end=${clipDuration.toFixed(3)},asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,afade=t=in:st=0:d=0.04,afade=t=out:st=${Math.max(0, clipDuration - 0.06).toFixed(3)}:d=0.06,loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur=${clipDuration.toFixed(3)},atrim=end=${clipDuration.toFixed(3)}`
         : "aresample=48000:async=1:first_pts=0,loudnorm=I=-16:TP=-1.5:LRA=11";
@@ -132,24 +150,29 @@ export async function assembleMovieFiles(input: {
         ...(!sourceProbe.hasAudio ? ["-f", "lavfi", "-t", (clipDuration ?? sourceProbe.duration).toFixed(3), "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"] : []),
         ...(clipDuration ? ["-t", clipDuration.toFixed(3)] : []),
         "-map", "0:v:0", "-map", sourceProbe.hasAudio ? "0:a:0" : "1:a:0",
-        ...(!canCopyVideo ? ["-vf", `scale=${dimensions}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${dimensions}:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p`] : []),
+        ...(!canCopyVideo ? ["-vf", `trim=duration=${clipDuration},setpts=PTS-STARTPTS,scale=${dimensions}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${dimensions}:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p`] : []),
         // Every generated shot is an isolated audio context. Trimming, resetting
         // timestamps and fading the few boundary milliseconds prevents packets,
         // old speech or a finished music cue from leaking into the next shot.
         "-af", audioBoundaryFilter,
-        ...(canCopyVideo ? ["-c:v", "copy"] : ["-c:v", "libx264", "-threads:v", "2", "-preset", "veryfast", "-crf", "18"]),
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        "-movflags", "+faststart", target,
-      ], { maxBuffer: 16 * 1024 * 1024 });
+        ...(canCopyVideo ? ["-c:v", "copy"] : ["-c:v", "libx264", "-threads:v", "1", "-preset", "veryfast", "-tune", "zerolatency", "-crf", "18", "-x264-params", "ref=1:rc-lookahead=0:sync-lookahead=0"]),
+        // PCM intermediates avoid accumulating AAC encoder delay at every cut.
+        // Encode AAC once, in the final mux, preserving native Google voices.
+        "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", "-video_track_timescale", "24000", target,
+      ], { maxBuffer: 2 * 1024 * 1024, timeout: 10 * 60_000, windowsHide: true });
       normalized.push(target);
+      await input.onProgress?.("normalizing", index + 1, input.clips.length);
     }
     const concatFile = path.join(tempRoot, "concat.txt");
-    await writeFile(concatFile, normalized.map((file) => `file '${file.replaceAll("'", "'\\''")}'`).join("\n"));
+    await writeFile(concatFile, normalized.map((file, index) => `file '${file.replaceAll("\\", "/").replaceAll("'", "'\\''")}'\nduration ${durations[index].toFixed(6)}`).join("\n"));
+    const expectedDuration = durations.reduce((sum, duration) => sum + duration, 0);
+    await input.onProgress?.("muxing", input.clips.length, input.clips.length);
     await execFileAsync(env().FFMPEG_PATH, [
       "-y", "-nostdin", "-threads", "1", "-f", "concat", "-safe", "0", "-i", concatFile,
-      "-c", "copy", "-movflags", "+faststart", input.outputPath,
-    ], { maxBuffer: 16 * 1024 * 1024 });
-    const expectedDuration = input.clips.reduce((sum, clip) => sum + (clip.durationSeconds ?? 0), 0) || undefined;
+      "-t", expectedDuration.toFixed(6), "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy",
+      "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", input.outputPath,
+    ], { maxBuffer: 2 * 1024 * 1024, timeout: 10 * 60_000, windowsHide: true });
+    await input.onProgress?.("quality-check", input.clips.length, input.clips.length);
     return await finalMediaQc(input.outputPath, dimensions, expectedDuration);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
@@ -170,14 +193,14 @@ async function finalMediaQc(filePath: string, expectedDimensions: string, expect
   }
   const blackScan = await execFileAsync(env().FFMPEG_PATH, [
     "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1", "-i", filePath, "-vf", "blackdetect=d=0.4:pic_th=0.98:pix_th=0.02", "-an", "-f", "null", "-",
-  ], { maxBuffer: 16 * 1024 * 1024 });
+  ], { maxBuffer: 2 * 1024 * 1024, timeout: 10 * 60_000, windowsHide: true });
   const blackFrameSegments = (blackScan.stderr.match(/black_start:/g) ?? []).length;
   if (blackFrameSegments) issues.push(`${blackFrameSegments} unexpected black-frame segment(s)`);
   let audioMaxVolumeDb: number | null = null;
   if (probe.hasAudio) {
     const audioScan = await execFileAsync(env().FFMPEG_PATH, [
       "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1", "-i", filePath, "-af", "volumedetect", "-vn", "-f", "null", "-",
-    ], { maxBuffer: 16 * 1024 * 1024 });
+    ], { maxBuffer: 2 * 1024 * 1024, timeout: 10 * 60_000, windowsHide: true });
     const match = audioScan.stderr.match(/max_volume:\s*(-?[\d.]+)\s*dB/i);
     audioMaxVolumeDb = match ? Number(match[1]) : null;
     if (audioMaxVolumeDb !== null && audioMaxVolumeDb > -0.1) issues.push("Potential audio clipping");

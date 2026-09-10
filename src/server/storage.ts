@@ -24,6 +24,8 @@ function createClient(endpointValue: string, publicAccess = false): S3Client {
     region: env().S3_REGION,
     forcePathStyle: env().S3_FORCE_PATH_STYLE === "true",
     credentials: { accessKeyId: env().S3_ACCESS_KEY, secretAccessKey: env().S3_SECRET_KEY },
+    maxAttempts: 3,
+    requestHandler: { connectionTimeout: 10_000, socketTimeout: 120_000 },
   });
 }
 
@@ -49,7 +51,7 @@ async function ensureBucket(): Promise<void> {
         if (status !== 409) throw error;
       }
     }
-  })();
+  })().catch((error) => { bucketPromise = undefined; throw error; });
   return bucketPromise;
 }
 

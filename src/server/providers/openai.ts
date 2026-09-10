@@ -311,11 +311,17 @@ function firstQuotedDialogue(idea: string): string | null {
   return (match?.[1] ?? match?.[2] ?? "").trim() || null;
 }
 
-function moviePlanRequest(input: { projectId: string; idea: string; durationSeconds: number; videoModelId?: string }): string {
+export function moviePlanRequest(input: { projectId: string; idea: string; durationSeconds: number; videoModelId?: string; fastDraft?: boolean }): string {
   const shotLimit = input.videoModelId?.startsWith("gemini-omni")
     ? "For Gemini Omni Flash, make every shot at most 10 seconds and include exact 00:00-00:SS action timing so the Movie Engine can guarantee the requested total runtime with fewer provider calls."
     : "Make every shot at most 8 seconds and use only 4, 6 or 8 second provider beats where practical.";
-  return `Create a production-ready MoviePlan for project ${input.projectId}. Exact target runtime: ${input.durationSeconds} seconds. The sum of all shot durationSeconds must equal exactly ${input.durationSeconds}; never return a shorter plan. ${shotLimit} User idea: ${input.idea}`;
+  const maxBeat = input.videoModelId?.startsWith("gemini-omni") ? 10 : 8;
+  const shotCount = Math.ceil(input.durationSeconds / maxBeat);
+  const durations = Array.from({ length: shotCount }, (_, index) => Math.min(maxBeat, input.durationSeconds - index * maxBeat));
+  const compactPlan = input.fastDraft
+    ? `Fast Draft production budget: exactly ${shotCount} shots with durations [${durations.join(", ")}] seconds in chronological order. Plan the meaningful action inside these shots; do not split them into additional API calls. Every shot must advance the user's story, not repeat, pause or add filler. Use concise field values, consistent locations, and preserve all requested events and dialogue. Scenes may group shots but must not add extra shots.`
+    : "";
+  return `Create a production-ready MoviePlan for project ${input.projectId}. Exact target runtime: ${input.durationSeconds} seconds. The sum of all shot durationSeconds must equal exactly ${input.durationSeconds}; never return a shorter plan. ${shotLimit} ${compactPlan} User idea: ${input.idea}`;
 }
 
 async function selectGeminiFallbackModels(apiKey: string): Promise<string[]> {

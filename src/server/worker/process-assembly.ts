@@ -15,7 +15,7 @@ interface AssemblyJobRow {
 export async function processAssembly(databaseJobId: string) {
   const jobs = await query<AssemblyJobRow>(
     `UPDATE jobs SET state='generating',started_at=COALESCE(started_at,now()),attempt=attempt+1,updated_at=now()
-     WHERE id=$1 AND state IN ('queued','retrying') RETURNING *`,
+     WHERE id=$1 AND type='assemble-movie' AND state IN ('queued','retrying') AND available_at<=now() AND attempt<max_attempts RETURNING *`,
     [databaseJobId],
   );
   const job = jobs[0];
@@ -35,13 +35,20 @@ export async function processAssembly(databaseJobId: string) {
     [job.project_id, job.payload.sceneId ?? null],
   );
   if (!assets.length) throw new Error("No completed shot assets are available for export.");
-  const clips = await Promise.all(assets.map(async (asset, index) => {
+  const clips: Array<{ filePath: string; durationSeconds: number }> = [];
+  await query("UPDATE exports SET state='generating' WHERE id=$1", [job.payload.exportId]);
+  for (const [index, asset] of assets.entries()) {
     const filePath = join(tempRoot, `source-${index}.mp4`);
     await getObjectToFile(asset.storage_key, filePath);
-    return { filePath, durationSeconds: Number(asset.duration_seconds) };
-  }));
+    clips.push({ filePath, durationSeconds: Number(asset.duration_seconds) });
+    await query("UPDATE jobs SET result=$2,updated_at=now() WHERE id=$1", [job.id, JSON.stringify({ stage: "downloading", completed: index + 1, total: assets.length })]);
+  }
   const outputPath = join(tempRoot, `movie.${job.payload.format}`);
-  const assembledQc = await assembleMovieFiles({ clips, resolution: job.payload.resolution, outputFormat: job.payload.format, outputPath });
+  const assembledQc = await assembleMovieFiles({ clips, resolution: job.payload.resolution, outputFormat: job.payload.format, outputPath,
+    onProgress: async (stage, completed, total) => {
+      await query("UPDATE jobs SET result=$2,updated_at=now() WHERE id=$1", [job.id, JSON.stringify({ stage, completed, total })]);
+    },
+  });
   const duplicateChecksums = assets.filter((asset, index) => assets.findIndex((candidate) => candidate.checksum === asset.checksum) !== index).map((asset) => asset.shot_id);
   const qcReport = { ...assembledQc, duplicateShotIds: [...new Set(duplicateChecksums)], passed: assembledQc.passed && duplicateChecksums.length === 0 };
   const storageKey = `projects/${job.project_id}/exports/${job.payload.sceneId ? `scene-${job.payload.sceneId}-` : ""}${job.payload.exportId}.${job.payload.format}`;
